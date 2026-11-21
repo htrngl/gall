@@ -25,12 +25,15 @@ dumps the nodes that have only scheduler names (`node_N`, `x (view)`...).
 | --- | --- | --- | --- |
 | `ref/short` | 34 tokens | one token per graph | 2000 |
 | `ref/short.b256` | same | one batch | 2000 |
-| `ref/2k` | head of `docs/build.md` | one token per graph | 256 |
+| `ref/2k` | 2331 tokens, head of `docs/build.md` | one token per graph | 256 |
 | `ref/2k.b256` | same | batches of 256 | 256 |
-| `ref/8k.b256` | head of `tools/server/README.md` | batches of 256 | 64 |
+| `ref/8k.b256` | 10504 tokens, head of `tools/server/README.md` | batches of 256 | 64 |
 
 the engine decodes token by token, so compare with the directories without
-a suffix. the `.b256` directories show what batched prefill changes.
+a suffix. the `.b256` directories show what batched prefill changes. there
+is no token-by-token `8k` (about 14 minutes under the lock); run
+`refdump $M ref/8k.b256/prompt.txt ref/8k 64 1` when the engine needs it.
+`tools/cmp.py A B` compares two step directories or two `logits.f32`.
 
 ## files
 
@@ -128,8 +131,16 @@ measured 2026-11-21 on `short`, `scratch/cmp.py`-style comparison:
   max abs (0.67 mean over 65 rows). the 65 argmax tokens are equal.
 - batched prefill (one batch of 34) against token by token: row 0 differs
   by 0.15 max abs, the worst of 65 rows by 1.17. the 65 argmax tokens are
-  equal. only 67 of 1397 node files of `s0000` are bitwise equal.
+  equal. only 67 of 1397 node files of `s0000` are bitwise equal. the two
+  2000-token greedy texts are equal for 186 tokens and differ from token
+  187.
+- `2k` against `2k.b256`: row 0 differs by 0.52 max abs, the worst of 65
+  rows by 2.81 (0.59 mean). the 65 argmax tokens and all 256 greedy tokens
+  are equal.
 
 so small rounding differences grow (top-8 expert selection is not
 continuous). compare a new engine step by step with teacher-forced tokens
 from `gen.txt`, and judge it against these noise levels, not against 1e-6.
+llama.cpp does not give the same 2000 greedy tokens for its own two prefill
+modes, so the milestone 1 test "same greedy tokens for 2k tokens" cannot be
+passed as written.
