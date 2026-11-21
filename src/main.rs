@@ -4,6 +4,7 @@
 // gall mmb
 // gall tok MODEL FILE
 // gall serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
+// gall up [CTX] | down | log | model | test (see up.rs)
 mod dr;
 mod gguf;
 mod gpu;
@@ -11,6 +12,7 @@ mod model;
 mod mv;
 mod serve;
 mod tok;
+mod up;
 use std::{collections::BTreeMap, fs, time::Instant};
 
 fn ids(p: &str) -> Vec<u32> {
@@ -42,8 +44,21 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
 }
 
 fn main() {
-    let a: Vec<String> = std::env::args().collect();
+    let mut a: Vec<String> = std::env::args().collect();
+    if a.len() < 2 {
+        return eprintln!("gall up [ctx] | down | log | model | test");
+    }
+    if a[1] == "test" {
+        let d = up::cache().join("test");
+        fs::create_dir_all(&d).unwrap();
+        let f = [("tokens", include_str!("../tests/short/tokens.txt")),
+            ("gen", include_str!("../tests/short/gen.txt"))];
+        f.map(|(n, s)| fs::write(d.join(n).with_extension("txt"), s).unwrap());
+        a = ["gall", "check", &up::model(), d.to_str().unwrap()]
+            .map(String::from).into();
+    }
     match a[1].as_str() {
+        "up" | "down" | "log" | "model" => return up::main(&a[1..]),
         "dr" => return dr::main(&a[2..]),
         "run" if a.iter().any(|x| x == "--draft") => return dr::run(&a[2..]),
         "mmb" => return model::pf::bench(),

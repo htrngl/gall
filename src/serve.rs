@@ -782,6 +782,7 @@ pub fn main(a: &[String]) {
         let say = tok.enc(&opt("--dummy", say), true);
         Box::new(Dummy(say, 0, vec![0.0; tok.txt.len()], 0))
     } else {
+        crate::up::guard();
         let m = crate::model::Model::open(&a[0], ctx);
         let s = crate::model::snap::Snaps::new(&a[0], &m);
         Box::new(Ink(m, vec![], s))
