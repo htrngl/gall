@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 #[path = "pf.rs"]
 pub mod pf;
+#[path = "snap.rs"]
+pub mod snap;
 
 const N: usize = 2304;
 const OPS: &str = include_str!("ops.metal");

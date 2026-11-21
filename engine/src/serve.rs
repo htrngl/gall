@@ -29,6 +29,11 @@ pub trait Lm {
         }
         self.step(*l)
     }
+    // holds p[..k]: restore or feed and store prefixes of p up to the
+    // system region p[..sys]; the new k and the length restored
+    fn prime(&mut self, _p: &[u32], k: usize, _sys: usize) -> (usize, usize) {
+        (k, 0)
+    }
 }
 
 // ---- json
@@ -278,8 +283,9 @@ fn effort(e: &J) -> Result<String, String> {
 }
 
 // r: the request; eff: the reasoning effort if the request has none
-fn prompt(r: &J, eff: &J) -> Result<String, String> {
-    let mut o = String::new();
+// the prompt, and the length of its system region
+fn prompt(r: &J, eff: &J) -> Result<(String, usize), String> {
+    let (mut o, mut sys) = (String::new(), None);
     let tools = r["tools"].a();
     if !tools.is_empty() {
         let spec = |t: &J| {
@@ -309,6 +315,7 @@ fn prompt(r: &J, eff: &J) -> Result<String, String> {
         .to_string();
         if role != "system" {
             o += &eff.take().unwrap_or_default();
+            sys.get_or_insert(o.len());
         }
         let asst = role == "assistant";
         let calls = if asst { m["tool_calls"].a() } else { &[] };
@@ -373,7 +380,9 @@ fn prompt(r: &J, eff: &J) -> Result<String, String> {
             o += "<|content_model_end_sampling|>";
         }
     }
-    Ok(o + &eff.unwrap_or_default())
+    let o = o + &eff.unwrap_or_default();
+    let n = sys.unwrap_or(o.len());
+    Ok((o, n))
 }
 
 // ---- sampling: top_k, top_p, min_p, temperature, in llama.cpp's order
@@ -514,10 +523,11 @@ struct Srv {
 
 impl Srv {
     fn chat(&mut self, r: &J, w: &mut TcpStream) -> io::Result<()> {
-        let p = match prompt(r, &self.effort) {
-            Ok(p) => self.tok.enc(&p, true),
+        let (p, sys) = match prompt(r, &self.effort) {
+            Ok((p, n)) => (self.tok.enc(&p, true), self.tok.enc(&p[..n], true)),
             Err(e) => return reply(w, 400, &err(&e)),
         };
+        let sys = if p.starts_with(&sys) { sys.len() } else { 0 };
         if p.is_empty() || p.len() >= self.ctx {
             let e = format!("{} prompt tokens, context {}", p.len(), self.ctx);
             return reply(w, 400, &err(&e));
@@ -563,9 +573,11 @@ impl Srv {
             self.lm.reset();
             k = 0;
         }
-        self.fed.truncate(k);
-        self.fed.extend(&p[k..]);
-        let mut lg = self.lm.feed(&p[k..]);
+        let (at, snap) = self.lm.prime(&p, k, sys);
+        let k = k.max(snap); // not fed for this request
+        self.fed.clear();
+        self.fed.extend(&p);
+        let mut lg = self.lm.feed(&p[at..]);
         let t1 = Instant::now();
 
         let [model, think, text, tool, end] = self.t;
@@ -630,9 +642,11 @@ impl Srv {
         let (np, ms) = (p.len() - k, |d: Duration| d.as_secs_f64() * 1e3);
         let rate = |n: usize, d: Duration| n as f64 / d.as_secs_f64().max(1e-9);
         eprintln!(
-            "ink: prompt {} ({k} cached) {:.1} t/s, predicted {n} {:.1} t/s",
+            "ink: prompt {} ({k} cached, snap {snap}) {:.1} t/s, first token \
+             {:.2} s, predicted {n} {:.1} t/s",
             p.len(),
             rate(np, dp),
+            dp.as_secs_f64(),
             rate(n, dg)
         );
         let usage = obj!["prompt_tokens" => p.len(), "completion_tokens" => n,
@@ -720,7 +734,7 @@ impl Lm for Dummy {
 }
 
 // the engine as an Lm; a checkpoint after each feed (the prompt)
-struct Ink(crate::model::Model, Vec<f32>);
+struct Ink(crate::model::Model, Vec<f32>, crate::model::snap::Snaps);
 
 impl Lm for Ink {
     fn reset(&mut self) {
@@ -743,6 +757,9 @@ impl Lm for Ink {
         self.1 = self.0.logits();
         &self.1
     }
+    fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
+        self.2.prime(&mut self.0, p, k, sys)
+    }
 }
 
 pub fn main(a: &[String]) {
@@ -756,7 +773,7 @@ pub fn main(a: &[String]) {
     if a.get(1).is_some_and(|x| x == "--prompt") {
         // ink serve <gguf> --prompt <request.json>: the rendered prompt
         let r = J::parse(&std::fs::read(&a[2]).unwrap()).unwrap();
-        return print!("{}", prompt(&r, &"none".into()).unwrap());
+        return print!("{}", prompt(&r, &"none".into()).unwrap().0);
     }
     let ctx: usize = opt("--ctx", "102400").parse().unwrap();
     let say = "<|message_model|><|content_text|>hello from ink\
@@ -765,7 +782,9 @@ pub fn main(a: &[String]) {
         let say = tok.enc(&opt("--dummy", say), true);
         Box::new(Dummy(say, 0, vec![0.0; tok.txt.len()], 0))
     } else {
-        Box::new(Ink(crate::model::Model::open(&a[0], ctx), vec![]))
+        let m = crate::model::Model::open(&a[0], ctx);
+        let s = crate::model::snap::Snaps::new(&a[0], &m);
+        Box::new(Ink(m, vec![], s))
     };
     let kv = |k: &str, d: f64| {
         let k = format!("general.sampling.{k}");
