@@ -145,14 +145,31 @@ draft cost: prose ties at block 1 (83 ms for 1.61 tokens) and loses at
 block 2; math gains ~15% and code ~35% at block 3 (132 ms for 2.96 and
 3.51 tokens). the real t(T) decides; it needs the batched pass.
 
+## batched verify, as far as it got
+
+`Dr::pass` runs `[anchor, drafts]` on 2, 4 or 8 activation rows: the small
+ops row by row between the weights, every weight read once for all rows
+(`drm.metal` `x_<fmt>_<T>`), the rows' experts as a union built on the
+gpu. `Dr::commit` keeps the accepted rows (`Model::truncate`) and injects
+their context. text equals plain greedy at block 0, 1, 3, 7.
+
+it is not faster: a pass of 2 / 4 / 8 rows takes 272 / 250 / 740 ms
+against 52 ms serial. at 4 rows: expert slabs 161 ms (4 serial tokens:
+~92), q8_0 24, head and q5_k 18, small ops ~30. the slab kernels call
+`u_<fmt>` per row and the iq / nvfp4 dequant is repeated per row; they
+need the hand-written dequant-once form that q8_0 and q5_k have in the
+drafter (1.3x one input for 8). so `Spec` starts from these costs and the
+block stays 0 (`BLOCK=n` forces one): `--draft` runs at serial speed with
+a 3-token probe draft every 32 tokens.
+
 ## left
 
-- batched verify: one pass over `[anchor, drafts]` with per-row features
-  (H after the first `elem` of visits 5, 23, 41; the normed output) and
-  per-row argmax, then `Model::truncate(n + kept + 1)` (the rings hold 12
-  steps). `Dr::inject` then runs per kept row; stale rows in the drafter
-  caches are overwritten before they are read.
-- block size from a running acceptance estimate; 0 on prose.
-- sampling: accept while the target's sample equals the draft.
+- dequant-once slab kernels for iq3_xxs, iq2_s, iq2_xs, iq2_xxs, nvfp4,
+  iq4_nl; then re-measure t(2), t(4), t(8) and the three prompts.
+- prompt context: `feed()` (prefill) taps no features, so after a
+  prefilled prompt the drafter has no context; either tap H at visits 5,
+  23, 41 and the normed output in `pf.rs`, or bound the drafter's keys to
+  the injected range.
+- `serve.rs --draft` (a queue of verified tokens behind `Lm`), sampling.
 - the last drafter layer only needs rows 1..B (q, wo, ffn): ~1.5 ms.
 - the drafter's full-attention layer reads all context (4KB per token).
