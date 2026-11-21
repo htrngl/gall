@@ -18,56 +18,55 @@ pub const SRC: &str = concat!(
     include_str!("mv.metal")
 );
 
-pub fn name(ty: u32) -> &'static str {
-    match ty {
-        0 => "f32",
-        30 => "bf16",
-        8 => "q8_0",
-        12 => "q4_k",
-        13 => "q5_k",
-        14 => "q6_k",
-        16 => "iq2_xxs",
-        17 => "iq2_xs",
-        18 => "iq3_xxs",
-        20 => "iq4_nl",
-        22 => "iq2_s",
-        40 => "nvfp4",
-        _ => panic!("mv: tensor type {ty}"),
-    }
-}
-
 #[repr(C)]
 struct P(u32, u32, u32, u32); // n_in, n_out, row bytes, experts
 
+// (type, name, rows per threadgroup as in mv.metal)
+const TY: [(u32, &str, usize); 12] = [
+    (0, "f32", 2),
+    (30, "bf16", 2),
+    (8, "q8_0", 4),
+    (12, "q4_k", 2),
+    (13, "q5_k", 2),
+    (14, "q6_k", 2),
+    (16, "iq2_xxs", 8),
+    (17, "iq2_xs", 4),
+    (22, "iq2_s", 8),
+    (18, "iq3_xxs", 8),
+    (20, "iq4_nl", 4),
+    (40, "nvfp4", 4),
+];
+
+pub fn name(ty: u32) -> &'static str {
+    TY.iter().find(|t| t.0 == ty).expect("mv: tensor type").1
+}
+
 pub struct Mv {
-    p: HashMap<(&'static str, u32), Pipe>,
-    eye: Buf,
-    nr: usize,
+    p: HashMap<(&'static str, u32), (Pipe, usize)>,
 }
 
 impl Mv {
-    // defs: extra #defines; NR (rows per threadgroup) is read back from it
+    // defs: extra #defines; NR n overrides the rows per threadgroup
     pub fn new(g: &Gpu, defs: &str) -> Mv {
-        let nr = defs.split("NR ").nth(1).map_or(2, |s| {
+        let nr = defs.split("NR ").nth(1).map(|s| {
             s.split_whitespace().next().unwrap().parse().unwrap()
         });
         let mut p = HashMap::new();
-        for ty in [0, 30, 8, 12, 13, 14, 16, 17, 18, 20, 22, 40] {
+        for (ty, name, r) in TY {
             for k in ["mv", "up", "down", "row"] {
-                let f = format!("{k}_{}", name(ty));
-                p.insert((k, ty), g.pipe(SRC, defs, &f));
+                let f = g.pipe(SRC, defs, &format!("{k}_{name}"));
+                p.insert((k, ty), (f, nr.unwrap_or(r)));
             }
         }
-        let eye = g.buf(4 * 64);
-        (0..8).for_each(|i| slice::<f32>(&eye)[9 * i] = 1.);
-        Mv { p, eye, nr }
+        Mv { p }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn go(&self, e: &Enc, k: &'static str, ty: u32, b: &[B], n_in: usize, n_out: usize, rows: usize) {
         let rb = n_in / blk(ty).0 * blk(ty).1;
         let p = P(n_in as u32, n_out as u32, rb as u32, NE as u32);
-        call(e, &self.p[&(k, ty)], &p, b, [rows.div_ceil(self.nr), 1, 1], 32);
+        let (f, r) = &self.p[&(k, ty)];
+        call(e, f, &p, b, [rows / r, 1, 1], 32);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -88,8 +87,8 @@ impl Mv {
     pub fn row(&self, e: &Enc, ty: u32, w: B, i: usize, y: B, n_in: usize) {
         let rb = n_in / blk(ty).0 * blk(ty).1;
         let p = P(n_in as u32, 1, rb as u32, 0);
-        let b = [(w.0, w.1 + i * rb), (&self.eye, 0), y];
-        call(e, &self.p[&("row", ty)], &p, &b, [n_in.div_ceil(32), 1, 1], 32);
+        let b = [(w.0, w.1 + i * rb), y, y];
+        call(e, &self.p[&("row", ty)].0, &p, &b, [n_in.div_ceil(32), 1, 1], 32);
     }
 }
 

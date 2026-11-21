@@ -24,8 +24,8 @@ fn main() {
     let x = gpu.buf(4 * 8 * 4608);
     slice::<f32>(&x).iter_mut().for_each(|v| *v = rnd());
     let y = gpu.buf(4 * 201024);
-    let ids = gpu.buf(4 * mv::NE);
-    slice::<u32>(&ids).copy_from_slice(&[5, 127, 0, 64, 33, 90, 17, 101]);
+    let ids = gpu.buf(4 * 128); // 16 sets of 8 experts
+    (0..128).for_each(|i| slice::<u32>(&ids)[i] = (i as u32 * 37 + 5) % 128);
     let (xs, ys, is) = (slice::<f32>(&x), slice::<f32>(&y), slice::<u32>(&ids));
 
     // ceiling: 1GB of weights, summed as 16-byte words
@@ -87,8 +87,21 @@ fn main() {
             nrm = nrm.max(v.abs());
         }
         let nan = ys[..n_y].iter().filter(|v| v.is_nan()).count();
-        let reps = (2e9 / (rows * rb) as f64).ceil().max(4.) as usize;
-        let run = || gpu.run(|e| (0..reps).for_each(|_| enc(e)));
+        // time over every tensor of this type and shape, expert sets cycling
+        let all: Vec<_> = g.t.values().filter(|o| o.ty == t.ty && o.dims == t.dims).collect();
+        let reps = (1.5e9 / (rows * rb) as f64).ceil().max(4.) as usize;
+        let run = || {
+            gpu.run(|e| {
+                for i in 0..reps {
+                    let (w, bi) = (gpu.w(all[i % all.len()]), (&ids, 32 * (i % 16)));
+                    match (t.dims.len(), up) {
+                        (2, _) => m.dense(e, t.ty, w, bx, by, n_in, n_out),
+                        (_, true) => m.experts_up(e, t.ty, w, bi, bx, by, n_in, n_out),
+                        _ => m.experts_down(e, t.ty, w, bi, bx, by, n_in, n_out),
+                    }
+                }
+            })
+        };
         let s = run().min(run()) / reps as f64;
         let kind = ["", "", "mv", if up { "up" } else { "down" }][t.dims.len()];
         println!(
@@ -103,16 +116,16 @@ fn main() {
         );
     }
 
-    // row gather
-    for name in ["token_embd.weight", "blk.0.attn_q.weight", "blk.9.ffn_gate_up_exps.weight"] {
-        let t = &g.t[name];
-        if !name.contains(&filt) && filt != "row" && !filt.is_empty() {
-            continue;
+    // row gather; the sums can be checked against gguf-py
+    for t in pick.values() {
+        if !filt.is_empty() && filt != "row" {
+            break;
         }
-        let (n, i) = (t.dims[0], 1234);
+        let (n, i) = (t.dims[0], 1234 % t.dims[1]);
         gpu.run(|e| m.row(e, t.ty, gpu.w(t), i, (&y, 0), n));
         let r = mv::deq(t.ty, &g.data(t)[i * t.row()..], n);
         let err = r.iter().zip(&*ys).map(|(a, b)| (a - b).abs()).fold(0., f32::max);
-        println!("row {:8} err {err:.1e}  {name}", mv::name(t.ty));
+        let sum: f64 = r.iter().map(|v| v.abs() as f64).sum();
+        println!("row {:8} err {err:.1e} sum {sum:.6} {:?}  {}", mv::name(t.ty), &r[..3], t.name);
     }
 }
