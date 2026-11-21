@@ -10,7 +10,9 @@
 
 struct PM { uint n_in, n_out, rb, ls, xo, xs, yo, ys; };
 
-#ifndef HT // tile precision
+// tile precision. float tiles: 0.8x the speed; logits after 2200 tokens
+// against stepping kl 7e-4, max abs 0.5 (half: 8e-3, 1.6)
+#ifndef HT
 #define HT half
 #define HM simdgroup_half8x8
 #endif

@@ -464,7 +464,7 @@ impl Model {
     // decode toks (not empty), logits only for the last: no output head
     // and no wait between the others
     pub fn feed(&mut self, toks: &[u32]) -> u32 {
-        let toks = self.prefill(toks, 256);
+        let toks = self.prefill(toks, 512);
         let (l, h) = toks.split_last().unwrap();
         for c in h.chunks(4) {
             let ops = c.iter().enumerate();

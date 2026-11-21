@@ -9,7 +9,6 @@
 using namespace metal;
 #define N 2304
 #define CH 6656 // conv channels per slot: k, v, attention out, ffn out
-#define C 256 // keys per attention chunk
 #define TG uint3 gp [[threadgroup_position_in_grid]], \
   uint ln [[thread_index_in_simdgroup]]
 #define EL for (uint e = ln; e < N; e += 32)
@@ -19,7 +18,6 @@ using namespace metal;
 typedef const device uint *U;
 typedef device float *A;
 typedef const device float *S;
-typedef const device half4 *KV;
 
 // causal conv with residual of element o of token tk at pos; st is the
 // channel in ring row 0
@@ -123,49 +121,90 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
   }
 }
 
-// one query per (kv head, token) threadgroup of 96, a q head per
-// simdgroup: online softmax over chunks of C keys, bias and sink inside,
-// then the sigmoid gate.
-// p: 0 q, 1 rel, 2 sink, 3 kv slot (halfs), 4 gate, 5 pos of token 0,
-// 6 swa, 7 rel bias, 8 out, 9 first token
-kernel void attn(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
-                 const device half *kv [[buffer(3)]],
+// relative bias of a token and q head by distance:
+// rt[(token*24 + h)*1024 + d] = rel[h] . bias[d]. grid (32, 24, tokens)
+// p: 0 rel, 1 rel bias
+kernel void relb(U p [[buffer(0)]], S a [[buffer(1)]], S s [[buffer(2)]],
+                 A rt [[buffer(8)]], TG) {
+  uint d = gp.x * 32 + ln, h = gp.y;
+  a += gp.z * STR + p[0] + h * 16, s += p[1] + d * 16;
+  float o = 0;
+  for (uint i = 0; i < 16; i++) o += s[i] * a[i];
+  rt[(gp.z * 24 + h) * 1024 + d] = o;
+}
+
+// a kv head and 8 tokens per threadgroup, a q head per simdgroup. over
+// blocks of 32 keys: scores as 8x8 tiles straight from the cache, online
+// softmax with bias and sink by lane (a key each), outputs as tiles
+// again; then the sigmoid gate. q stays float against the half keys
+// (half q: kl 1e-3 against stepping); float weights against half v
+// compile too, but multiply wrong. blocks start at multiples of 32, so the
+// ring never splits one; keys out of a query's window weigh 0.
+// p: 0 q, 2 sink, 3 kv slot (halfs), 4 gate, 5 pos of token 0, 6 swa,
+// 8 out, 9 first token, 10 tokens
+kernel void attn(U p [[buffer(0)]], A a [[buffer(1)]],
+                 const device half *kv [[buffer(3)]], S rt [[buffer(8)]],
                  uint sg [[simdgroup_index_in_threadgroup]], TG) {
-  threadgroup float sc[3 * C];
-  uint tk = gp.y + p[9], h = gp.x * 3 + sg, pos = p[5] + tk,
-       lo = p[6] && pos > 1023 ? pos - 1023 : 0;
-  a += tk * STR;
-  const device float4 *q = (const device float4 *)(a + p[0] + h * 128);
-  float r[16], m = a[p[2] + h], l = 1;
-  for (uint i = 0; i < 16; i++) r[i] = a[p[1] + h * 16 + i];
-  float4 acc = 0;
-#define KEY(j) (KV)(kv + p[3] + (p[6] ? (j) % 2048 : (j)) * 2048) + gp.x * 32
-  for (uint j0 = lo; j0 <= pos; j0 += C) {
-    uint j1 = min(j0 + C, pos + 1);
-    float cm = -1e30;
-    for (uint j = j0 + ln; j < j1; j += 32) {
-      KV k = KEY(j);
-      float o = 0;
-      for (uint i = 0; i < 32; i++) o += dot(float4(k[i]), q[i]);
-      o *= 0.08838834764;
-      S b = s + p[7] + (pos - j) * 16;
-      if (pos - j < 1024)
-        for (uint i = 0; i < 16; i++) o += b[i] * r[i];
-      cm = max(cm, sc[sg * C + j - j0] = o);
-    }
-    cm = max(m, simd_max(cm));
-    acc *= exp(m - cm), l *= exp(m - cm), m = cm;
-    for (uint j = j0 + ln; j < j1; j += 32)
-      sc[sg * C + j - j0] = exp(sc[sg * C + j - j0] - m);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint j = j0; j < j1; j++) {
-      float w = sc[sg * C + j - j0];
-      l += w, acc += w * float4((KEY(j))[256 + ln]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup half sp[3 * 256];
+  threadgroup float sq[3 * 1024], so[3 * 1024], sc[3 * 256];
+  threadgroup half *w = sp + sg * 256;
+  threadgroup float *q = sq + sg * 1024, *o = so + sg * 1024,
+                    *s = sc + sg * 256;
+  uint g = gp.x, h = g * 3 + sg, t0 = gp.y * 8 + p[9], e = h * 128 + ln * 4;
+  float M[8], L[8];
+  for (uint i = 0; i < 8; i++) {
+    S at = a + (t0 + i) * STR;
+    for (uint k = 0; k < 4; k++)
+      q[i * 128 + ln * 4 + k] = at[p[0] + e + k], o[i * 128 + ln * 4 + k] = 0;
+    M[i] = at[p[2] + h], L[i] = 1;
   }
-  for (uint i = 0, e = h * 128 + ln * 4; i < 4; i++, e++)
-    a[p[8] + e] = acc[i] / l / (1 + exp(-a[p[4] + e]));
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  uint hi = p[5] + min(t0 + 7, p[10] - 1),
+       lo = p[6] && p[5] + t0 > 1023 ? p[5] + t0 - 1023 : 0;
+  for (uint j0 = lo & ~31u; j0 <= hi; j0 += 32) {
+    const device half *k = kv + p[3] + (p[6] ? j0 % 2048 : j0) * 2048 + g * 128;
+    simdgroup_half8x8 mb;
+    simdgroup_float8x8 ma, mc[4];
+    for (uint c = 0; c < 4; c++)
+      mc[c] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    for (uint d = 0; d < 16; d++) {
+      simdgroup_load(ma, q + d * 8, 128);
+      for (uint c = 0; c < 4; c++) {
+        simdgroup_load(mb, k + c * 8 * 2048 + d * 8, 2048, 0, true);
+        simdgroup_multiply_accumulate(mc[c], ma, mb, mc[c]);
+      }
+    }
+    for (uint c = 0; c < 4; c++) simdgroup_store(mc[c], s + c * 8, 32);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0, j = j0 + ln; i < 8; i++) {
+      uint d = p[5] + t0 + i - j;
+      bool ok = t0 + i < p[10] && j <= p[5] + t0 + i && (!p[6] || d < 1024);
+      float x = s[i * 32 + ln] * 0.08838834764;
+      if (ok && d < 1024) x += rt[((t0 + i) * 24 + h) * 1024 + d];
+      float m = max(M[i], simd_max(ok ? x : -1e30)), r = exp(M[i] - m);
+      x = ok ? exp(x - m) : 0;
+      L[i] = L[i] * r + simd_sum(x), M[i] = m, w[i * 32 + ln] = x;
+      for (uint c = 0; c < 4; c++) o[i * 128 + ln * 4 + c] *= r;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 mp[4];
+    for (uint c = 0; c < 4; c++) simdgroup_load(mp[c], w + c * 8, 32);
+    for (uint d = 0; d < 16; d++) {
+      simdgroup_load(mc[0], o + d * 8, 128);
+      for (uint c = 0; c < 4; c++) {
+        simdgroup_load(mb, k + 1024 + c * 8 * 2048 + d * 8, 2048);
+        simdgroup_multiply_accumulate(mc[0], mp[c], mb, mc[0]);
+      }
+      simdgroup_store(mc[0], o + d * 8, 128);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint i = 0; i < 8; i++) {
+    A at = a + (t0 + i) * STR;
+    for (uint k = 0; k < 4; k++)
+      at[p[8] + e + k] = o[i * 128 + ln * 4 + k] / L[i] /
+                         (1 + exp(-at[p[4] + e + k]));
+  }
 }
 
 // ffn_inp = conv(attention out) + residual, then its mix

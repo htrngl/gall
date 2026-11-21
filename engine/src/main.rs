@@ -1,6 +1,6 @@
 // ink run MODEL --tokens FILE [-n 64] [-c 4096] [--prof]
-// ink check MODEL REFDIR [-n 64] [-c 4096]
-// ink pp MODEL TOKENS [-n all] [-ub 256] [-c 4096] [--cmp] [--ref REFDIR]
+// ink check MODEL REFDIR [-n 64] [-c 4096] [-ub]
+// ink pp MODEL TOKENS [-n all] [-ub 512] [-c 4096] [--cmp] [--ref REFDIR]
 // ink mmb
 // ink tok MODEL FILE
 // ink serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
@@ -136,7 +136,7 @@ fn main() {
             // batched prefill: speed, and logits against stepping / a ref row
             let toks = ids(&a[3]);
             let toks = &toks[..opt("-n").map_or(toks.len(), |_| n)];
-            let ub = opt("-ub").map_or(256, |v| v.parse().unwrap());
+            let ub = opt("-ub").map_or(512, |v| v.parse().unwrap());
             let t0 = Instant::now();
             let rest = m.prefill(toks, ub);
             let g = (toks.len() - rest.len()) as f64 / m.t;
@@ -164,10 +164,16 @@ fn main() {
             let lg = f32s(&format!("{d}/logits.f32"));
             let nv = 200058;
             let (mut kls, mut flips) = (vec![], 0);
-            let mut next = 0;
+            // -ub: the prompt by feed() (batched), not step by step
+            let (mut next, ub) = (0, opt("-ub").is_some());
+            if ub {
+                next = m.feed(&toks);
+            }
             for (i, &t) in toks.iter().chain(&gen[..n.min(gen.len() - 1)]).enumerate() {
                 let Some(g) = i.checked_sub(toks.len()) else {
-                    next = m.step(t);
+                    if !ub {
+                        next = m.step(t);
+                    }
                     continue;
                 };
                 // i is the step that feeds gen[g]; next predicts gen[g]

@@ -52,6 +52,7 @@ pub struct Pf {
     id: Buf,  // 8 expert ids per token, then the pair of each
     col: Buf, // token | k << 16 of each pair
     tl: Buf,  // tiles of the mat-mats: (expert, first column, columns)
+    rt: Buf,  // relative bias by token, q head, distance
     k: HashMap<&'static str, Pipe>,
     mm: HashMap<u32, Pipe>,
 }
@@ -59,7 +60,7 @@ pub struct Pf {
 impl Pf {
     fn new(g: &Gpu, tb: usize) -> Pf {
         let d = format!("#define STR {STR}\n");
-        let ks = ["prep", "ctl", "post", "attn", "mid", "top", "act", "dsum",
+        let ks = ["prep", "ctl", "post", "relb", "attn", "mid", "top", "act", "dsum",
             "fin", "end", "msg"];
         let ty = [1, 8, 12, 13, 14, 16, 17, 18, 20, 22, 40];
         let f = |t| if t == 1 { "mm_f16".into() } else { format!("mm_{}", name(t)) };
@@ -72,6 +73,7 @@ impl Pf {
             id: g.buf(4 * (16 * tb + 8)),
             col: g.buf(4 * np),
             tl: g.buf(12 * (tb / 32 + np / 8)),
+            rt: g.buf(4 * tb * 24 * 1024),
             k: ks.map(|k| (k, g.pipe(OPS, &d, k))).into(),
             mm: ty.map(|t| (t, g.pipe(MM, &d, &f(t)))).into(),
         }
@@ -105,7 +107,8 @@ impl Model {
             let n = (t.div_ceil(8) * 8 - 32 * i).min(32);
             tl[3 * i..3 * i + 3].copy_from_slice(&[0, 32 * i as u32, n as u32]);
         }
-        let bufs = [&pf.a, &self.s, &self.kv, &self.cs, &pf.id, &pf.pe, &pf.col];
+        let bufs =
+            [&pf.a, &self.s, &self.kv, &self.cs, &pf.id, &pf.pe, &pf.col, &pf.rt];
         macro_rules! k {
             ($e:expr, $n:expr, $g:expr, $th:expr, $($p:expr),*) => {{
                 let mut p = [0u32; 24];
@@ -182,11 +185,12 @@ impl Model {
             k!(e, "post", g1, 32, Q, K, V, R, l.qc, l.rc, l.kc, l.vc, dk, DV, cs, pos,
                 l.swa, self.hp[0].to_bits(), self.hp[1].to_bits(),
                 self.hp[2].to_bits(), self.hp[3].to_bits(), kv);
+            k!(e, "relb", [32, 24, t], 32, R, l.rb);
             // bound the keys of one dispatch
-            let tq = ((1 << 22) / if l.swa { 1024 } else { pos + t }).max(1);
+            let tq = ((1 << 22) / if l.swa { 1024 } else { pos + t }).max(8) / 8 * 8;
             for t0 in (0..t).step_by(tq) {
-                k!(e, "attn", [8, (t - t0).min(tq), 1], 96, Q, R, SK, kv, G, pos,
-                    l.swa, l.rb, O, t0);
+                k!(e, "attn", [8, (t - t0).min(tq).div_ceil(8), 1], 96, Q, 0, SK, kv,
+                    G, pos, l.swa, 0, O, t0, t);
             }
             dense(e, l.o, O, AO, 3072, N);
             k!(e, "mid", g1, 32, F, BK, nbs[v].1, 1, l.fq, XF, 1, msg, 0, 3, l.fnw,
