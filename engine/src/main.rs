@@ -2,6 +2,7 @@
 // ink check MODEL REFDIR [-n 64] [-c 4096]
 // ink tok MODEL FILE
 // ink serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
+mod dr;
 mod gguf;
 mod gpu;
 mod model;
@@ -41,6 +42,7 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     match a[1].as_str() {
+        "dr" => return dr::main(&a[2..]),
         "tok" => return tok::main(&a[2..]),
         "serve" => return serve::main(&a[2..]),
         _ => {}
