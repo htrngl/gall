@@ -76,6 +76,14 @@ measured on this machine, one run each, nothing else loaded.
   lookup vs occupancy not separated. tuned on m5 max (73 t/s there). its
   quality is between UD-IQ1_S and UD-IQ3_XXS by their table.
 
+- mlx: stock mlx-lm 0.32.2 has no inkling2_loop; mlx-vlm main does
+  (Neywa-Labs fork, 0.8.0, mlx 0.32.4). `netprojects/Inkling-2-Mini-MLX-3bit`
+  (14.1GB, 3-bit experts, 4-bit in 0-1/20-23, 6-bit attention; KL 0.042 by
+  their card): serial decode 14.7 t/s, prefill 126 t/s at 705 tokens, 14.3
+  -16.1GB peak. bundled dspark: block 4 9.4/15.6/13.6 (prose/math/code),
+  block 3 11.1/16.8/15.2; a block 2 run was killed by `./wd` at 5% free.
+  level with llama.cpp, so no reason to switch engines.
+
 ## depth
 
 - decode slows with cache depth. at 8.3k tokens deep: f16 KV 12.4 t/s, q8_0
