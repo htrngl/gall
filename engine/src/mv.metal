@@ -36,12 +36,7 @@ UNIT(bf16) {
 UNIT(q8_0) {
     W c = b + (e/4)*34;
     device const packed_char4 *q = (device const packed_char4 *)(c + 2 + 8*(e%4));
-#ifdef UP
-    return 127*F16(c)*DOT8(unpack_snorm4x8_to_float(as_type<uint>(char4(q[0]))),
-                           unpack_snorm4x8_to_float(as_type<uint>(char4(q[1]))));
-#else
     return F16(c)*DOT8(char4(q[0]), char4(q[1]));
-#endif
 }
 
 // q4_k/q5_k: 6-bit scale and min of sub-block j
@@ -105,18 +100,8 @@ UNIT(nvfp4) {
 #define SGN(v, sg, m) select(float4(v), -float4(v), (uint4(sg) & m) != 0)
 #define M0 uint4(1, 2, 4, 8)
 #define M1 uint4(16, 32, 64, 128)
-#ifdef UP
-// the 4 bytes of g, each negated where its bit of sg is set, as floats
-// in one unpack (no byte is 0, so the negation does not carry)
-static inline float4 sg4(uint g, uint sg) {
-    uint m = ((sg & 15)*0x204081) & 0x01010101;
-    return unpack_snorm4x8_to_float((g ^ (m*255)) + m);
-}
-#define GDOT(g0, g1, sg) (127*DOT8(sg4(uint(g0), sg), sg4(uint(g1), (sg) >> 4)))
-#else
 #define GDOT(g0, g1, sg) \
     DOT8(SGN(as_type<uchar4>(uint(g0)), sg, M0), SGN(as_type<uchar4>(uint(g1)), sg, M1))
-#endif
 
 UNIT(iq2_xxs) {
     uint ib = e/4, l = e%4;

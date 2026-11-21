@@ -118,6 +118,40 @@ fn main() {
         );
     }
 
+    // synth: attention as a 4-bit plain format. the nvfp4 unit as a dense
+    // mat-vec over slabs of nvfp4 bytes, against q8_0 on the real tensors;
+    // n = q8_0 dispatches per token (layers 6-17 run 3 times)
+    if filt == "synth" {
+        let nv: Vec<_> = g.t.values().filter(|t| t.ty == 40).collect();
+        let mut tot = [0f64; 3];
+        for (n_in, n_out) in [(2304, 3072), (2304, 1024), (2304, 384), (3072, 2304)] {
+            let q8: Vec<_> = g.t.values().filter(|t| t.ty == 8 && t.dims == [n_in, n_out]).collect();
+            let n: usize = q8.iter().map(|t| {
+                let l: usize = t.name.split('.').nth(1).unwrap().parse().unwrap();
+                if (6..18).contains(&l) { 3 } else { 1 }
+            }).sum();
+            let slab = n_out * n_in / 64 * 36;
+            let reps = 2000;
+            let time = |ty: u32| {
+                let run = || gpu.run(|e| for i in 0..reps {
+                    let w = if ty == 8 { gpu.w(q8[i % q8.len()]) } else {
+                        let t = nv[i % nv.len()];
+                        let (b, o) = gpu.w(t);
+                        (b, o + (i * 7 % (t.len / slab - 1)) * slab)
+                    };
+                    m.dense(e, ty, w, (&x, 0), (&y, 0), n_in, n_out);
+                }) / reps as f64 * 1e3;
+                run().min(run())
+            };
+            let (a, b) = (time(8), time(40));
+            let (a, b) = (a.min(time(8)), b.min(time(40)));
+            println!("{n_in}x{n_out}: q8_0 {a:.4} ms, 4-bit {b:.4} ms, {n} per token: {:.2} -> {:.2} ms", a * n as f64, b * n as f64);
+            tot = [tot[0] + a * n as f64, tot[1] + b * n as f64, tot[2] + n as f64];
+        }
+        println!("q8_0 attention, {} dispatches per token: {:.2} -> {:.2} ms, {:.2} saved", tot[2], tot[0], tot[1], tot[0] - tot[1]);
+        return;
+    }
+
     // row gather; the sums can be checked against gguf-py
     for t in pick.values() {
         if !filt.is_empty() && filt != "row" {
