@@ -68,9 +68,13 @@ measured on this machine, one run each, nothing else loaded.
   tokens: decode 9.2 prose, 7.2 math, 8.1 code t/s; prefill 87 t/s at 703
   tokens; 6.7-6.9GB peak. with its dspark drafter: 7.6, 10.5, 8.4. the
   drafter verify kernel (`matmul_rotated_sg8_f16`, sg=32) asks for 1024
-  threads per group and m2 allows 832: it fails until sg=16, ntg=160. the
-  trellis decode is tuned for m5 max (73 t/s there) and is compute-bound on
-  m2. its quality is between UD-IQ1_S and UD-IQ3_XXS by their table.
+  threads per group and m2 allows 832: it fails until sg=16, ntg=160.
+  per token: python builds the graph in 20 ms, the GPU then runs ~110-150
+  ms. it reads ~1.3GB per token (48 visits x ~24MB + 150MB head), so
+  ~10-12GB/s against ~56GB/s for llama.cpp here: not bandwidth-bound. the
+  likely cost is trellis/LUT decode (~5G weights per token); ALU vs LUT
+  lookup vs occupancy not separated. tuned on m5 max (73 t/s there). its
+  quality is between UD-IQ1_S and UD-IQ3_XXS by their table.
 
 ## depth
 
