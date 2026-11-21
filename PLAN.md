@@ -9,8 +9,10 @@ macbook air, 24GB, through a patched llama.cpp.
 - weights: `unsloth/Inkling-2-Mini-GGUF` UD-IQ3_XXS (11.7GB) since
   2026-11-21, app id `unsloth/Inkling-2-Mini-GGUF:IQ3_XXS` (section with an
   explicit `model =` in `models.user.ini`; hax preset `inkling` points at
-  it). UD-Q3_K_XL (13.6GB) is kept as `:Q3_K_XL`; `.bak-q3kxl` copies of
-  both configs hold the old settings. IQ3_XXS per token reads ~2.8GB:
+  it). UD-IQ1_M is deleted. UD-Q3_K_XL (13.6GB) stays only until the
+  grain model daemon moves: `~/.config/grain/config` points at IQ3_XXS,
+  but the root plist still names Q3_K_XL until `sudo grain install`.
+  `.bak-q3kxl` copies of the app and hax configs hold the old settings. IQ3_XXS per token reads ~2.8GB:
   experts ~1.3GB (NVFP4 down, IQ3_XXS/IQ2_S gate-up, IQ4_NL), attention
   ~1.2GB (mostly q8_0), q5_K head 0.3GB. served at 15.0 t/s via the app.
 - engine: built here by `./build`: ggml-org/llama.cpp `b12600` (carries
@@ -136,6 +138,8 @@ and conv ~2 ms. about 3.6GB is read per token, so the ceiling at ~90GB/s is
 near 25 t/s, not 40.
 
 ## ideas left
+
+the custom engine brief, with a fresh IQ3_XXS profile, is `ENGINE.md`.
 
 1. decode at depth: a banded variant for one query would drop the dense
    per-head bias and mask chain (CONT, CPY, GET_ROWS, ADD over n_kv x 24
