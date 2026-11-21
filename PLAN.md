@@ -6,8 +6,13 @@ macbook air, 24GB, through a patched llama.cpp.
 
 ## current setup
 
-- weights: `unsloth/Inkling-2-Mini-GGUF` UD-Q3_K_XL (13.6GB), in the HF cache.
-  expert tensors of 20 layers are NVFP4 with per-expert scales.
+- weights: `unsloth/Inkling-2-Mini-GGUF` UD-IQ3_XXS (11.7GB) since
+  2026-11-21, app id `unsloth/Inkling-2-Mini-GGUF:IQ3_XXS` (section with an
+  explicit `model =` in `models.user.ini`; hax preset `inkling` points at
+  it). UD-Q3_K_XL (13.6GB) is kept as `:Q3_K_XL`; `.bak-q3kxl` copies of
+  both configs hold the old settings. IQ3_XXS per token reads ~2.8GB:
+  experts ~1.3GB (NVFP4 down, IQ3_XXS/IQ2_S gate-up, IQ4_NL), attention
+  ~1.2GB (mostly q8_0), q5_K head 0.3GB. served at 15.0 t/s via the app.
 - engine: built here by `./build`: ggml-org/llama.cpp `b12600` (carries
   upstream's own inkling 2 mini, #32694) + the 32 unsloth pins in `pins.txt`
   (their `scripts/unsloth/pr-set.json` at master `e94fed7`, merged in order,
