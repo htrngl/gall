@@ -60,7 +60,8 @@ int main(int c, char ** v) {
     auto cp = llama_context_default_params();
     cp.n_ctx = (tok.size() + n_gen + 256 + 255)/256*256;
     cp.n_batch = cp.n_ubatch = n_batch;
-    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    // FA=0: dense attention in f32, a reference without the f16 kernel
+    cp.flash_attn_type = getenv("FA") ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.cb_eval = cb;
     llama_context * ctx = llama_init_from_model(model, cp);
 

@@ -57,19 +57,21 @@ fn main() {
     if a[1] == "kb" {
         // ink kb KERNEL GX,GY THREADS P0,P1,..: time 100 dispatches on zeros
         let g = gpu::Gpu::new();
-        let b = [256, 512, 64, 128, 1].map(|n| g.buf(n << 20));
-        let pipe = g.pipe(include_str!("ops.metal"), "", &a[2]);
+        let b = [256, 512, 600, 128, 1].map(|n| g.buf(n << 20));
+        let defs = std::env::var("DEFS").unwrap_or_default().replace(';', "\n");
+        let pipe = g.pipe(include_str!("ops.metal"), &defs, &a[2]);
         let v = |s: &str| s.split(',').map(|x| x.parse().unwrap()).collect::<Vec<usize>>();
         let (gr, mut p) = (v(&a[3]), [0u32; 24]);
         v(&a[5]).iter().enumerate().for_each(|(i, &x)| p[i] = x as u32);
+        let reps = std::env::var("REPS").map_or(10000, |v| v.parse().unwrap());
         for _ in 0..3 {
             let t = g.run(|e| {
-                for _ in 0..10000 {
+                for _ in 0..reps {
                     let b = b.each_ref().map(|b| (b, 0));
                     gpu::call(e, &pipe, &p, &b, [gr[0], gr[1], 1], a[4].parse().unwrap());
                 }
             });
-            println!("{}: {:.1} us per dispatch", a[2], 1e2 * t);
+            println!("{}: {:.1} us per dispatch", a[2], 1e6 * t / reps as f64);
         }
         return;
     }
@@ -81,6 +83,8 @@ fn main() {
             let t0 = Instant::now();
             let mut next = m.feed(&toks);
             let pp = t0.elapsed().as_secs_f64();
+            // --deep N: time decode as if N tokens deep, on a stale cache
+            m.pos = opt("--deep").map_or(m.pos, |v| v.parse().unwrap());
             eprintln!("prompt: {} tokens, {:.1} t/s", toks.len(), toks.len() as f64 / pp);
             let (t0, mut gpu) = (Instant::now(), 0.);
             m.save();
@@ -163,8 +167,9 @@ fn main() {
             let (toks, gen) = (ids(&format!("{d}/tokens.txt")), ids(&format!("{d}/gen.txt")));
             let lg = f32s(&format!("{d}/logits.f32"));
             let nv = 200058;
-            let (mut kls, mut flips) = (vec![], 0);
-            // -ub: the prompt by feed() (batched), not step by step
+            let (mut kls, mut flips, mut rows, mut gt) = (vec![], 0, vec![], vec![]);
+            // -ub: the prompt by feed() (batched), not step by step.
+            // LOGITS=file keeps every row
             let (mut next, ub) = (0, opt("-ub").is_some());
             if ub {
                 next = m.feed(&toks);
@@ -177,8 +182,12 @@ fn main() {
                     continue;
                 };
                 // i is the step that feeds gen[g]; next predicts gen[g]
+                let row = m.logits();
                 if let Some(r) = lg.chunks(nv).nth(g) {
-                    kls.push(kl(r, &m.logits()));
+                    kls.push(kl(r, &row));
+                }
+                if std::env::var("LOGITS").is_ok() {
+                    rows.extend(row.iter().flat_map(|v| v.to_le_bytes()));
                 }
                 if next != t {
                     flips += 1;
@@ -187,6 +196,7 @@ fn main() {
                 let sd = format!("{d}/s{g:04}");
                 if !fs::exists(&sd).unwrap() {
                     next = m.step(t);
+                    gt.push(1e3 * m.t);
                     continue;
                 }
                 // one command buffer per visit; compare the named nodes
@@ -196,6 +206,20 @@ fn main() {
                 for v in 0..=vs.len() {
                     m.gpu.run(|e| ops.iter().filter(|o| o.1 == v).for_each(|o| o.2(e)));
                     let Some(&(phys, slot, _)) = vs.get(v) else { break };
+                    // a different expert set, and the reference's margin
+                    // between its 8th and 9th
+                    let rd = |n: &str| fs::read(format!("{sd}/ffn_moe_{n}-{slot}.i32")).unwrap();
+                    let i32s = |b: Vec<u8>| -> Vec<u32> {
+                        b.chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()
+                    };
+                    let (mut e, mut r) = (m.experts(), i32s(rd("topk")));
+                    e.sort();
+                    r.sort();
+                    if e != r {
+                        let (o, pb) = (i32s(rd("argsort")), f32s(&format!("{sd}/ffn_moe_probs_biased-{slot}.f32")));
+                        let d = pb[o[7] as usize] - pb[o[8] as usize];
+                        println!("step {g} visit {v} slot {slot}: experts differ, ref margin {d:.2e}");
+                    }
                     for nm in ["Qcur", "Kcur", "Vcur", "Rcur", "kqv_out", "gate", "is", "ffn_inp",
                         "ffn_moe_out"] {
                         let mut r = f32s(&format!("{sd}/{nm}-{slot}.f32"));
@@ -227,6 +251,10 @@ fn main() {
                     println!("  {k:24} {e:.2e} ({s})");
                 }
             }
+            if let Ok(f) = std::env::var("LOGITS") {
+                fs::write(f, rows).unwrap();
+            }
+            println!("gpu ms/token: {:.1}", gt.iter().sum::<f64>() / gt.len().max(1) as f64);
             let mean = kls.iter().sum::<f64>() / kls.len().max(1) as f64;
             let max = kls.iter().fold(0f64, |a, &b| a.max(b));
             println!(

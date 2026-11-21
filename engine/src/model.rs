@@ -15,9 +15,9 @@ pub mod snap;
 
 const N: usize = 2304;
 const OPS: &str = include_str!("ops.metal");
-pub const KINDS: [&str; 13] = [
-    "dots", "elem", "low", "ctl", "rows", "post", "attn", "merge", "top8", "act",
-    "msg", "amax", "best",
+pub const KINDS: [&str; 15] = [
+    "dots", "elem", "low", "ctl", "rows", "post", "score", "smax", "gather",
+    "merge", "top8", "act", "msg", "amax", "best",
 ];
 // regions of the activation buffer, in floats. 0 means "none" in params.
 const PRE: usize = N; // prelude output
@@ -46,7 +46,8 @@ const GU: usize = WT + 8; // 8 expert gate_up rows
 const HH: usize = GU + 8 * N;
 const MSG: usize = HH + 4 * N; // 12 layers x 4 messages
 const LG: usize = MSG + 48 * N; // logits
-const PT: usize = LG + 201024; // attention partials, to the end
+const PT: usize = LG + 201024; // attention scratch, to the end: scores
+// (24 per key), their maxima per 8 keys, the 24 maxima, partials per 256
 const CH: usize = 6656; // conv channels per slot
 const CS: usize = 16 * CH; // conv state floats per slot, a ring of 16
 const SW: usize = 2048; // sliding window ring
@@ -108,6 +109,7 @@ pub struct Model {
     kvo: Vec<usize>, // kv slot offsets, in halfs
     hp: [f32; 4],    // qk clip, rel clip, log floor, log alpha
     n_ctx: usize,
+    pub q8: bool, // full-attention cache as int8 with f16 scales
     pub pos: usize,
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
@@ -236,19 +238,20 @@ impl Model {
         let (sb, hb) = (gpu.buf(4 * s.len()), gpu.buf(2 * sh.len()));
         slice::<f32>(&sb)[..s.len()].copy_from_slice(&s);
         slice::<u16>(&hb)[..sh.len()].copy_from_slice(&sh);
+        let q8 = std::env::var("KV").is_ok_and(|v| v == "q8");
         let mut kvo = vec![0];
         let mut by_slot = visits();
         by_slot.sort_by_key(|v| v.1);
         for (i, _, _) in by_slot {
-            let n = if i % 6 != 5 { SW } else { n_ctx };
-            kvo.push(kvo.last().unwrap() + n * 2048);
+            let n = if i % 6 != 5 { SW * 2048 } else { n_ctx * Self::row(q8) };
+            kvo.push(kvo.last().unwrap() + n);
         }
-        let nc = n_ctx.div_ceil(128).max(8);
+        let nk = n_ctx.max(1024) + 256;
         let pipes = KINDS.map(|k| (k, gpu.pipe(OPS, "", k))).into();
         Model {
             mv: Mv::new(&gpu, ""),
             pipes,
-            a: gpu.buf(4 * (PT + nc * 24 * 130)),
+            a: gpu.buf(4 * (PT + nk * 27 + 24 + nk.div_ceil(256) * 24 * 132)),
             s: sb,
             sh: hb,
             kv: gpu.buf(2 * kvo[48]),
@@ -269,6 +272,7 @@ impl Model {
                 g.f("inkling2.attention.log_scale_alpha") as f32,
             ],
             n_ctx,
+            q8,
             pos: 0,
             t: 0.,
             ck: None,
@@ -276,6 +280,11 @@ impl Model {
             g,
             gpu,
         }
+    }
+
+    // halfs per key of a full-attention slot
+    pub fn row(q8: bool) -> usize {
+        if q8 { 1088 } else { 2048 }
     }
 
     pub fn reset(&mut self) {
@@ -297,7 +306,8 @@ impl Model {
     // checkpoint the state at pos, for truncate()
     pub fn save(&mut self) {
         let kv = slice::<u16>(&self.kv);
-        let w = self.swa(self.pos).flat_map(|r| &kv[r]).copied().collect();
+        let mut w = vec![];
+        self.swa(self.pos).for_each(|r| w.extend_from_slice(&kv[r]));
         self.ck = Some((self.pos, slice::<f32>(&self.cs).to_vec(), w));
     }
 
@@ -393,12 +403,19 @@ impl Model {
                 (pos, pos + 1, 1. + self.hp[3] * t)
             };
             let (cs, kv) = (slot * CS, self.kvo[slot]);
+            let q8 = self.q8 && !l.swa;
             k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd, l.vd,
-                cs, kv + idx * 2048, f32::to_bits(tau), self.hp[0].to_bits(),
-                self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK);
-            let nc = nk.div_ceil(128);
-            k!("attn", [nc, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb);
-            k!("merge", [24, 1, 1], 32, PT, nc, SK, G, O, IS);
+                cs, kv + idx * Self::row(q8), f32::to_bits(tau), self.hp[0].to_bits(),
+                self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK, q8);
+            let (ng, nc) = (nk.div_ceil(128), nk.div_ceil(256));
+            let nm = self.n_ctx.max(1024) + 256;
+            let (mx, gm, pa) = (PT + 24 * nm, PT + 27 * nm, PT + 27 * nm + 24);
+            k!("score", [ng, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb, mx, q8);
+            let th = (ng * 16).next_multiple_of(32).min(1024);
+            k!("smax", [24, 1, 1], th, mx, ng * 16, SK, gm, th);
+            k!("gather", [nc, 8, 1], 512, gm, 0, PT, kv, nk, pos, l.swa, 0, pa, q8);
+            let ns = nc.min(16);
+            k!("merge", [24, 1, 1], 32 * ns, pa, nc, SK, G, O, IS, gm, ns);
             mv!("mv", l.o, O, AO, 3072, N);
             nb += first as usize;
             let (r, st) = (if first { 0 } else { H }, cs + 2048);
@@ -476,6 +493,11 @@ impl Model {
             self.pos += c.len();
         }
         self.step(*l)
+    }
+
+    // the experts of the last visit
+    pub fn experts(&self) -> Vec<u32> {
+        slice::<u32>(&self.id)[..8].to_vec()
     }
 
     // greedy id of the last step

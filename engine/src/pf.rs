@@ -60,7 +60,7 @@ pub struct Pf {
 impl Pf {
     fn new(g: &Gpu, tb: usize) -> Pf {
         let d = format!("#define STR {STR}\n");
-        let ks = ["prep", "ctl", "post", "relb", "attn", "mid", "top", "act", "dsum",
+        let ks = ["prep", "ctl", "post", "relb", "attn", "attq", "mid", "top", "act", "dsum",
             "fin", "end", "msg"];
         let ty = [1, 8, 12, 13, 14, 16, 17, 18, 20, 22, 40];
         let f = |t| if t == 1 { "mm_f16".into() } else { format!("mm_{}", name(t)) };
@@ -182,15 +182,23 @@ impl Model {
                 small(e, l.vd as usize, x(2), DV, N, 32);
             }
             let (cs, kv, dk) = (slot * CS, self.kvo[slot], if l.swa { 0 } else { DK });
+            let q8 = self.q8 && !l.swa;
             k!(e, "post", g1, 32, Q, K, V, R, l.qc, l.rc, l.kc, l.vc, dk, DV, cs, pos,
                 l.swa, self.hp[0].to_bits(), self.hp[1].to_bits(),
-                self.hp[2].to_bits(), self.hp[3].to_bits(), kv);
+                self.hp[2].to_bits(), self.hp[3].to_bits(), kv, q8);
             k!(e, "relb", [32, 24, t], 32, R, l.rb);
             // bound the keys of one dispatch
             let tq = ((1 << 22) / if l.swa { 1024 } else { pos + t }).max(8) / 8 * 8;
             for t0 in (0..t).step_by(tq) {
-                k!(e, "attn", [8, (t - t0).min(tq).div_ceil(8), 1], 96, Q, 0, SK, kv,
-                    G, pos, l.swa, 0, O, t0, t);
+                let n = (t - t0).min(tq);
+                if q8 {
+                    // the q8 cache keeps the scalar kernel
+                    k!(e, "attq", [8, n, 1], 96, Q, R, SK, kv, G, pos, l.swa, l.rb, O,
+                        t0, q8);
+                } else {
+                    k!(e, "attn", [8, n.div_ceil(8), 1], 96, Q, 0, SK, kv, G, pos,
+                        l.swa, 0, O, t0, t);
+                }
             }
             dense(e, l.o, O, AO, 3072, N);
             k!(e, "mid", g1, 32, F, BK, nbs[v].1, 1, l.fq, XF, 1, msg, 0, 3, l.fnw,

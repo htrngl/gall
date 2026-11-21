@@ -12,8 +12,12 @@ using namespace metal;
 #define CH 6656 // conv channels per slot: k, v, attention out, ffn out
 #define CR 16 // conv ring: the last 3 inputs, and 12 steps of rollback
 #define SW 2048 // sliding window ring: window 1024 and as much rollback
-#define C 128 // keys per attention chunk: 16 simdgroups of 8
-#define PW 130 // floats per attention partial: acc[128], max, sum
+#ifndef KG
+#define KG 8 // keys per simdgroup, attention scores
+#define KV 16 // and weighted v
+#endif
+#define C (16 * KV) // keys per attention chunk
+#define PW 132 // floats per attention partial: acc[128], sum
 #define GP uint3 gp [[threadgroup_position_in_grid]], \
   uint ln [[thread_index_in_simdgroup]]
 #define TG GP, uint t [[thread_index_in_threadgroup]], \
@@ -158,7 +162,7 @@ kernel void rows(U p [[buffer(0)]], A a [[buffer(1)]],
 // p: 0 q, 1 k, 2 rel, 3 q clip, 4 rel clip, 5 k conv, 6 v conv,
 // 7 k taps, 8 v taps (0: none), 9 conv state, 10 kv write (halfs), 11 tau,
 // 12 qk clip, 13 rel clip, 14 pos, 15 v, 16 nx, 17 x, 18 q scale out,
-// 19 sink w, 20 sink out
+// 19 sink w, 20 sink out, 21 q8
 kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                  device half *kv [[buffer(3)]], A cs [[buffer(4)]],
                  SH sh [[buffer(6)]], TG) {
@@ -203,74 +207,128 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
     y = simd_sum(dot(x, x));
     x *= j ? rsqrt(y / 128 + 1e-6) : 1 / max(1., (sqrt(y) + 1e-6) / F(12));
     W(a + p[1] + c, 0) = x;
-    ((device half4 *)(kv + p[10] + c))[0] = half4(x);
+    if (!p[21]) {
+      ((device half4 *)(kv + p[10] + c))[0] = half4(x);
+      continue;
+    }
+    // q8: lanes 8b..8b+7 hold block b of 32
+    float4 ax = abs(x);
+    float qd = 0, mx = max(max(ax.x, ax.y), max(ax.z, ax.w));
+    for (uint b = 0; b < 4; b++) {
+      float mb = simd_max(ln / 8 == b ? mx : 0);
+      if (ln / 8 == b) qd = mb;
+    }
+    device half *r = kv + p[10] + (j * 8 + h) * 68;
+    half hd = half(qd / 127);
+    ((device char4 *)r)[ln] =
+        char4(clamp(round(x / max(float(hd), 1e-20)), -127., 127.));
+    if (ln % 8 == 0) r[64 + ln / 8] = hd;
   }
 }
 
-// one query over a chunk of C keys per (chunk, kv head) threadgroup of 16
-// simdgroups: a simdgroup takes 8 keys in turn with lane = 4 dims, so a
-// score is one simd_sum; online softmax (acc, max, sum) for the 3 q heads
-// of the kv head, merged over the threadgroup.
-// key j is position j, or pos - j in the sliding window ring
-// p: 0 q, 1 rel, 2 partials, 3 kv slot (halfs), 4 keys, 5 pos, 6 swa,
-// 7 rel bias
-kernel void attn(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
-                 const device half *kv [[buffer(3)]], TG) {
-  threadgroup float ml[16 * 6];
-  threadgroup float4 ac[16 * 3 * 32];
-  uint h = gp.y * 3;
-  const device half4 *k = (const device half4 *)(kv + p[3] + gp.y * 128);
-  float4 q[3], acc[3];
-  float3 rl = 0, m = -1e30, l = 0;
+// attention for one query in 4 dispatches, so that no thread runs a long
+// chain: scores, their maximum, weighted v, sum. bound by the cache read
+// (~81 GB/s in f16; q8 reads half and is no faster).
+// key j is position j, or pos - j in the sliding window ring; a cache row
+// (k of kv head r, v at 8 + r) is 128 f16, or with q8 128 int8 and their
+// 4 f16 scales, as q8_0
+static float4 kvl(const device half *kv, U p, uint j, uint r, uint ln) {
+  j = p[6] ? (p[5] - j) % SW : j;
+  if (!p[9]) return float4(((const device half4 *)(kv + j * 2048))[r * 32 + ln]);
+  kv += j * 1088 + r * 68;
+  return float4(((const device char4 *)kv)[ln]) * float(kv[64 + ln / 8]);
+}
+
+// 1: scores, grid (keys / 16 KG, kv heads) of 16 simdgroups. a simdgroup
+// with lane = 4 dims takes KG keys in turn: a score is one simd_sum. leaves the scores of the
+// 3 q heads and their maxima over the group
+// p: 0 q, 1 rel, 2 scores, 3 kv slot (halfs), 4 keys, 5 pos, 6 swa,
+// 7 rel bias, 8 maxima, 9 q8
+kernel void score(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
+                  const device half *kv [[buffer(3)]], TG) {
+  uint h = gp.y * 3, g = gp.x * 16 + sg;
+  float4 q[3];
+  float3 rl = 0, m = -1e30, o;
   for (uint i = 0; i < 3; i++) {
-    q[i] = L(a + p[0] + (h + i) * 128, ln), acc[i] = 0;
+    q[i] = L(a + p[0] + (h + i) * 128, ln);
     if (ln < 16) rl[i] = a[p[1] + (h + i) * 16 + ln];
   }
-  for (uint j = gp.x * C + sg * 8, j1 = min(j + 8, p[4]); j < j1; j++) {
-    uint d = p[6] ? j : p[5] - j, r = (p[6] ? (p[5] - j) % SW : j) * 512;
-    float4 kk = float4(k[r + ln]), vv = float4(k[r + 256 + ln]);
-    float b = 0;
-    if (d < 1024 && ln < 16) b = s[p[7] + d * 16 + ln];
-    for (uint i = 0; i < 3; i++) {
-      float o = simd_sum(dot(kk, q[i]) * 0.08838834764 + b * rl[i]);
-      float w = exp(min(o, m[i]) - max(o, m[i]));
-      bool up = o > m[i];
-      m[i] = max(o, m[i]);
-      l[i] = up ? l[i] * w + 1 : l[i] + w;
-      acc[i] = up ? acc[i] * w + vv : acc[i] + w * vv;
-    }
+  for (uint j = g * KG, j1 = min(j + KG, p[4]); j < j1; j++) {
+    uint d = p[6] ? j : p[5] - j;
+    float4 k = kvl(kv + p[3], p, j, gp.y, ln);
+    float b = d < 1024 && ln < 16 ? s[p[7] + d * 16 + ln] : 0;
+    for (uint i = 0; i < 3; i++)
+      o[i] = simd_sum(dot(k, q[i]) * 0.08838834764 + b * rl[i]);
+    m = max(m, o);
+    if (ln < 3) a[p[2] + j * 24 + h + ln] = o[ln];
+  }
+  if (ln < 3) a[p[8] + g * 24 + h + ln] = m[ln];
+}
+
+// 2: the maximum per q head over the groups and the sink; a threadgroup
+// of p[4] threads per head. p: 0 maxima, 1 groups, 2 sink, 3 out
+kernel void smax(U p [[buffer(0)]], A a [[buffer(1)]], TG) {
+  threadgroup float r[32];
+  float m = -1e30;
+  for (uint g = t; g < p[1]; g += p[4]) m = max(m, a[p[0] + g * 24 + gp.x]);
+  m = simd_max(m);
+  if (!ln) r[sg] = m;
+  BAR;
+  m = simd_max(ln < p[4] / 32 ? r[ln] : -1e30);
+  if (!t) a[p[3] + gp.x] = max(m, a[p[2] + gp.x]);
+}
+
+// 3: weighted v, grid (keys / C, kv heads) of 16 simdgroups, KV keys in
+// turn each. leaves (acc[128], sum) per chunk and q head. skipping keys
+// of no weight does not pay: at 10k deep all are within e^-20 of the
+// maximum, and 75% are needed for 1 - 1e-3 of it
+// p: 0 max, 2 scores, 3 kv slot, 4 keys, 5 pos, 6 swa, 8 partials, 9 q8
+kernel void gather(U p [[buffer(0)]], A a [[buffer(1)]],
+                   const device half *kv [[buffer(3)]], TG) {
+  threadgroup float4 ac[16 * 3 * 32];
+  threadgroup float ls[16 * 3];
+  uint h = gp.y * 3;
+  float3 m = float3(a[p[0] + h], a[p[0] + h + 1], a[p[0] + h + 2]), l = 0;
+  float4 acc[3] = {0, 0, 0};
+  for (uint j = gp.x * C + sg * KV, j1 = min(j + KV, p[4]); j < j1; j++) {
+    float3 w = exp(float3(*(const device packed_float3 *)(a + p[2] + j * 24 + h)) - m);
+    l += w;
+    float4 v = kvl(kv + p[3], p, j, 8 + gp.y, ln);
+    for (uint i = 0; i < 3; i++) acc[i] += w[i] * v;
   }
   for (uint i = 0; i < 3; i++) {
     ac[(sg * 3 + i) * 32 + ln] = acc[i];
-    if (!ln) ml[sg * 6 + i] = m[i], ml[sg * 6 + 3 + i] = l[i];
+    if (!ln) ls[sg * 3 + i] = l[i];
   }
   BAR;
   if (sg > 2) return;
-  float mm = -1e30, ll = 0;
   float4 o = 0;
-  for (uint g = 0; g < 16; g++) mm = max(mm, ml[g * 6 + sg]);
-  for (uint g = 0; g < 16; g++) {
-    float w = exp(ml[g * 6 + sg] - mm);
-    ll += w * ml[g * 6 + 3 + sg], o += w * ac[(g * 3 + sg) * 32 + ln];
-  }
-  A out = a + p[2] + (gp.x * 24 + h + sg) * PW;
+  float ll = 0;
+  for (uint g = 0; g < 16; g++)
+    ll += ls[g * 3 + sg], o += ac[(g * 3 + sg) * 32 + ln];
+  A out = a + p[8] + (gp.x * 24 + h + sg) * PW;
   W(out, ln) = o;
-  if (!ln) out[128] = mm, out[129] = ll;
+  if (!ln) out[128] = ll;
 }
 
-// merge the partials with the sink; gate with sigmoid. one group per head
-// p: 0 partials, 1 chunks, 2 sink, 3 gate, 4 out, 5 q scale
-kernel void merge(U p [[buffer(0)]], A a [[buffer(1)]], GP) {
-  float m = a[p[2] + gp.x], l = 0;
+// 4: sum the partials, each of the p[7] simdgroups takes its share of the
+// chunks; normalize with the sink, gate with sigmoid. a threadgroup per head
+// p: 0 partials, 1 chunks, 2 sink, 3 gate, 4 out, 5 q scale, 6 max
+kernel void merge(U p [[buffer(0)]], A a [[buffer(1)]], TG) {
+  threadgroup float4 ac[16 * 32];
+  threadgroup float ls[16];
+  float l = 0;
   float4 acc = 0;
-  for (uint c = 0; c < p[1]; c++)
-    m = max(m, a[p[0] + (c * 24 + gp.x) * PW + 128]);
-  for (uint c = 0; c < p[1]; c++) {
+  for (uint c = sg; c < p[1]; c += p[7]) {
     S o = a + p[0] + (c * 24 + gp.x) * PW;
-    float w = exp(o[128] - m);
-    l += w * o[129], acc += w * L(o, ln);
+    l += o[128], acc += L(o, ln);
   }
-  acc /= l + exp(a[p[2] + gp.x] - m);
+  ac[t] = acc;
+  if (!ln) ls[sg] = l;
+  BAR;
+  if (sg) return;
+  for (uint g = 1; g < p[7]; g++) l += ls[g], acc += ac[g * 32 + ln];
+  acc /= l + exp(a[p[2] + gp.x] - a[p[6] + gp.x]);
   uint e = gp.x * 128 + ln * 4;
   W(a + p[4] + e, 0) = acc / (1 + exp(-L(a + p[3] + e, 0) * a[p[5]]));
 }
