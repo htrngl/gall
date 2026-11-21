@@ -84,6 +84,11 @@ measured on this machine, one run each, nothing else loaded.
   block 3 11.1/16.8/15.2; a block 2 run was killed by `./wd` at 5% free.
   level with llama.cpp, so no reason to switch engines.
 
+- UD-IQ3_XXS (11.66GB file, 10.85GiB weights) against UD-Q3_K_XL, same
+  build, back to back, ub 256, fa on: pp512 117.3 vs 119.2, tg64 14.84 vs
+  14.75 t/s; perplexity on 8 x 512 tokens of llama.cpp docs 4.5867 vs
+  4.5921 (+-0.23). same speed and quality, 1.8GiB less memory.
+
 ## depth
 
 - decode slows with cache depth. at 8.3k tokens deep: f16 KV 12.4 t/s, q8_0
