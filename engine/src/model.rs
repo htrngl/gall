@@ -9,8 +9,10 @@ use std::collections::HashMap;
 
 const N: usize = 2304;
 const OPS: &str = include_str!("ops.metal");
-const KINDS: [&str; 9] =
-    ["prep", "post", "attn", "merge", "mid", "act", "fin", "msg", "amax"];
+const KINDS: [&str; 13] = [
+    "dots", "elem", "low", "ctl", "rows", "post", "attn", "merge", "top8", "act",
+    "msg", "amax", "best",
+];
 // regions of the activation buffer, in floats. 0 means "none" in params.
 const PRE: usize = N; // prelude output
 const H: usize = 2 * N; // residual stream
@@ -20,21 +22,28 @@ const F: usize = 7 * N; // ffn_inp
 const AO: usize = 8 * N; // attention output after wo
 const D: usize = 9 * N; // expert output
 const BK: usize = 10 * N; // normalized block stack, 5 deep
-const TMP: usize = 15 * N;
-const Q: usize = 17 * N; // q, gate, attention out: 3072 each
+const VR: usize = 15 * N; // mixed inputs before the norm, 3
+const TMP: usize = 18 * N; // control inputs, 3 x 2N
+const Q: usize = 24 * N; // q, gate, attention out: 3072 each
 const G: usize = Q + 3072;
 const O: usize = G + 3072;
-const K: usize = O + 3072;
-const V: usize = K + 1024;
-const R: usize = V + 1024;
-const SK: usize = R + 384;
-const WT: usize = SK + 24;
+const K: usize = O + 3072; // k then v
+const R: usize = K + 2048;
+const SK: usize = R + 384; // sinks
+const DK: usize = SK + 24; // dynamic conv taps, k then v
+const GC: usize = DK + 64; // control low rank, 3 x 130
+const SC: usize = GC + 390; // mix scalars, 3 x 8
+const IS: usize = SC + 24; // rms scales: q input, ffn input
+const LGT: usize = IS + 2; // router logits
+const WT: usize = LGT + 128;
 const GU: usize = WT + 8; // 8 expert gate_up rows
 const HH: usize = GU + 8 * N;
 const MSG: usize = HH + 4 * N; // 12 layers x 4 messages
 const LG: usize = MSG + 48 * N; // logits
 const PT: usize = LG + 201024; // attention partials, to the end
-const CS: usize = 6656 * 3; // conv state floats per slot
+const CH: usize = 6656; // conv channels per slot
+const CS: usize = 16 * CH; // conv state floats per slot, a ring of 16
+const SW: usize = 2048; // sliding window ring
 
 type T = &'static Tensor;
 
@@ -94,6 +103,7 @@ pub struct Model {
     n_ctx: usize,
     pub pos: usize,
     pub t: f64, // gpu seconds of the last step
+    ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
 }
 
 // (physical layer, cache slot, pass) in execution order
@@ -193,7 +203,7 @@ impl Model {
         let mut by_slot = visits();
         by_slot.sort_by_key(|v| v.1);
         for (i, _, _) in by_slot {
-            let n = if i % 6 != 5 { 1024 } else { n_ctx };
+            let n = if i % 6 != 5 { SW } else { n_ctx };
             kvo.push(kvo.last().unwrap() + n * 2048);
         }
         let nc = n_ctx.div_ceil(256).max(4);
@@ -223,14 +233,51 @@ impl Model {
             n_ctx,
             pos: 0,
             t: 0.,
+            ck: None,
             g,
             gpu,
         }
     }
 
     pub fn reset(&mut self) {
-        self.pos = 0;
+        (self.pos, self.ck) = (0, None);
         slice::<f32>(&self.cs).fill(0.);
+    }
+
+    // the sliding window cache rows of the n positions before pos
+    fn swa(&self, pos: usize) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+        let v = visits().into_iter().filter(|v| v.0 % 6 != 5);
+        v.flat_map(move |(_, slot, _)| {
+            (pos.saturating_sub(1024)..pos).map(move |p| {
+                let o = self.kvo[slot] + p % SW * 2048;
+                o..o + 2048
+            })
+        })
+    }
+
+    // checkpoint the state at pos, for truncate()
+    pub fn save(&mut self) {
+        let kv = slice::<u16>(&self.kv);
+        let w = self.swa(self.pos).flat_map(|r| &kv[r]).copied().collect();
+        self.ck = Some((self.pos, slice::<f32>(&self.cs).to_vec(), w));
+    }
+
+    // forget all but the first n tokens: a few steps back by the rings,
+    // or back to the checkpoint. false: not possible, reset
+    pub fn truncate(&mut self, n: usize) -> bool {
+        if n <= self.pos && self.pos - n <= 12 {
+            self.ck.take_if(|c| c.0 > n);
+        } else if let Some((_, cs, w)) = self.ck.as_ref().filter(|c| c.0 == n) {
+            slice::<f32>(&self.cs).copy_from_slice(cs);
+            let kv = slice::<u16>(&self.kv);
+            for (r, w) in self.swa(n).zip(w.chunks(2048)) {
+                kv[r].copy_from_slice(w);
+            }
+        } else {
+            return false;
+        }
+        self.pos = n;
+        true
     }
 
     // the dispatches of one token: (kind, visit, encode)
@@ -266,60 +313,84 @@ impl Model {
                 })));
             }};
         }
-        let emb = self.emb;
+        let (emb, t32) = (self.emb, [18, 1, 1]);
         ops.push(("row", 0, Box::new(move |e: &Enc| {
-            self.mv.row(e, emb.ty, self.gpu.w(emb), tok as usize, (&self.a, 4 * H), N)
+            self.mv.row(e, emb.ty, self.gpu.w(emb), tok as usize, (&self.a, 4 * VR), N)
         })));
-        k!("prep", [1, 1, 1], 768, H, BK, 0, 0, 0, H, 1, 0, 0, 0, self.tn, 0, 0, TMP);
-        let mut nb = 0;
+        k!("dots", [2, 1, 1], 576, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC);
+        k!("elem", t32, 32, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC, 1, VR, H, self.tn,
+            0, 0, 1);
+        let (mut nb, mut fin) = (0, [0, H, 0, 0, 0]); // pending ffn conv
         for (i, slot, pass) in visits() {
             let l = &self.l[i];
             let (first, lp) = (i % 6 == 0, pass > 0);
-            let h = if i == 6 { PRE } else { H };
             let msg = if lp { MSG + (i - 6) * 4 * N } else { 0 };
-            if i == 6 {
-                nb = 1;
-            }
             let nx = if lp || !l.swa { 3 } else { 1 };
             let x = |j: usize| X + (nx / 3) * j * N;
-            k!("prep", [1, 1, 1], 768, h, BK, nb, l.nq, l.aq, X, nx, msg, l.ctl, 0,
-                l.nw[0], l.nw[1], l.nw[2], TMP);
+            if i == 6 {
+                nb = 1;
+                fin[2] = PRE;
+            }
+            if i == 6 && lp {
+                fin = [0, PRE, 0, 0, 0];
+            }
+            let ([f0, f1, f2, f3, f4], [w0, w1, w2]) = (fin, l.nw);
+            k!("dots", [nb + 2, l.nq.max(1) as usize, 1], 576, f0, f1, f2, f3, f4, pos,
+                BK, nb, l.nq, l.aq, SC);
+            k!("elem", t32, 32, f0, f1, f2, f3, f4, pos, BK, nb, l.nq, l.aq, SC, nx,
+                VR, X, w0, w1, w2);
+            if lp {
+                k!("low", [65, 3, 1], 576, VR, msg, l.ctl, GC);
+                k!("ctl", [72, 3, 1], 32, VR, msg, l.ctl, GC, X, w0, w1, w2);
+            }
             mv!("mv", l.q, x(0), Q, N, 3072);
             mv!("mv", l.k, x(1), K, N, 1024);
-            mv!("mv", l.v, x(2), V, N, 1024);
+            mv!("mv", l.v, x(2), K + 1024, N, 1024);
             mv!("mv", l.rel, x(0), R, N, 384);
             mv!("mv", l.gate, x(0), G, N, 3072);
             let (idx, nk, tau) = if l.swa {
-                (pos % 1024, (pos + 1).min(1024), 1.)
+                (pos % SW, (pos + 1).min(1024), 1.)
             } else {
                 let t = ((pos + 1) as f32 / self.hp[2]).max(1.).ln();
                 (pos, pos + 1, 1. + self.hp[3] * t)
             };
             let (cs, kv) = (slot * CS, self.kvo[slot]);
-            k!("post", [1, 1, 1], 768, X, Q, K, V, R, SK, l.sink, l.qc, l.rc, l.kc,
-                l.vc, l.kd, l.vd, cs, kv + idx * 2048, f32::to_bits(tau),
-                self.hp[0].to_bits(), self.hp[1].to_bits());
+            k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd, l.vd,
+                cs, kv + idx * 2048, f32::to_bits(tau), self.hp[0].to_bits(),
+                self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK);
             let nc = nk.div_ceil(256);
-            k!("attn", [nc, 8, 1], 96, Q, R, PT, kv, nk, pos, l.swa, l.rb);
-            k!("merge", [1, 1, 1], 768, PT, nc, SK, G, O);
+            k!("attn", [nc, 8, 1], 256, Q, R, PT, kv, nk, pos, l.swa, l.rb);
+            k!("merge", [24, 1, 1], 32, PT, nc, SK, G, O, IS);
             mv!("mv", l.o, O, AO, 3072, N);
             nb += first as usize;
-            k!("mid", [1, 1, 1], 768, F, BK, nb, 1, l.fq, XF, 1, msg, l.ctl, 3,
-                l.fnw, 0, 0, TMP, AO, if first { 0 } else { h }, cs + 2048 * 3,
-                l.apc, l.gi, l.pb, WT);
+            let (r, st) = (if first { 0 } else { H }, cs + 2048);
+            k!("dots", [nb + 2, 1, 1], 576, AO, r, F, st, l.apc, pos, BK, nb, 1, l.fq, SC);
+            k!("elem", t32, 32, AO, r, F, st, l.apc, pos, BK, nb, 1, l.fq, SC, 1, VR,
+                XF, l.fnw);
+            if lp {
+                let (m, c) = (msg + 3 * N, l.ctl as usize + 768 * N);
+                k!("low", [65, 1, 1], 576, VR, m, c, GC);
+                k!("ctl", [72, 1, 1], 32, VR, m, c, GC, XF, l.fnw);
+            }
+            k!("rows", [128, 1, 1], 576, XF, l.gi, LGT);
+            k!("top8", [1, 1, 1], 576, LGT, l.pb, WT, VR, IS + 1);
             mv!("up", l.gu, XF, GU, N, N);
-            k!("act", [36, 1, 1], 256, GU, HH, WT, l.us, l.ds);
+            k!("act", [36, 1, 1], 256, GU, HH, WT, l.us, l.ds, IS + 1);
             mv!("down", l.dn, HH, D, 1152, N);
-            k!("fin", [9, 1, 1], 256, D, F, if i == 5 { PRE } else { H },
-                cs + 4352 * 3, l.fpc);
+            fin = [D, F, H, cs + 4352, l.fpc as usize];
             if i == 17 && pass < 2 {
-                k!("msg", [12, 1, 1], 768, BK + 2 * N, H, self.mq, MSG);
+                k!("elem", t32, 32, D, F, H, fin[3], fin[4], pos, BK, nb, 0, 0, SC);
+                k!("msg", [72, 12, 1], 32, BK + 2 * N, H, self.mq, MSG);
             }
             vi += 1;
         }
-        k!("prep", [1, 1, 1], 768, H, BK, nb, 1, self.oq, X, 1, 0, 0, 0, self.on, 0, 0, TMP);
+        let [f0, f1, _, f3, f4] = fin;
+        k!("dots", [nb + 2, 1, 1], 576, f0, f1, 0, f3, f4, pos, BK, nb, 1, self.oq, SC);
+        k!("elem", t32, 32, f0, f1, 0, f3, f4, pos, BK, nb, 1, self.oq, SC, 1, VR, X,
+            self.on);
         mv!("mv", self.out, X, LG, N, 201024);
-        k!("amax", [1, 1, 1], 768, LG, 200058, 8);
+        k!("amax", [1563, 1, 1], 32, LG, 200058, PT);
+        k!("best", [1, 1, 1], 1024, PT, 1563, 8);
         ops
     }
 
@@ -339,9 +410,11 @@ impl Model {
 
     // logits of the last step, unpadded vocabulary, after the softcap
     pub fn logits(&self) -> Vec<f32> {
-        let c = self.g.f("inkling2.final_logit_softcapping") as f32;
-        let l = &slice::<f32>(&self.a)[LG..LG + self.g.u("inkling2.vocab_size_unpadded")];
-        l.iter().map(|x| c * (x / c).tanh()).collect()
+        let (c, a) = (self.g.f("inkling2.final_logit_softcapping") as f32, slice::<f32>(&self.a));
+        // the output norm scale is left to the reader
+        let n = a[VR..VR + N].iter().map(|x| x * x).sum::<f32>() / N as f32;
+        let (n, l) = ((n + 1e-6).sqrt(), &a[LG..LG + self.g.u("inkling2.vocab_size_unpadded")]);
+        l.iter().map(|x| c * (x / n / c).tanh()).collect()
     }
 
     // a region of the activations by ref dump name
@@ -349,7 +422,7 @@ impl Model {
         let (o, n) = match name {
             "Qcur" => (Q, 3072),
             "Kcur" => (K, 1024),
-            "Vcur" => (V, 1024),
+            "Vcur" => (K + 1024, 1024),
             "Rcur" => (R, 384),
             "kqv_out" => (O, 3072),
             "ffn_inp" => (F, N),

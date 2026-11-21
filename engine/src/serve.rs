@@ -719,7 +719,7 @@ impl Lm for Dummy {
     }
 }
 
-// the engine as an Lm; it cannot roll back yet
+// the engine as an Lm; a checkpoint after each feed (the prompt)
 struct Ink(crate::model::Model, Vec<f32>);
 
 impl Lm for Ink {
@@ -735,14 +735,15 @@ impl Lm for Ink {
         self.0.pos
     }
     fn truncate(&mut self, n: usize) -> bool {
-        n == self.0.pos
+        self.0.truncate(n)
     }
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
-        let (l, h) = toks.split_last().unwrap();
-        for &t in h {
+        for &t in toks {
             self.0.step(t);
         }
-        self.step(*l)
+        self.0.save();
+        self.1 = self.0.logits();
+        &self.1
     }
 }
 

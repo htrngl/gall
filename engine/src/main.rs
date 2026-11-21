@@ -50,6 +50,25 @@ fn main() {
     let opt = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].clone());
     let n: usize = opt("-n").map_or(64, |v| v.parse().unwrap());
     let ctx = opt("-c").map_or(4096, |v| v.parse().unwrap());
+    if a[1] == "kb" {
+        // ink kb KERNEL GX,GY THREADS P0,P1,..: time 100 dispatches on zeros
+        let g = gpu::Gpu::new();
+        let b = [256, 512, 64, 128, 1].map(|n| g.buf(n << 20));
+        let pipe = g.pipe(include_str!("ops.metal"), "", &a[2]);
+        let v = |s: &str| s.split(',').map(|x| x.parse().unwrap()).collect::<Vec<usize>>();
+        let (gr, mut p) = (v(&a[3]), [0u32; 24]);
+        v(&a[5]).iter().enumerate().for_each(|(i, &x)| p[i] = x as u32);
+        for _ in 0..3 {
+            let t = g.run(|e| {
+                for _ in 0..10000 {
+                    let b = b.each_ref().map(|b| (b, 0));
+                    gpu::call(e, &pipe, &p, &b, [gr[0], gr[1], 1], a[4].parse().unwrap());
+                }
+            });
+            println!("{}: {:.1} us per dispatch", a[2], 1e2 * t);
+        }
+        return;
+    }
     let mut m = model::Model::open(&a[2], ctx);
     m.reset();
     match a[1].as_str() {
@@ -77,19 +96,20 @@ fn main() {
                 1. / w
             );
             if a.iter().any(|x| x == "--prof") {
-                // every dispatch in its own command buffer: read as shares
+                // ablation: the token without one kind of dispatch
                 let ops = m.sched(next);
-                let mut by: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
-                for _ in 0..4 {
-                    for o in &ops {
-                        let e = by.entry(o.0).or_default();
-                        *e = (e.0 + 1, e.1 + m.gpu.run(|e| o.2(e)));
-                    }
-                }
-                let tot: f64 = by.values().map(|v| v.1).sum();
-                eprintln!("{} dispatches, {:.1} ms isolated", ops.len(), 250. * tot);
-                for (k, (c, t)) in by {
-                    eprintln!("{k:8} {:5} {:7.2} ms", c / 4, 250. * t);
+                let run = |skip: &str| {
+                    let f = |_| m.gpu.run(|e| {
+                        ops.iter().filter(|o| o.0 != skip).for_each(|o| o.2(e))
+                    });
+                    (0..8).map(f).fold(1f64, f64::min)
+                };
+                let all = run("");
+                let mut by: BTreeMap<&str, usize> = BTreeMap::new();
+                ops.iter().for_each(|o| *by.entry(o.0).or_default() += 1);
+                eprintln!("{} dispatches, {:.1} ms", ops.len(), 1e3 * all);
+                for (k, c) in by {
+                    eprintln!("{k:8} {c:5} {:7.2} ms", 1e3 * (all - run(k)));
                 }
             }
         }
@@ -126,7 +146,7 @@ fn main() {
                     m.gpu.run(|e| ops.iter().filter(|o| o.1 == v).for_each(|o| o.2(e)));
                     let Some(&(phys, slot, _)) = vs.get(v) else { break };
                     for nm in ["Qcur", "Kcur", "Vcur", "Rcur", "ffn_inp",
-                        "ffn_moe_weights_scaled", "ffn_moe_out", "l_out"] {
+                        "ffn_moe_weights_scaled", "ffn_moe_out"] {
                         let mut r = f32s(&format!("{sd}/{nm}-{slot}.f32"));
                         let mut x = m.peek(nm, phys).unwrap().to_vec();
                         if r.len() == 8 {
