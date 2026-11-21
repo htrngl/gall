@@ -29,13 +29,17 @@ against llama.cpp reference dumps, teacher-forced: 0 greedy mismatches over
 
 ```sh
 cargo build --release
-. ./env                                  # M=path to the GGUF
-./wd target/release/gall serve $M --port 9940 --ctx 32768
+gall up          # server on port 9940, 32k context (gall up 102400 for more)
+gall down
+gall log
 ```
 
+`gall` is the wrapper script in the repo root, linked into
+`/opt/homebrew/bin`; `./env` holds the GGUF path. any other arguments go to
+the engine: `gall check $M ref/short -n 64`.
+
 openai-compatible `/v1/chat/completions` (streaming, tools, reasoning),
-`/v1/models`, `/health`. the hax preset `gall` points at port 9940. the
-installed copy is `~/.llama-app/gall/gall`.
+`/v1/models`, `/health`. the hax preset `gall` points at port 9940.
 
 `./wd` takes a machine-wide lock and kills the command if memory runs out.
 two copies of the model do not fit on the GPU: stop the llama app's model
