@@ -36,7 +36,12 @@ UNIT(bf16) {
 UNIT(q8_0) {
     W c = b + (e/4)*34;
     device const packed_char4 *q = (device const packed_char4 *)(c + 2 + 8*(e%4));
+#ifdef UP
+    return 127*F16(c)*DOT8(unpack_snorm4x8_to_float(as_type<uint>(char4(q[0]))),
+                           unpack_snorm4x8_to_float(as_type<uint>(char4(q[1]))));
+#else
     return F16(c)*DOT8(char4(q[0]), char4(q[1]));
+#endif
 }
 
 // q4_k/q5_k: 6-bit scale and min of sub-block j
@@ -100,8 +105,18 @@ UNIT(nvfp4) {
 #define SGN(v, sg, m) select(float4(v), -float4(v), (uint4(sg) & m) != 0)
 #define M0 uint4(1, 2, 4, 8)
 #define M1 uint4(16, 32, 64, 128)
+#ifdef UP
+// the 4 bytes of g, each negated where its bit of sg is set, as floats
+// in one unpack (no byte is 0, so the negation does not carry)
+static inline float4 sg4(uint g, uint sg) {
+    uint m = ((sg & 15)*0x204081) & 0x01010101;
+    return unpack_snorm4x8_to_float((g ^ (m*255)) + m);
+}
+#define GDOT(g0, g1, sg) (127*DOT8(sg4(uint(g0), sg), sg4(uint(g1), (sg) >> 4)))
+#else
 #define GDOT(g0, g1, sg) \
     DOT8(SGN(as_type<uchar4>(uint(g0)), sg, M0), SGN(as_type<uchar4>(uint(g1)), sg, M1))
+#endif
 
 UNIT(iq2_xxs) {
     uint ib = e/4, l = e%4;
@@ -136,6 +151,38 @@ UNIT(iq3_xxs) {
            GDOT(iq3xxs_grid[b[2 + 2*e]], iq3xxs_grid[b[3 + 2*e]], sg);
 }
 
+// both nibbles of 4 bytes: xa and xb are the inputs of the low and the
+// high nibbles, at elements xo_<fmt>(e) and that + NH of the group
+#define NIB(F) static inline float n_##F(W b, uint e, float4 xa, float4 xb)
+#define NDOT(t, q) (dot(LUT4(t, (q & 15)), xa) + dot(LUT4(t, (q >> 4)), xb))
+
+static inline uint xo_iq4_nl(uint e) { return 32*(e/4) + 4*(e%4); }
+NIB(iq4_nl) {
+    W c = b + (e/4)*18;
+    uint4 q = uint4(*(Q)(c + 2 + 4*(e%4)));
+    return F16(c)*NDOT(k_iq4nl, q);
+}
+
+static inline uint xo_nvfp4(uint e) { return 8*(e & ~1u) + 4*(e & 1); }
+NIB(nvfp4) {
+    W a = b + (e/8)*36;
+    uint c = a[e%8/2];
+    uint4 q = uint4(*(Q)(a + 4 + 4*(e%8)));
+    float d = c == 127 ? 0 : (float)as_type<half>((ushort)((c & 127) << 7))*256;
+    return d*NDOT(k_fp4, q);
+}
+
+#define ACCN(F, NH, R, w0, x) \
+    for (uint k = 0; 32*k + l < U; k++) { \
+        device const packed_float4 *xp = \
+            (device const packed_float4 *)((x) + 256*k + xo_##F(l)); \
+        float4 xa = xp[0], xb = xp[NH/4]; \
+        for (uint i = 0; i < R; i++) \
+            s[i] += n_##F((w0) + i*p.rb + k*gb, l, xa, xb); \
+    }
+#define ACC16(F, R, w0, x) ACCN(F, 16, R, w0, x)
+#define ACC8(F, R, w0, x) ACCN(F, 8, R, w0, x)
+
 // s[i] += unit l of every group of row i of R rows at w0, times x
 #define ACC(F, R, w0, x) \
     for (uint k = 0; 32*k + l < U; k++) { \
@@ -160,8 +207,8 @@ UNIT(iq3_xxs) {
 // mv: y[n_out] = W x.  up: y[e][n_out] = W[ids[e]] x, e < ne.
 // down: y[n_out] = sum_e W[ids[e]] x[e].  row: y[n_in] = row of W.
 // R rows per threadgroup (NR overrides it); n_out is a multiple of R.
-#define KERNELS(F, R) KERNELS_(F, R)
-#define KERNELS_(F, R) \
+#define KERNELS(F, R) KERNELS_(F, R, ACC)
+#define KERNELS_(F, R, ACC) \
 kernel void mv_##F(ARGS) { \
     HEAD(R); \
     ACC(F, R, w + (ulong)r0*p.rb, x) \
@@ -201,8 +248,8 @@ KERNELS(iq2_xxs, R(8))
 KERNELS(iq2_xs, R(4))
 KERNELS(iq2_s, R(8))
 KERNELS(iq3_xxs, R(8))
-KERNELS(iq4_nl, R(4))
-KERNELS(nvfp4, R(4))
+KERNELS_(iq4_nl, R(4), ACC16)
+KERNELS_(nvfp4, R(8), ACC8)
 
 // device bandwidth ceiling: every thread sums a contiguous run of words
 kernel void bw(constant P &p, device const uint4 *w [[buffer(1)]],

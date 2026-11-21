@@ -15,7 +15,9 @@ fn main() {
     let defs = std::env::var("DEFS").unwrap_or_default().replace(';', "\n") + "\n";
     let mut gpu = Gpu::new();
     gpu.map(&g);
+    let t0 = std::time::Instant::now();
     let m = mv::Mv::new(&gpu, &defs);
+    println!("compile {:.2} s", t0.elapsed().as_secs_f64());
     let mut seed = 1u64;
     let mut rnd = move || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -31,9 +33,9 @@ fn main() {
     // ceiling: 1GB of weights, summed as 16-byte words
     if filt.is_empty() || filt == "bw" {
         let w = gpu.w(g.t.values().min_by_key(|t| t.off).unwrap());
-        let p = gpu.pipe(mv::SRC, &defs, "bw");
         for n in [64u32, 1024, 16384] {
             let t = (1usize << 26) / n as usize;
+            let p = gpu.pipe(mv::SRC, &defs, "bw");
             let run = || gpu.run(|e| call(e, &p, &[n, 0, 0, 0], &[(w.0, 0), (&y, 0), (&y, 0)], [t / 32, 1, 1], 32));
             let s = run().min(run());
             println!("bw {n:5} words/thread {:5.1} GB/s", (1u64 << 30) as f64 / s / 1e9);
@@ -89,7 +91,7 @@ fn main() {
         let nan = ys[..n_y].iter().filter(|v| v.is_nan()).count();
         // time over every tensor of this type and shape, expert sets cycling
         let all: Vec<_> = g.t.values().filter(|o| o.ty == t.ty && o.dims == t.dims).collect();
-        let reps = (1.5e9 / (rows * rb) as f64).ceil().max(4.) as usize;
+        let reps = (1.5e9 / (rows * rb) as f64).ceil().max(64.) as usize;
         let run = || {
             gpu.run(|e| {
                 for i in 0..reps {
