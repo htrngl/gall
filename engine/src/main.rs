@@ -1,5 +1,7 @@
 // ink run MODEL --tokens FILE [-n 64] [-c 4096] [--prof]
 // ink check MODEL REFDIR [-n 64] [-c 4096]
+// ink pp MODEL TOKENS [-n all] [-ub 256] [-c 4096] [--cmp] [--ref REFDIR]
+// ink mmb
 // ink tok MODEL FILE
 // ink serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
 mod dr;
@@ -44,6 +46,7 @@ fn main() {
     match a[1].as_str() {
         "dr" => return dr::main(&a[2..]),
         "run" if a.iter().any(|x| x == "--draft") => return dr::run(&a[2..]),
+        "mmb" => return model::pf::bench(),
         "tok" => return tok::main(&a[2..]),
         "serve" => return serve::main(&a[2..]),
         _ => {}
@@ -116,6 +119,32 @@ fn main() {
                 for (k, c) in by {
                     eprintln!("{k:8} {c:5} {:7.2} ms", 1e3 * (run("") - run(k)));
                 }
+            }
+        }
+        "pp" => {
+            // batched prefill: speed, and logits against stepping / a ref row
+            let toks = ids(&a[3]);
+            let toks = &toks[..opt("-n").map_or(toks.len(), |_| n)];
+            let ub = opt("-ub").map_or(256, |v| v.parse().unwrap());
+            let t0 = Instant::now();
+            let rest = m.prefill(toks, ub);
+            let g = (toks.len() - rest.len()) as f64 / m.t;
+            let next = m.feed(rest);
+            let (w, n) = (t0.elapsed().as_secs_f64(), toks.len() as f64);
+            eprintln!("pp{n}: {:.1} t/s wall, {g:.1} gpu in passes, next {next}", n / w);
+            let lg = m.logits();
+            let diff = |r: &[f32]| {
+                let d = r.iter().zip(&lg).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                format!("max abs {d:.3}, kl {:.2e}", kl(r, &lg))
+            };
+            if let Some(d) = opt("--ref") {
+                eprintln!("ref row 0: {}", diff(&f32s(&format!("{d}/logits.f32"))[..lg.len()]));
+            }
+            if a.iter().any(|x| x == "--cmp") {
+                m.reset();
+                let mut s = 0;
+                toks.iter().for_each(|&t| s = m.step(t));
+                eprintln!("stepped: next {s}, {}", diff(&m.logits()));
             }
         }
         "check" => {

@@ -7,6 +7,9 @@ use crate::gpu::*;
 use crate::mv::Mv;
 use std::collections::HashMap;
 
+#[path = "pf.rs"]
+pub mod pf;
+
 const N: usize = 2304;
 const OPS: &str = include_str!("ops.metal");
 pub const KINDS: [&str; 13] = [
@@ -105,6 +108,7 @@ pub struct Model {
     pub pos: usize,
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
+    pf: Option<pf::Pf>,
 }
 
 // f32 to f16, round to nearest; tiny values to 0
@@ -265,6 +269,7 @@ impl Model {
             pos: 0,
             t: 0.,
             ck: None,
+            pf: None,
             g,
             gpu,
         }
@@ -441,6 +446,7 @@ impl Model {
     // decode toks (not empty), logits only for the last: no output head
     // and no wait between the others
     pub fn feed(&mut self, toks: &[u32]) -> u32 {
+        let toks = self.prefill(toks, 256);
         let (l, h) = toks.split_last().unwrap();
         for c in h.chunks(4) {
             let ops = c.iter().enumerate();
