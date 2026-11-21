@@ -83,8 +83,11 @@ fn main() {
             let pp = t0.elapsed().as_secs_f64();
             eprintln!("prompt: {} tokens, {:.1} t/s", toks.len(), toks.len() as f64 / pp);
             let (t0, mut gpu) = (Instant::now(), 0.);
+            m.save();
+            let mut out = vec![];
             for _ in 0..n {
                 print!("{next} ");
+                out.push(next);
                 next = m.step(next);
                 gpu += m.t;
             }
@@ -96,6 +99,14 @@ fn main() {
                 1e3 * gpu / n as f64,
                 1. / w
             );
+            if a.iter().any(|x| x == "--rollback") {
+                // 5 steps back by the rings, then back to the checkpoint
+                for k in [n - 5, 0] {
+                    assert!(m.truncate(toks.len() + k), "truncate {k}");
+                    let r = out[k..].iter().fold(0, |_, &t| m.step(t));
+                    eprintln!("rollback to +{k}: {}", if r == next { "ok" } else { "differs" });
+                }
+            }
             if a.iter().any(|x| x == "--prof") {
                 // ablation: the token without one kind of dispatch
                 let ops = m.sched(next, m.pos, true);

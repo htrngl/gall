@@ -5,6 +5,7 @@
 use crate::gguf::{self, Gguf, Tensor};
 use crate::gpu::*;
 use crate::mv::Mv;
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
 use std::collections::HashMap;
 
 #[path = "pf.rs"]
@@ -437,7 +438,24 @@ impl Model {
     // decode one token; returns the greedy next id
     pub fn step(&mut self, tok: u32) -> u32 {
         let ops = self.sched(tok, self.pos, true);
-        let t = self.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
+        // several command buffers: the gpu starts while the rest encodes
+        let t = objc2::rc::autoreleasepool(|_| {
+            let cbs: Vec<_> = ops
+                .chunks(128)
+                .map(|c| {
+                    let cb = self.gpu.q.commandBuffer().unwrap();
+                    let e = cb.computeCommandEncoder().unwrap();
+                    c.iter().for_each(|o| o.2(&e));
+                    e.endEncoding();
+                    cb.commit();
+                    cb
+                })
+                .collect();
+            let l = cbs.last().unwrap();
+            l.waitUntilCompleted();
+            assert!(l.error().is_none(), "metal: {:?}", l.error());
+            l.GPUEndTime() - cbs[0].GPUStartTime()
+        });
         drop(ops);
         (self.t, self.pos) = (t, self.pos + 1);
         self.next()
