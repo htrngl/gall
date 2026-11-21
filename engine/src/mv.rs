@@ -140,7 +140,7 @@ pub fn deq(ty: u32, row: &[u8], n: usize) -> Vec<f32> {
                 let v = (g >> (8 * j) & 255) as f32 * d;
                 if sg >> j & 1 == 1 { -v } else { v }
             };
-            let ls = |o: usize| (0.5 + (u(o + k / 4) >> (4 * (k % 4 / 2)) & 15) as f32);
+            let ls = |o: usize| 0.5 + (u(o + k / 4) >> (4 * (k % 4 / 2)) & 15) as f32;
             // q4_k, q5_k: scale and min of sub-block j
             let k4 = |j: usize| {
                 let s = |i: usize| u(4 + i);

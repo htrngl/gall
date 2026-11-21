@@ -41,27 +41,30 @@ UNIT(q8_0) {
 
 // q4_k/q5_k: 6-bit scale and min of sub-block j
 static inline float2 k4(W sc, uint j) {
-    return j < 4 ? float2(sc[j] & 63, sc[j + 4] & 63)
-                 : float2((sc[j + 4] & 15) | ((sc[j - 4] >> 6) << 4),
-                          (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4));
+    uint a = sc[j & 3], c = sc[4 + (j & 3)], h = sc[8 + (j & 3)];
+    return j < 4 ? float2(a & 63, c & 63)
+                 : float2((h & 15) | ((a >> 6) << 4), (h >> 4) | ((c >> 6) << 4));
 }
+#define D2 float2(*(device const packed_half2 *)b)
 
 UNIT(q4_k) {
     uint j = e/4, sh = 4*(j & 1);
     float2 sm = k4(b + 4, j);
     Q q = (Q)(b + 16 + 32*(j/2) + 8*(e%4));
-    return F16(b)*sm.x*DOT8((uint4(q[0]) >> sh) & 15, (uint4(q[1]) >> sh) & 15) -
-           F16(b + 2)*sm.y*(dot(xa, 1) + dot(xb, 1));
+    float2 d = D2*sm;
+    return d.x*DOT8((uint4(q[0]) >> sh) & 15, (uint4(q[1]) >> sh) & 15) -
+           d.y*(dot(xa, 1) + dot(xb, 1));
 }
 
 UNIT(q5_k) {
     uint j = e/4, sh = 4*(j & 1), o = 8*(e%4);
     float2 sm = k4(b + 4, j);
     Q h = (Q)(b + 16 + o), q = (Q)(b + 48 + 32*(j/2) + o);
-    return F16(b)*sm.x*DOT8(
+    float2 d = D2*sm;
+    return d.x*DOT8(
                ((uint4(q[0]) >> sh) & 15) + (((uint4(h[0]) >> j) & 1) << 4),
                ((uint4(q[1]) >> sh) & 15) + (((uint4(h[1]) >> j) & 1) << 4)) -
-           F16(b + 2)*sm.y*(dot(xa, 1) + dot(xb, 1));
+           d.y*(dot(xa, 1) + dot(xb, 1));
 }
 
 UNIT(q6_k) {
