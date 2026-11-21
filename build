@@ -1,0 +1,29 @@
+#!/bin/sh -e
+# engine = ggml-org/llama.cpp b12568 + unsloth pin set (pins.txt, in order,
+# as their CI merges it) + patches/. installs to ~/.llama-app/inkling-metal
+# and points /opt/homebrew/bin/llama (what the Llama app runs) at it.
+cd "$(dirname "$0")"
+U=d20fe00659286081a3e96efd800c3706a88155ea # unslothai master, merge tooling
+G="git -C src-mix -c user.name=mix -c user.email=mix@localhost"
+if [ ! -d src-mix ]; then
+  git clone --filter=blob:none https://github.com/ggml-org/llama.cpp src-mix
+  $G fetch -q --no-tags https://github.com/unslothai/llama.cpp $U
+  $G show $U:scripts/unsloth/additive_merge.py > src-mix/.git/am.py
+  $G checkout -q -B mix b12568
+  while read -r r n s; do
+    $G fetch -q --no-tags https://github.com/$r.git $s
+    $G -c merge.conflictStyle=diff3 merge -q --no-ff --no-edit \
+      -m "Merge $r#$n @ $s" $s ||
+      { (cd src-mix && python3 .git/am.py) && $G commit -q --no-edit; }
+  done < pins.txt
+  $G checkout -q -B metal mix
+  $G am -q ../patches/*.patch
+fi
+cmake -S src-mix -B src-mix/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_METAL_EMBED_LIBRARY=ON \
+  -DGGML_RPC=ON -DCMAKE_INSTALL_RPATH=@loader_path \
+  -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON >/dev/null
+ninja -C src-mix/build
+D=~/.llama-app/inkling-metal
+rsync -a --delete src-mix/build/bin/ $D/
+ln -sfn $D/llama /opt/homebrew/bin/llama

@@ -1,0 +1,41 @@
+From 1c4bef139e083ad43b5f2c1c182825cb3fc33f4f Mon Sep 17 00:00:00 2001
+From: Louis Goddard <louisgoddard@gmail.com>
+Date: Fri, 20 Nov 2026 23:26:29 +0000
+Subject: [PATCH 05/10] metal : key the GGML_METAL_PROF=2 table by op, type and
+ shape
+
+---
+ ggml/src/ggml-metal/ggml-metal-context.m | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 3025a2b17..5950024d8 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -569,7 +569,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+             prof = getenv("GGML_METAL_PROF") ? atoi(getenv("GGML_METAL_PROF")) : 0;
+         }
+         if (prof > 1 && gf->n_nodes > 100) {
+-            static struct { char name[64]; double t; int n; } acc[256];
++            static struct { char name[64]; double t; int n; } acc[1024];
+             static int n_acc = 0, n_graphs = 0;
+             [ctx->cmd_buf_last waitUntilCompleted];
+             ctx->cmd_buf_last = nil;
+@@ -586,12 +586,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+                 [cmd_buf commit];
+                 [cmd_buf waitUntilCompleted];
+                 char name[64];
+-                snprintf(name, sizeof(name), "%s%s %s %s", ggml_op_desc(node), res > 1 ? "+" : "", node->src[0] ? ggml_type_name(node->src[0]->type) : "", (node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "" : "skip");
++                snprintf(name, sizeof(name), "%s%s %s [%d,%d,%d,%d]%s", ggml_op_desc(node), res > 1 ? "+" : "", node->src[0] ? ggml_type_name(node->src[0]->type) : "", (int) node->ne[0], (int) node->ne[1], (int) node->ne[2], (int) node->ne[3], (node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "" : " skip");
+                 int k = 0;
+                 while (k < n_acc && strcmp(acc[k].name, name)) {
+                     k++;
+                 }
+-                if (k == n_acc && n_acc < 256) {
++                if (k == n_acc && n_acc < 1023) {
+                     strcpy(acc[n_acc++].name, name);
+                 }
+                 acc[k].t += cmd_buf.GPUEndTime - cmd_buf.GPUStartTime;
+-- 
+2.50.1 (Apple Git-155)
+

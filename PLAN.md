@@ -1,70 +1,115 @@
-# inkling-metal: scratch plan
+# inkling-metal
 
-speed up local inference of thinkingmachines' inkling-2-mini (26.2B MoE,
-3.4B active, middle 12 of 24 layers looped 3x, hybrid local/global attention)
-on an m2 macbook air, 24GB. llama.cpp edits are fair game. just ideas, not
-settled; measure before trusting any of it.
+local inference of thinkingmachines' inkling-2-mini (26.2B MoE, 3.4B active,
+middle 12 of 24 layers looped 3x, hybrid local/global attention) on an m2
+macbook air, 24GB, through a patched llama.cpp.
 
-## current setup (working, stable)
+## current setup
 
-- weights: `unsloth/Inkling-2-Mini-GGUF` UD-Q3_K_XL (13.6GB, top-1 96.3% vs
-  Q8_K_XL), in the HF cache. IQ4_XS, dspark drafter and mmproj were deleted.
-- engine: unsloth llama.cpp prebuilt `b12568-mix-8eebad4` (carries the looped
-  layer + dspark pins; stock llama.cpp can't run it) in
-  `~/.llama-app/unsloth-b12568/`.
-- served by the Llama menu bar app (router on `127.0.0.1:9931`). the app
-  checks `/opt/homebrew/bin/llama` first and overwrites `~/.llama-app/llama`
-  on launch, so brew's llama.cpp is unlinked and `/opt/homebrew/bin/llama`
-  is a symlink to the unsloth build. `brew link llama.cpp` undoes it.
+- weights: `unsloth/Inkling-2-Mini-GGUF` UD-Q3_K_XL (13.6GB), in the HF cache.
+  expert tensors of 20 layers are NVFP4 with per-expert scales.
+- engine: built here by `./build`: ggml-org/llama.cpp `b12568` + the 30
+  unsloth pins in `pins.txt` (merged in order, as their CI does) +
+  `patches/`. installed in `~/.llama-app/inkling-metal/`, and
+  `/opt/homebrew/bin/llama` (what the Llama menu bar app runs) links to it.
+  the unsloth prebuilt is still in `~/.llama-app/unsloth-b12568/`; relink to
+  go back. `brew link llama.cpp` restores brew's.
+- `./build` was run here from the build step on; its clone-and-merge
+  branch is the same sequence that made `src-mix` but was not re-run.
+- the installed prebuilt `b12568-mix-8eebad4` was 28 of those pins: it has no
+  chunked (#385) or banded (#386) attention. `git -C src-mix diff
+  mix-8eebad4 mix` shows the difference.
 - settings: `~/.config/llama/models.user.ini`, section
-  `[unsloth/Inkling-2-Mini-GGUF:Q3_K_XL]`: ctx 32768, ubatch 128, parallel 1,
-  cache-ram 512, ctx-checkpoints 2, spec-type none. ~14.8GB on device.
+  `[unsloth/Inkling-2-Mini-GGUF:Q3_K_XL]`: ctx 102400, ubatch 256,
+  flash-attn on, parallel 1, cache-ram 512, ctx-checkpoints 2, spec-type
+  none. ~16.6GB on device (12.7 model, 3.4 f16 KV, 0.5 compute).
 - hax preset `inkling` in `~/.config/hax/config.json`.
+
+## what changed and what it bought
+
+measured on this machine, one run each, nothing else loaded.
+
+| | prebuilt, 32k | now, 100k |
+| --- | --- | --- |
+| prefill, 512 tokens | 85 t/s (ub 128) | 121 t/s (ub 256), 126 (ub 512) |
+| decode, short context | 12.7 t/s (11.6 via app) | 14.4 t/s (15.7 via app) |
+| device memory, projected | 14.8GB | 16.6GB |
+| same settings at 100k | 22.2GB (does not fit) | 16.6GB |
+
+- `patches/0001`: metal kernel for `FLASH_ATTN_EXT_BANDED`. the relative
+  position bias and the per-query sink go into the half8x8 flash attention
+  kernel, so prefill no longer builds an n_kv x n_ubatch x n_head bias. the
+  compute buffer stops growing with context. also takes a q8_0 KV cache.
+  `test-backend-ops -o FLASH_ATTN_EXT_BANDED -b MTL0`: 46/46 against CPU.
+- `patches/0002`: NVFP4 expert mat-vec kernel wasted 25-44% of its lane
+  iterations on this model's row widths. decode 11.8 -> 13.8 t/s in a
+  back-to-back pair.
+- `patches/0006-0008, 0010`: fewer graph nodes per decoded token (12.6k ->
+  11.2k) in the bias path, `mix()` and `clip()`. GPU time 65.8 -> 61.5 ms
+  per token. the `mix()` and `clip()` rewrites are algebraically the same
+  but round differently: on a 2.3k-token prompt the temp-0 text diverges
+  after 15 tokens, and perplexity on 4 chunks moves 4.580 -> 4.558. drop
+  0007 and 0008 (about 3.5 ms per token) for strict identity.
+- `patches/0003-0005, 0009`: perf cases and env-gated profiling, inert unless set.
+  `GGML_METAL_PROF=1` prints encode/gpu/wall per graph, `=2` a per-op table,
+  `GGML_METAL_PROF_SKIP=",MUL_MAT,"` skips op types for ablation.
+- temp-0 output of the final build is byte-identical to the prebuilt on a
+  390-token prompt + 48 tokens. a code planted 400 tokens into a 31k-token
+  prompt is retrieved at 100k context.
+
+## depth
+
+- decode slows with cache depth. at 8.3k tokens deep: f16 KV 12.4 t/s, q8_0
+  KV 11.0 t/s (prefill to that depth averaged 89 and 79 t/s). at 2k deep
+  the extra 7 ms per token is half flash attention, half the dense
+  bias and mask plumbing around it. the 8
+  full-attention layer visits read the whole cache for every token, so this
+  is partly inherent: 100k of f16 KV is 3.2GB per token.
+- not measured cleanly beyond 8k. one 31k run with q8_0 KV gave 59 t/s
+  average prefill and 5.9 t/s decode, but a build was running beside it.
+- q8_0 KV (`cache-type-k = q8_0`, `cache-type-v = q8_0`) brings 100k down to
+  15.0GB with the same text in tests, at the cost above.
 
 ## hazards
 
-- the first attempt (IQ4_XS + mmproj + drafter, 64k ctx, default 8GB
-  cache-ram) froze the machine and needed a hard reboot. swap shows 0MB and
-  `iogpu.wired_limit_mb` is 22528, so overcommit hangs instead of slowing.
-- always run experiments under a watchdog: poll
-  `sysctl -n kern.memorystatus_vm_pressure_level` (4 = critical) and
-  `memory_pressure` free %, and `kill -9` the server before it gets there.
-  a 32k/ub128 run peaks at level 2 (warn), ~11-13% free.
-- use `llama fit-params -m ... -c N -ub N -fit off -lv 4` to read the
+- overcommit froze the machine once (swap shows 0MB, `iogpu.wired_limit_mb`
+  is 22528). two loaded models is enough: metal reports `Insufficient
+  Memory` and every request fails with `Compute error`.
+- run every experiment through `./wd cmd...`: it takes a machine-wide lock
+  and kills the command if `kern.memorystatus_vm_pressure_level` reaches 4
+  or free memory drops below `$MINFREE` % (default 6). the lock does not
+  cover the app: unload its model first
+  (`curl 127.0.0.1:9931/models/unload -d '{"model":"..."}'`).
+- `lockf` needs `-k`; without it the lock file is unlinked on release and
+  two holders get through.
+- at 100k/ub256 the app peaked at pressure level 1, 17% free on a short
+  request. a full 100k context has not been run.
+- `llama fit-params -m ... -c N -ub N -fa on -fit off -lv 4` reads the
   projected memory breakdown without loading anything.
+- `llama-bench -d N` cannot restore state with a q8_0 KV cache
+  (`failed to restore kv cache`); its depth numbers are then depth 0.
 
-## observations so far
+## where decode time goes now
 
-- decode ~12.3 tok/s, small prompts only (no real pp numbers yet).
-- rough roofline: ~5.4B effective params/token at ~3.5 bits is ~2.4GB/token;
-  at ~100GB/s that's ~40 tok/s. we're at ~30%, so overhead-bound.
-- compute buffer is O(ubatch x ctx): 1.8GB @16k, 6.6GB @64k (ub 512);
-  0.85GB @32k ub 128. `-fa on` changes nothing, so attention isn't hitting
-  the flash attention path.
-- dspark drafter (n-max 3): 52% acceptance but 9.5 tok/s vs 12.3 without.
+from in-situ ablation before the node trimming, 1-token graph, ~66 ms GPU
+per token, roughly +-3 ms: 12.6k graph nodes, ~7k metal kernels, one command buffer, no CPU fallback.
+MUL_MAT 21-29 ms (q8_0 attention projections, bandwidth-bound, and the q5_K
+output head), MUL_MAT_ID ~23 ms, ~7k small kernels ~19 ms, flash attention
+and conv ~2 ms. about 3.6GB is read per token, so the ceiling at ~90GB/s is
+near 25 t/s, not 40.
 
-## ideas, roughly in order
+## ideas left
 
-1. baseline. `llama-bench` pp512/tg128 at depth 0/8k/32k; verbose logs for
-   graph splits and CPU fallbacks; xcode metal capture of one decode step
-   for a per-kernel breakdown. sets the order of everything else.
-2. attention -> flash attention. suspects: extra inkling tensors
-   (`inkling_rel_idx`, `inkling_tau`, `inkling_attn_sconv`), i.e. a relative
-   position bias, temperature and short conv. fold bias into the FA mask and
-   tau into the scale, or add a metal FA variant. wins: constant compute
-   buffer, ub 512 back (faster prefill), 128k ctx in budget, flat decode at
-   depth, and quantized KV (q8_0 needs FA).
-3. drafter verify cost. MoE verify at batch 4 touches ~4x experts. bench
-   pp2..pp4 vs tg; tune metal `mul_mat_id` for tiny batches; try
-   `--spec-draft-n-max 1/2`. 52% acceptance should pay if verify is cheap.
-4. loop overhead. check the graph isn't duplicating work per loop pass
-   (per-pass scale copies, rebuilt views); confirm metal fusions fire for
-   this arch (rms_norm+mul, moe gate/up, shared expert add). compare against
-   upstream ggml-org/llama.cpp#32694 (`inkling2_loop` layout, unsloth's
-   `Shard_Rewrite/` files) which needs the loop-pass scale re-share fix.
-5. quant mix, only once bandwidth-bound: attention/shared tensors Q4-Q6,
-   routed experts Q3; K-quants over IQ on metal. compare KLD and tg against
-   UD-Q3_K_XL.
-6. housekeeping: build the fork from source here and pin it, instead of the
-   brew-slot symlink; turn swap back on (needs sudo) so mistakes degrade
-   rather than freeze.
+1. decode at depth: a banded variant for one query would drop the dense
+   per-head bias and mask chain (CONT, CPY, GET_ROWS, ADD over n_kv x 24
+   per full layer); then check the vec kernel against bandwidth.
+2. fused control, SITU, convolve and clip kernels: 1-2 ms each.
+3. the lane fix of `patches/0002` for the q5_K output head and the 18
+   expert tensors that are not NVFP4: ~1 ms and ~1.5 ms.
+4. dspark drafter: 52% acceptance but slower than no drafter on the old
+   build; verify cost is now lower, not re-measured.
+5. quant mix: attention tensors are already bandwidth-bound, so smaller
+   quants there would pay; compare KLD against UD-Q3_K_XL first.
+6. upstream now has Inkling 2 Mini itself (ggml-org/llama.cpp#32694);
+   rebase the patches onto it when a tag carries it.
+7. turn swap back on (needs sudo) so mistakes degrade rather than freeze.

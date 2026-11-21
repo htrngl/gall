@@ -1,0 +1,29 @@
+From 7e043e86d1468abdf097706798057d790290902c Mon Sep 17 00:00:00 2001
+From: Louis Goddard <louisgoddard@gmail.com>
+Date: Fri, 20 Nov 2026 23:18:07 +0000
+Subject: [PATCH 03/10] tests : add inkling-2-mini decode perf cases for
+ mul_mat_id and mul_mat
+
+---
+ tests/test-backend-ops.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8a0a7b407..48f6d0a67 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -14103,6 +14103,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 2560, 65536, r, 1, 1, false));
+     }
+ 
++    // Inkling-2-Mini decode: merged gate/up and down experts, and one attention projection
++    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32, 8, true,  4608, 1, 2304));
++    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32, 8, false, 2304, 1, 1152));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 3072, 1, 2304, {1, 1}, {1, 1}));
++
+     // LoRA at prefill: B is [rank, n_out], so K = rank
+     for (int64_t k : {16, 32, 48, 64}) {
+         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 2048, 512, k, {1, 1}, {1, 1}));
+-- 
+2.50.1 (Apple Git-155)
+

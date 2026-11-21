@@ -1,0 +1,75 @@
+From a135e18e29855044655d94bf22d8fb082c05f5da Mon Sep 17 00:00:00 2001
+From: Louis Goddard <louisgoddard@gmail.com>
+Date: Sat, 21 Nov 2026 00:01:47 +0000
+Subject: [PATCH 09/10] metal : GGML_METAL_PROF=2 drains the autorelease pool
+ per node and restarts the table for a new graph size
+
+---
+ ggml/src/ggml-metal/ggml-metal-context.m | 43 ++++++++++++++----------
+ 1 file changed, 26 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 5950024d8..caca6f667 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -570,7 +570,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+         }
+         if (prof > 1 && gf->n_nodes > 100) {
+             static struct { char name[64]; double t; int n; } acc[1024];
+-            static int n_acc = 0, n_graphs = 0;
++            static int n_acc = 0, n_graphs = 0, n_nodes = 0;
++            if (n_nodes != gf->n_nodes) {
++                // a new graph shape (prompt or decode): restart the table
++                n_nodes = gf->n_nodes;
++                n_acc = n_graphs = 0;
++                memset(acc, 0, sizeof(acc));
++            }
+             [ctx->cmd_buf_last waitUntilCompleted];
+             ctx->cmd_buf_last = nil;
+             for (int i = 0; i < gf->n_nodes;) {
+@@ -579,23 +585,26 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+                     i++;
+                     continue;
+                 }
+-                id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+-                ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, i, gf->n_nodes, ctx->use_concurrency, false, 0);
+-                int res = ggml_metal_op_encode(ctx_op, 0);
+-                ggml_metal_op_free(ctx_op);
+-                [cmd_buf commit];
+-                [cmd_buf waitUntilCompleted];
+-                char name[64];
+-                snprintf(name, sizeof(name), "%s%s %s [%d,%d,%d,%d]%s", ggml_op_desc(node), res > 1 ? "+" : "", node->src[0] ? ggml_type_name(node->src[0]->type) : "", (int) node->ne[0], (int) node->ne[1], (int) node->ne[2], (int) node->ne[3], (node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "" : " skip");
+-                int k = 0;
+-                while (k < n_acc && strcmp(acc[k].name, name)) {
+-                    k++;
+-                }
+-                if (k == n_acc && n_acc < 1023) {
+-                    strcpy(acc[n_acc++].name, name);
++                int res = 1;
++                @autoreleasepool {
++                    id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
++                    ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, i, gf->n_nodes, ctx->use_concurrency, false, 0);
++                    res = ggml_metal_op_encode(ctx_op, 0);
++                    ggml_metal_op_free(ctx_op);
++                    [cmd_buf commit];
++                    [cmd_buf waitUntilCompleted];
++                    char name[64];
++                    snprintf(name, sizeof(name), "%s%s %s [%d,%d,%d,%d]%s", ggml_op_desc(node), res > 1 ? "+" : "", node->src[0] ? ggml_type_name(node->src[0]->type) : "", (int) node->ne[0], (int) node->ne[1], (int) node->ne[2], (int) node->ne[3], (node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "" : " skip");
++                    int k = 0;
++                    while (k < n_acc && strcmp(acc[k].name, name)) {
++                        k++;
++                    }
++                    if (k == n_acc && n_acc < 1023) {
++                        strcpy(acc[n_acc++].name, name);
++                    }
++                    acc[k].t += cmd_buf.GPUEndTime - cmd_buf.GPUStartTime;
++                    acc[k].n += 1;
+                 }
+-                acc[k].t += cmd_buf.GPUEndTime - cmd_buf.GPUStartTime;
+-                acc[k].n += 1;
+                 for (; res > 0 && i < gf->n_nodes; i++) {
+                     res -= !(ggml_op_is_empty(gf->nodes[i]->op) || ggml_is_empty(gf->nodes[i]));
+                 }
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,13 @@
+#!/bin/sh
+# run a command under a machine-wide lock (one model at a time); kill -9 it
+# if memory pressure goes critical or free % drops below $MINFREE
+[ "$WDL" ] || WDL=1 exec env WDL=1 lockf -k /tmp/inkling-metal.lock "$0" "$@"
+"$@" & p=$!
+while kill -0 $p 2>/dev/null; do
+  l=$(sysctl -n kern.memorystatus_vm_pressure_level)
+  f=$(memory_pressure | awk '/free percentage/{print +$NF}')
+  [ "$l" -ge 4 ] || [ "$f" -lt "${MINFREE:-6}" ] &&
+    { kill -9 $p; echo "wd: killed (level $l, free $f%)" >&2; }
+  sleep 1
+done
+wait $p

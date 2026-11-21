@@ -1,0 +1,111 @@
+From 693cc4ba5354316e20a0556bb71159fe715a6200 Mon Sep 17 00:00:00 2001
+From: Louis Goddard <louisgoddard@gmail.com>
+Date: Fri, 20 Nov 2026 23:18:08 +0000
+Subject: [PATCH 04/10] metal : add GGML_METAL_PROF and GGML_METAL_PROF_SKIP
+ decode diagnostics
+
+---
+ ggml/src/ggml-metal/ggml-metal-context.m | 56 ++++++++++++++++++++++++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp   | 12 +++++
+ 2 files changed, 68 insertions(+)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e12c55a39..3025a2b17 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -563,6 +563,52 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+         // short-hand
+         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+ 
++        // diagnostic: GGML_METAL_PROF=1 times encode and GPU per graph, =2 runs each node in its own command buffer
++        static int prof = -1;
++        if (prof < 0) {
++            prof = getenv("GGML_METAL_PROF") ? atoi(getenv("GGML_METAL_PROF")) : 0;
++        }
++        if (prof > 1 && gf->n_nodes > 100) {
++            static struct { char name[64]; double t; int n; } acc[256];
++            static int n_acc = 0, n_graphs = 0;
++            [ctx->cmd_buf_last waitUntilCompleted];
++            ctx->cmd_buf_last = nil;
++            for (int i = 0; i < gf->n_nodes;) {
++                struct ggml_tensor * node = gf->nodes[i];
++                if (ggml_op_is_empty(node->op) || ggml_is_empty(node)) {
++                    i++;
++                    continue;
++                }
++                id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
++                ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, i, gf->n_nodes, ctx->use_concurrency, false, 0);
++                int res = ggml_metal_op_encode(ctx_op, 0);
++                ggml_metal_op_free(ctx_op);
++                [cmd_buf commit];
++                [cmd_buf waitUntilCompleted];
++                char name[64];
++                snprintf(name, sizeof(name), "%s%s %s %s", ggml_op_desc(node), res > 1 ? "+" : "", node->src[0] ? ggml_type_name(node->src[0]->type) : "", (node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "" : "skip");
++                int k = 0;
++                while (k < n_acc && strcmp(acc[k].name, name)) {
++                    k++;
++                }
++                if (k == n_acc && n_acc < 256) {
++                    strcpy(acc[n_acc++].name, name);
++                }
++                acc[k].t += cmd_buf.GPUEndTime - cmd_buf.GPUStartTime;
++                acc[k].n += 1;
++                for (; res > 0 && i < gf->n_nodes; i++) {
++                    res -= !(ggml_op_is_empty(gf->nodes[i]->op) || ggml_is_empty(gf->nodes[i]));
++                }
++            }
++            if (++n_graphs % 32 == 0) {
++                for (int k = 0; k < n_acc; k++) {
++                    fprintf(stderr, "PROF2 %-40s n %6.1f ms %8.3f\n", acc[k].name, (double) acc[k].n/n_graphs, 1e3*acc[k].t/n_graphs);
++                }
++            }
++            return GGML_STATUS_SUCCESS;
++        }
++        const uint64_t t_prof = prof ? ggml_time_us() : 0;
++
+         // the main thread commits the first few commands immediately
+         // cmd_buf[n_cb]
+         {
+@@ -609,6 +655,16 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+         // for debugging: block until graph is computed
+         //[ctx->cmd_buf_last waitUntilCompleted];
+ 
++        if (prof == 1 && gf->n_nodes > 100) {
++            const uint64_t t_enc = ggml_time_us() - t_prof;
++            double t_gpu = 0.0;
++            for (int i = 0; i <= n_cb; ++i) {
++                [ctx->cmd_bufs[i].obj waitUntilCompleted];
++                t_gpu += ctx->cmd_bufs[i].obj.GPUEndTime - ctx->cmd_bufs[i].obj.GPUStartTime;
++            }
++            fprintf(stderr, "PROF1 nodes %d n_cb %d encode %.2f ms gpu %.2f ms wall %.2f ms\n", gf->n_nodes, n_cb, 1e-3*t_enc, 1e3*t_gpu, 1e-3*(ggml_time_us() - t_prof));
++        }
++
+         // enter here only when capturing in order to wait for all computation to finish
+         // otherwise, we leave the graph to compute asynchronously
+         if (use_capture && ctx->capture_started) {
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 2c9fcf488..3bd3453dd 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -219,6 +219,18 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+         return 1;
+     }
+ 
++    // diagnostic: GGML_METAL_PROF_SKIP=",MUL_MAT,CONCAT," does not run these ops (the results are garbage)
++    {
++        static const char * skip = getenv("GGML_METAL_PROF_SKIP");
++        if (skip) {
++            char name[64];
++            snprintf(name, sizeof(name), ",%s,", ggml_op_name(node->op));
++            if (strstr(skip, name)) {
++                return 1;
++            }
++        }
++    }
++
+     int n_fuse = 1;
+ 
+     // check if the current node can run concurrently with other nodes before it
+-- 
+2.50.1 (Apple Git-155)
+
