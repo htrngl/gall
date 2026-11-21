@@ -4,3 +4,6 @@ src-decode/
 *.log
 env
 src-b12568/
+ref/
+engine/target/
+scratch/
