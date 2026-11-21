@@ -8,17 +8,23 @@ macbook air, 24GB, through a patched llama.cpp.
 
 - weights: `unsloth/Inkling-2-Mini-GGUF` UD-Q3_K_XL (13.6GB), in the HF cache.
   expert tensors of 20 layers are NVFP4 with per-expert scales.
-- engine: built here by `./build`: ggml-org/llama.cpp `b12568` + the 30
-  unsloth pins in `pins.txt` (merged in order, as their CI does) +
-  `patches/`. installed in `~/.llama-app/inkling-metal/`, and
-  `/opt/homebrew/bin/llama` (what the Llama menu bar app runs) links to it.
-  the unsloth prebuilt is still in `~/.llama-app/unsloth-b12568/`; relink to
-  go back. `brew link llama.cpp` restores brew's.
-- `./build` was run here from the build step on; its clone-and-merge
-  branch is the same sequence that made `src-mix` but was not re-run.
-- the installed prebuilt `b12568-mix-8eebad4` was 28 of those pins: it has no
-  chunked (#385) or banded (#386) attention. `git -C src-mix diff
-  mix-8eebad4 mix` shows the difference.
+- engine: built here by `./build`: ggml-org/llama.cpp `b12600` (carries
+  upstream's own inkling 2 mini, #32694) + the 32 unsloth pins in `pins.txt`
+  (their `scripts/unsloth/pr-set.json` at master `e94fed7`, merged in order,
+  as their CI does; adds #32704, the loop-slot scale fix, and the
+  `inkling2_loop` path) + `patches/`. installed in
+  `~/.llama-app/inkling-metal/`, and `/opt/homebrew/bin/llama` links to it.
+  the b12568 build is kept in `~/.llama-app/inkling-metal-old/` and its tree
+  in `src-b12568/`; the unsloth prebuilt is in `~/.llama-app/unsloth-b12568/`.
+- patches 0001-0006 apply as they were on b12568 (0001 needed its q8_0
+  line moved into the new `use_banded()`); 0007 is the old 0006-0008 and
+  0010 ported to upstream's rewrite of `inkling2.cpp`.
+- 2026-11-21 against the b12568 build, same text, 4 chunks: perplexity
+  4.7784 -> 4.7769, pp512 116 -> 121 t/s, tg64 14.0 -> 15.6 t/s, tg64 at
+  8k deep 13.5 -> 13.7 t/s. `FLASH_ATTN_EXT_BANDED` 48/48 on MTL0; the new
+  f16/bf16 rel-bias cases are "not supported" and fall back.
+- UD-IQ1_M (7.5GB) is not faster here: tg64 14.7 t/s, pp512 117, perplexity
+  5.13 on the same text. dequant cost outweighs the bandwidth it saves.
 - settings: `~/.config/llama/models.user.ini`, section
   `[unsloth/Inkling-2-Mini-GGUF:Q3_K_XL]`: ctx 102400, ubatch 256,
   flash-attn on, parallel 1, cache-ram 512, ctx-checkpoints 2, spec-type

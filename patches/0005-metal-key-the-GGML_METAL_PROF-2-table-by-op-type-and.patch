@@ -1,7 +1,7 @@
-From 1c4bef139e083ad43b5f2c1c182825cb3fc33f4f Mon Sep 17 00:00:00 2001
+From 9e164f19df4064135da8764e9139d123b603194b Mon Sep 17 00:00:00 2001
 From: Louis Goddard <louisgoddard@gmail.com>
 Date: Fri, 20 Nov 2026 23:26:29 +0000
-Subject: [PATCH 05/10] metal : key the GGML_METAL_PROF=2 table by op, type and
+Subject: [PATCH 5/7] metal : key the GGML_METAL_PROF=2 table by op, type and
  shape
 
 ---

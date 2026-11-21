@@ -1,7 +1,7 @@
-From 3499984d8455e04c94caf1c64f649212474a3813 Mon Sep 17 00:00:00 2001
+From c931f8ba079d9d2323623b65e2f919cb1c74f4d8 Mon Sep 17 00:00:00 2001
 From: Louis Goddard <louisgoddard@gmail.com>
 Date: Fri, 20 Nov 2026 23:18:07 +0000
-Subject: [PATCH 02/10] metal : nvfp4 mul_mv takes half a sub-block per thread
+Subject: [PATCH 2/7] metal : nvfp4 mul_mv takes half a sub-block per thread
  and 4 rows per simdgroup
 
 ---

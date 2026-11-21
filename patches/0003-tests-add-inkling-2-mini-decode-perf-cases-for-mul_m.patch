@@ -1,7 +1,7 @@
-From 7e043e86d1468abdf097706798057d790290902c Mon Sep 17 00:00:00 2001
+From 62c7dc9aad08808bf1f004663af00fa8e46a72e5 Mon Sep 17 00:00:00 2001
 From: Louis Goddard <louisgoddard@gmail.com>
 Date: Fri, 20 Nov 2026 23:18:07 +0000
-Subject: [PATCH 03/10] tests : add inkling-2-mini decode perf cases for
+Subject: [PATCH 3/7] tests : add inkling-2-mini decode perf cases for
  mul_mat_id and mul_mat
 
 ---
@@ -9,10 +9,10 @@ Subject: [PATCH 03/10] tests : add inkling-2-mini decode perf cases for
  1 file changed, 5 insertions(+)
 
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8a0a7b407..48f6d0a67 100644
+index 91777f83a..540dcec5c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -14103,6 +14103,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14110,6 +14110,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 2560, 65536, r, 1, 1, false));
      }
  

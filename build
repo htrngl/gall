@@ -1,15 +1,15 @@
 #!/bin/sh -e
-# engine = ggml-org/llama.cpp b12568 + unsloth pin set (pins.txt, in order,
+# engine = ggml-org/llama.cpp b12600 + unsloth pin set (pins.txt, in order,
 # as their CI merges it) + patches/. installs to ~/.llama-app/inkling-metal
 # and points /opt/homebrew/bin/llama (what the Llama app runs) at it.
 cd "$(dirname "$0")"
-U=d20fe00659286081a3e96efd800c3706a88155ea # unslothai master, merge tooling
+U=e94fed794a234b2d48a236762dafd5527dc085b1 # unslothai master, merge tooling
 G="git -C src-mix -c user.name=mix -c user.email=mix@localhost"
 if [ ! -d src-mix ]; then
   git clone --filter=blob:none https://github.com/ggml-org/llama.cpp src-mix
   $G fetch -q --no-tags https://github.com/unslothai/llama.cpp $U
   $G show $U:scripts/unsloth/additive_merge.py > src-mix/.git/am.py
-  $G checkout -q -B mix b12568
+  $G checkout -q -B mix b12600
   while read -r r n s; do
     $G fetch -q --no-tags https://github.com/$r.git $s
     $G -c merge.conflictStyle=diff3 merge -q --no-ff --no-edit \

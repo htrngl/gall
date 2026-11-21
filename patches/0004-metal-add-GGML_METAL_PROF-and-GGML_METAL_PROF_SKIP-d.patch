@@ -1,7 +1,7 @@
-From 693cc4ba5354316e20a0556bb71159fe715a6200 Mon Sep 17 00:00:00 2001
+From 44a244a4d791e2997e7491a665576f3cffa77674 Mon Sep 17 00:00:00 2001
 From: Louis Goddard <louisgoddard@gmail.com>
 Date: Fri, 20 Nov 2026 23:18:08 +0000
-Subject: [PATCH 04/10] metal : add GGML_METAL_PROF and GGML_METAL_PROF_SKIP
+Subject: [PATCH 4/7] metal : add GGML_METAL_PROF and GGML_METAL_PROF_SKIP
  decode diagnostics
 
 ---
@@ -84,7 +84,7 @@ index e12c55a39..3025a2b17 100644
          // otherwise, we leave the graph to compute asynchronously
          if (use_capture && ctx->capture_started) {
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index 2c9fcf488..3bd3453dd 100644
+index 28b6ef162..b7ae5d04c 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -219,6 +219,18 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
