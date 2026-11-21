@@ -23,9 +23,11 @@ using namespace metal;
 // float4 i of a float pointer: load, store
 #define L(x, i) float4(((const device packed_float4 *)(x))[i])
 #define W(x, i) ((device packed_float4 *)(x))[i]
+#define LH(x, i) float4(((const device half4 *)(x))[i])
 typedef const device uint *U;
 typedef device float *A;
 typedef const device float *S;
+typedef const device half *SH; // the larger small matrices, f16
 
 // sum of v over a threadgroup of T; r is its scratch, one per sum
 static float red(float v, threadgroup float *r, uint sg, uint ln) {
@@ -105,15 +107,15 @@ kernel void elem(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // control, low rank, grid (65, controls): g[r] = down[r] . v and
 // g[64 + r] = down[r] . msg for r < 64, then g[128..] = v . v, msg . msg
 // p: 0 v, 1 msg, 2 ctl, 3 g
-kernel void low(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
-                TG) {
+kernel void low(U p [[buffer(0)]], A a [[buffer(1)]],
+                SH s [[buffer(6)]], TG) {
   threadgroup float r[NS], q[NS];
   float4 v = L(a + p[0] + gp.y * N, t), m = L(a + p[1] + gp.y * N, t);
-  S w = s + p[2] + gp.y * 256 * N + gp.x * 2 * N;
+  SH w = s + p[2] + gp.y * 256 * N + gp.x * 2 * N;
   bool n = gp.x > 63;
-  float x = simd_sum(dot(m, n ? m : L(w, T + t)));
+  float x = simd_sum(dot(m, n ? m : LH(w, T + t)));
   if (!ln) q[sg] = x;
-  x = red(dot(v, n ? v : L(w, t)), r, sg, ln);
+  x = red(dot(v, n ? v : LH(w, t)), r, sg, ln);
   if (t) return;
   A g = a + p[3] + gp.y * 130 + (n ? 128 : gp.x);
   g[0] = x;
@@ -125,15 +127,15 @@ kernel void low(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // with g from the normalized v and msg; x = v * w
 // p: 0 v, 1 msg, 2 ctl, 3 g, 4 x, 5.. w
 kernel void ctl(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
-                GP) {
+                SH sh [[buffer(6)]], GP) {
   uint e = gp.x * 32 + ln;
-  S g = a + p[3] + gp.y * 130,
-    w = s + p[2] + gp.y * 256 * N + 128 * N + e * 64;
+  S g = a + p[3] + gp.y * 130;
+  SH w = sh + p[2] + gp.y * 256 * N + 128 * N + e * 64;
   float2 n = rsqrt(float2(g[128], g[129]) / N + 1e-6);
   float o = 0, f = 0;
   for (uint k = 0; k < 16; k++) {
     float4 x = n.x * L(g, k) + n.y * L(g, 16 + k);
-    o += dot(x, L(w, k)), f += dot(x, L(w, 16 * N + k));
+    o += dot(x, LH(w, k)), f += dot(x, LH(w, 16 * N + k));
   }
   A v = a + p[0] + gp.y * N + e;
   *v += tanh(o) * a[p[1] + gp.y * N + e] - tanh(f) * *v;
@@ -141,10 +143,10 @@ kernel void ctl(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 }
 
 // y[r] = W[r] . x, one threadgroup per row. p: 0 x, 1 W, 2 y
-kernel void rows(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
-                 TG) {
+kernel void rows(U p [[buffer(0)]], A a [[buffer(1)]],
+                 SH s [[buffer(6)]], TG) {
   threadgroup float r[NS];
-  float o = red(dot(L(s + p[1] + gp.x * N, t), L(a + p[0], t)), r, sg, ln);
+  float o = red(dot(LH(s + p[1] + gp.x * N, t), L(a + p[0], t)), r, sg, ln);
   if (!t) a[p[2] + gp.x] = o;
 }
 
@@ -156,7 +158,8 @@ kernel void rows(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // 12 qk clip, 13 rel clip, 14 pos, 15 v, 16 nx, 17 x, 18 q scale out,
 // 19 sink w, 20 sink out
 kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
-                 device half *kv [[buffer(3)]], A cs [[buffer(4)]], TG) {
+                 device half *kv [[buffer(3)]], A cs [[buffer(4)]],
+                 SH sh [[buffer(6)]], TG) {
   threadgroup float r[12 * NS];
   uint h = gp.x, i = h * 128 + ln * 4, nx = p[16];
   bool dy = p[7] && h < 8;
@@ -165,9 +168,9 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
     float4 v = L(a + p[15] + min(j, nx - 1) * N, t);
     o[j] = dot(v, v);
   }
-  o[3] = dot(L(s + p[19] + h * N, t), L(a + p[17], t));
+  o[3] = dot(LH(sh + p[19] + h * N, t), L(a + p[17], t));
   for (uint k = 0; k < 8 && dy; k++)
-    o[4 + k] = dot(L(s + p[7 + k / 4] + (h * 4 + 3 - k % 4) * N, t),
+    o[4 + k] = dot(LH(sh + p[7 + k / 4] + (h * 4 + 3 - k % 4) * N, t),
                    L(a + p[17] + (1 + k / 4) * N, t));
   for (uint k = 0; k < (dy ? 12 : 4); k++) {
     o[k] = simd_sum(o[k]);
@@ -293,17 +296,18 @@ kernel void top8(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
   if (t < 8) a[p[2] + t] = w8[t] / (z + 1e-20) * 8;
 }
 
-// situ on the 8 expert gate_up rows, times router weight and scales
+// situ on the 8 expert gate_up rows, times router weight and scales;
+// a thread takes 4 elements
 // p: 0 gate_up, 1 out, 2 weights, 3 up scale, 4 down scale, 5 input scale
 kernel void act(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                 const device uint *id [[buffer(5)]],
                 uint i [[thread_position_in_grid]]) {
-  uint e = i / 1152, c = i % 1152;
+  uint e = i / 288, c = i % 288;
   if (e > 7) return;
-  float us = s[p[3] + id[e]] * a[p[5]], g = a[p[0] + e * N + c] * us,
-        u = a[p[0] + e * N + 1152 + c] * us;
-  a[p[1] + i] = 4 * tanh(g / 4) / (1 + exp(-g)) * 25 * tanh(u / 25) *
-                a[p[2] + e] * s[p[4] + id[e]];
+  float us = s[p[3] + id[e]] * a[p[5]];
+  float4 g = L(a + p[0] + e * N, c) * us, u = L(a + p[0] + e * N + 1152, c) * us;
+  W(a + p[1] + e * 1152, c) = 100 * tanh(g / 4) / (1 + exp(-g)) * tanh(u / 25) *
+                              a[p[2] + e] * s[p[4] + id[e]];
 }
 
 // cross-pass messages, grid (72, 12 core layers): mix of the bank block

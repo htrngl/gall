@@ -98,18 +98,25 @@ fn main() {
             if a.iter().any(|x| x == "--prof") {
                 // ablation: the token without one kind of dispatch
                 let ops = m.sched(next);
+                let small = |k: &str| model::KINDS.contains(&k);
                 let run = |skip: &str| {
+                    let on = |k: &str| match skip {
+                        "small" => !small(k),
+                        "weights" => small(k),
+                        _ => k != skip,
+                    };
                     let f = |_| m.gpu.run(|e| {
-                        ops.iter().filter(|o| o.0 != skip).for_each(|o| o.2(e))
+                        ops.iter().filter(|o| on(o.0)).for_each(|o| o.2(e))
                     });
-                    (0..8).map(f).fold(1f64, f64::min)
+                    (0..12).map(f).fold(1f64, f64::min)
                 };
                 let all = run("");
                 let mut by: BTreeMap<&str, usize> = BTreeMap::new();
                 ops.iter().for_each(|o| *by.entry(o.0).or_default() += 1);
                 eprintln!("{} dispatches, {:.1} ms", ops.len(), 1e3 * all);
+                by.extend([("small", 0), ("weights", 0)]);
                 for (k, c) in by {
-                    eprintln!("{k:8} {c:5} {:7.2} ms", 1e3 * (all - run(k)));
+                    eprintln!("{k:8} {c:5} {:7.2} ms", 1e3 * (run("") - run(k)));
                 }
             }
         }

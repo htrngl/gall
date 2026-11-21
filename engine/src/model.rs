@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 const N: usize = 2304;
 const OPS: &str = include_str!("ops.metal");
-const KINDS: [&str; 13] = [
+pub const KINDS: [&str; 13] = [
     "dots", "elem", "low", "ctl", "rows", "post", "attn", "merge", "top8", "act",
     "msg", "amax", "best",
 ];
@@ -88,6 +88,7 @@ pub struct Model {
     pipes: HashMap<&'static str, Pipe>,
     pub a: Buf,
     s: Buf,
+    sh: Buf,
     kv: Buf,
     cs: Buf,
     id: Buf,
@@ -104,6 +105,17 @@ pub struct Model {
     pub pos: usize,
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
+}
+
+// f32 to f16, round to nearest; tiny values to 0
+fn f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let (s, e, m) = (b >> 16 & 0x8000, (b >> 23 & 255) as i32 - 112, b & 0x7fffff);
+    match e {
+        ..=0 => s as u16,
+        31.. => (s | 0x7c00) as u16,
+        _ => (s + ((e as u32) << 10) + (m >> 13) + (m >> 12 & 1)) as u16,
+    }
 }
 
 // (physical layer, cache slot, pass) in execution order
@@ -134,10 +146,27 @@ impl Model {
             }
             o
         };
+        // the larger ones as f16, offsets in halfs
+        let mut sh = vec![0u16; 4];
+        let mut hm = |n: String| -> u32 {
+            let Some(t) = g.t.get(n.as_str()) else { return 0 };
+            let (o, d) = (sh.len() as u32, g.data(t));
+            match t.ty {
+                0 => sh.extend(d.chunks(4).map(|b| {
+                    f16(f32::from_le_bytes(b.try_into().unwrap()))
+                })),
+                30 => sh.extend(d.chunks(2).map(|b| {
+                    f16(f32::from_bits((b[0] as u32) << 16 | (b[1] as u32) << 24))
+                })),
+                _ => panic!("{n}: not a small tensor"),
+            }
+            o
+        };
         let l = (0..24)
             .map(|i| {
                 let t = |n: &str| &g.t[format!("blk.{i}.{n}.weight").as_str()];
                 let mut w = |n: &str| sm(format!("blk.{i}.{n}"));
+                let mut wh = |n: &str| hm(format!("blk.{i}.{n}"));
                 let swa = i % 6 != 5;
                 let aq = w("attn_res_query.weight");
                 let nw = if swa {
@@ -148,7 +177,7 @@ impl Model {
                 let ctl = ["attn", "k", "v", "mlp"]
                     .map(|c| {
                         ["down", "gain", "forget"]
-                            .map(|k| w(&format!("loop_{c}_{k}.weight")))[0]
+                            .map(|k| wh(&format!("loop_{c}_{k}.weight")))[0]
                     })[0];
                 L {
                     swa,
@@ -164,19 +193,19 @@ impl Model {
                     aq,
                     nw,
                     ctl,
-                    sink: w("attn_sink_proj.weight"),
+                    sink: wh("attn_sink_proj.weight"),
                     qc: w("attn_q_clip.weight"),
                     rc: w("attn_rel_clip.weight"),
                     rb: w("attn_rel_bias.weight"),
                     kc: w("attn_k_conv.weight"),
                     vc: w("attn_v_conv.weight"),
-                    kd: w("attn_k_conv_proj.weight"),
-                    vd: w("attn_v_conv_proj.weight"),
+                    kd: wh("attn_k_conv_proj.weight"),
+                    vd: wh("attn_v_conv_proj.weight"),
                     apc: w("attn_post_conv.weight"),
                     fpc: w("ffn_post_conv.weight"),
                     fq: w("ffn_res_query.weight"),
                     fnw: w("ffn_norm.weight"),
-                    gi: w("ffn_gate_inp.weight"),
+                    gi: wh("ffn_gate_inp.weight"),
                     pb: w("exp_probs_b.bias"),
                     us: w("ffn_gate_up_exps.scale"),
                     ds: w("ffn_down_exps.scale"),
@@ -197,8 +226,9 @@ impl Model {
                 s.extend_from_within(o..o + N);
             }
         }
-        let sb = gpu.buf(4 * s.len());
+        let (sb, hb) = (gpu.buf(4 * s.len()), gpu.buf(2 * sh.len()));
         slice::<f32>(&sb)[..s.len()].copy_from_slice(&s);
+        slice::<u16>(&hb)[..sh.len()].copy_from_slice(&sh);
         let mut kvo = vec![0];
         let mut by_slot = visits();
         by_slot.sort_by_key(|v| v.1);
@@ -213,6 +243,7 @@ impl Model {
             pipes,
             a: gpu.buf(4 * (PT + nc * 24 * 130)),
             s: sb,
+            sh: hb,
             kv: gpu.buf(2 * kvo[48]),
             cs: gpu.buf(4 * 48 * CS),
             id: gpu.buf(4 * 16),
@@ -294,7 +325,7 @@ impl Model {
                 p[..v.len()].copy_from_slice(&v);
                 let pipe = &self.pipes[$n];
                 ops.push(($n, vi, Box::new(move |e: &Enc| {
-                    let b = [&self.a, &self.s, &self.kv, &self.cs, &self.id];
+                    let b = [&self.a, &self.s, &self.kv, &self.cs, &self.id, &self.sh];
                     call(e, pipe, &p, &b.map(|b| (b, 0)), $g, $th)
                 })));
             }};
@@ -375,7 +406,7 @@ impl Model {
             k!("rows", [128, 1, 1], 576, XF, l.gi, LGT);
             k!("top8", [1, 1, 1], 576, LGT, l.pb, WT, VR, IS + 1);
             mv!("up", l.gu, XF, GU, N, N);
-            k!("act", [36, 1, 1], 256, GU, HH, WT, l.us, l.ds, IS + 1);
+            k!("act", [9, 1, 1], 256, GU, HH, WT, l.us, l.ds, IS + 1);
             mv!("down", l.dn, HH, D, 1152, N);
             fin = [D, F, H, cs + 4352, l.fpc as usize];
             if i == 17 && pass < 2 {
