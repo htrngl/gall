@@ -738,9 +738,7 @@ impl Lm for Ink {
         self.0.truncate(n)
     }
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
-        for &t in toks {
-            self.0.step(t);
-        }
+        self.0.feed(toks);
         self.0.save();
         self.1 = self.0.logits();
         &self.1

@@ -12,7 +12,7 @@ using namespace metal;
 #define CH 6656 // conv channels per slot: k, v, attention out, ffn out
 #define CR 16 // conv ring: the last 3 inputs, and 12 steps of rollback
 #define SW 2048 // sliding window ring: window 1024 and as much rollback
-#define C 256 // keys per attention chunk
+#define C 128 // keys per attention chunk: 16 simdgroups of 8
 #define PW 130 // floats per attention partial: acc[128], max, sum
 #define GP uint3 gp [[threadgroup_position_in_grid]], \
   uint ln [[thread_index_in_simdgroup]]
@@ -68,8 +68,8 @@ kernel void dots(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                  A cs [[buffer(4)]], TG) {
   threadgroup float r[NS];
   uint nb = p[7], b = gp.x;
-  float4 x = hv(p, a, s, cs, t, false), y = L(s + p[9] + gp.y * N, t);
-  if (b < nb) x = L(a + p[6] + b * N, t);
+  float4 x = L(a + p[6] + b * N, t), y = L(s + p[9] + gp.y * N, t);
+  if (b >= nb) x = hv(p, a, s, cs, t, false);
   float o = red(dot(x, b > nb ? x : y), r, sg, ln);
   if (!t) a[p[10] + gp.y * 8 + b] = o;
 }
@@ -142,11 +142,13 @@ kernel void ctl(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
   a[p[4] + gp.y * N + e] = *v * s[p[5 + gp.y] + e];
 }
 
-// y[r] = W[r] . x, one threadgroup per row. p: 0 x, 1 W, 2 y
+// router logits y[r] = W[r] . x, one threadgroup per row; row 128 is
+// v . v, for the rms scale of x. p: 0 x, 1 W, 2 y, 3 v
 kernel void rows(U p [[buffer(0)]], A a [[buffer(1)]],
                  SH s [[buffer(6)]], TG) {
   threadgroup float r[NS];
-  float o = red(dot(LH(s + p[1] + gp.x * N, t), L(a + p[0], t)), r, sg, ln);
+  float4 x = L(a + p[gp.x < 128 ? 0 : 3], t);
+  float o = red(dot(gp.x < 128 ? LH(s + p[1] + gp.x * N, t) : x, x), r, sg, ln);
   if (!t) a[p[2] + gp.x] = o;
 }
 
@@ -164,7 +166,7 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
   uint h = gp.x, i = h * 128 + ln * 4, nx = p[16];
   bool dy = p[7] && h < 8;
   float o[12];
-  for (uint j = 0; j < 3; j++) {
+  for (uint j = 0; j < (h < 8 ? 3 : 1); j++) {
     float4 v = L(a + p[15] + min(j, nx - 1) * N, t);
     o[j] = dot(v, v);
   }
@@ -205,8 +207,8 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
   }
 }
 
-// one query over a chunk of C keys per (chunk, kv head) threadgroup of 8
-// simdgroups: a simdgroup takes 32 keys in turn with lane = 4 dims, so a
+// one query over a chunk of C keys per (chunk, kv head) threadgroup of 16
+// simdgroups: a simdgroup takes 8 keys in turn with lane = 4 dims, so a
 // score is one simd_sum; online softmax (acc, max, sum) for the 3 q heads
 // of the kv head, merged over the threadgroup.
 // key j is position j, or pos - j in the sliding window ring
@@ -214,8 +216,8 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // 7 rel bias
 kernel void attn(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                  const device half *kv [[buffer(3)]], TG) {
-  threadgroup float ml[8 * 6];
-  threadgroup float4 ac[8 * 3 * 32];
+  threadgroup float ml[16 * 6];
+  threadgroup float4 ac[16 * 3 * 32];
   uint h = gp.y * 3;
   const device half4 *k = (const device half4 *)(kv + p[3] + gp.y * 128);
   float4 q[3], acc[3];
@@ -224,7 +226,7 @@ kernel void attn(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
     q[i] = L(a + p[0] + (h + i) * 128, ln), acc[i] = 0;
     if (ln < 16) rl[i] = a[p[1] + (h + i) * 16 + ln];
   }
-  for (uint j = gp.x * C + sg * 32, j1 = min(j + 32, p[4]); j < j1; j++) {
+  for (uint j = gp.x * C + sg * 8, j1 = min(j + 8, p[4]); j < j1; j++) {
     uint d = p[6] ? j : p[5] - j, r = (p[6] ? (p[5] - j) % SW : j) * 512;
     float4 kk = float4(k[r + ln]), vv = float4(k[r + 256 + ln]);
     float b = 0;
@@ -246,8 +248,8 @@ kernel void attn(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
   if (sg > 2) return;
   float mm = -1e30, ll = 0;
   float4 o = 0;
-  for (uint g = 0; g < 8; g++) mm = max(mm, ml[g * 6 + sg]);
-  for (uint g = 0; g < 8; g++) {
+  for (uint g = 0; g < 16; g++) mm = max(mm, ml[g * 6 + sg]);
+  for (uint g = 0; g < 16; g++) {
     float w = exp(ml[g * 6 + sg] - mm);
     ll += w * ml[g * 6 + 3 + sg], o += w * ac[(g * 3 + sg) * 32 + ln];
   }
@@ -273,41 +275,35 @@ kernel void merge(U p [[buffer(0)]], A a [[buffer(1)]], GP) {
   W(a + p[4] + e, 0) = acc / (1 + exp(-L(a + p[3] + e, 0) * a[p[5]]));
 }
 
-// router: rms scale of the ffn input v, then top 8 of sigmoid(logits) +
-// bias, weights normalized, times 8. one threadgroup of T
-// p: 0 logits, 1 bias, 2 weights out, 3 v, 4 scale out
+// router, one simdgroup per expert: its rank among sigmoid(logits) +
+// bias; the top 8 leave their id and sigmoid
+// p: 0 logits (then v . v), 1 bias, 2 weights out
 kernel void top8(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
-                 device uint *id [[buffer(5)]], TG) {
-  threadgroup float r[NS], sel[128], w8[8];
-  float4 v = L(a + p[3], t);
-  float z = rsqrt(red(dot(v, v), r, sg, ln) / N + 1e-6), pr = 0;
-  if (!t) a[p[4]] = z;
-  if (t < 128) {
-    pr = 1 / (1 + exp(-a[p[0] + t] * z));
-    sel[t] = pr + s[p[1] + t];
-  }
-  BAR;
-  uint k = 0;
-  for (uint i = 0; i < 128 && t < 128; i++)
-    k += sel[i] > sel[t] || (sel[i] == sel[t] && i < t);
-  if (k < 8 && t < 128) id[k] = t, w8[k] = pr;
-  BAR;
-  for (uint i = z = 0; i < 8; i++) z += w8[i];
-  if (t < 8) a[p[2] + t] = w8[t] / (z + 1e-20) * 8;
+                 device uint *id [[buffer(5)]], GP) {
+  uint t = gp.x;
+  float4 pr = 1 / (1 + exp(-L(a + p[0], ln) * rsqrt(a[p[0] + 128] / N + 1e-6))),
+         sel = pr + L(s + p[1], ln);
+  float w = simd_broadcast(pr[t % 4], t / 4), x = simd_broadcast(sel[t % 4], t / 4);
+  uint4 i = ln * 4 + uint4(0, 1, 2, 3);
+  int4 c = int4(sel > x) | (int4(sel == x) & int4(i < t));
+  uint k = simd_sum(uint(c.x + c.y + c.z + c.w));
+  if (!ln && k < 8) id[k] = t, a[p[2] + k] = w;
 }
 
-// situ on the 8 expert gate_up rows, times router weight and scales;
-// a thread takes 4 elements
-// p: 0 gate_up, 1 out, 2 weights, 3 up scale, 4 down scale, 5 input scale
+// situ on the 8 expert gate_up rows, times router weight (normalized,
+// times 8) and scales; a thread takes 4 elements
+// p: 0 gate_up, 1 out, 2 weights, 3 up scale, 4 down scale, 5 v . v
 kernel void act(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                 const device uint *id [[buffer(5)]],
                 uint i [[thread_position_in_grid]]) {
   uint e = i / 288, c = i % 288;
   if (e > 7) return;
-  float us = s[p[3] + id[e]] * a[p[5]];
+  float4 w = L(a + p[2], 0) + L(a + p[2], 1);
+  float us = s[p[3] + id[e]] * rsqrt(a[p[5]] / N + 1e-6);
   float4 g = L(a + p[0] + e * N, c) * us, u = L(a + p[0] + e * N + 1152, c) * us;
   W(a + p[1] + e * 1152, c) = 100 * tanh(g / 4) / (1 + exp(-g)) * tanh(u / 25) *
-                              a[p[2] + e] * s[p[4] + id[e]];
+                              a[p[2] + e] * 8 / (w.x + w.y + w.z + w.w + 1e-20) *
+                              s[p[4] + id[e]];
 }
 
 // cross-pass messages, grid (72, 12 core layers): mix of the bank block

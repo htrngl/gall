@@ -43,6 +43,7 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     match a[1].as_str() {
         "dr" => return dr::main(&a[2..]),
+        "run" if a.iter().any(|x| x == "--draft") => return dr::run(&a[2..]),
         "tok" => return tok::main(&a[2..]),
         "serve" => return serve::main(&a[2..]),
         _ => {}
@@ -75,10 +76,7 @@ fn main() {
         "run" => {
             let toks = ids(&opt("--tokens").expect("--tokens FILE"));
             let t0 = Instant::now();
-            let mut next = 0;
-            for &t in &toks {
-                next = m.step(t);
-            }
+            let mut next = m.feed(&toks);
             let pp = t0.elapsed().as_secs_f64();
             eprintln!("prompt: {} tokens, {:.1} t/s", toks.len(), toks.len() as f64 / pp);
             let (t0, mut gpu) = (Instant::now(), 0.);
@@ -97,7 +95,7 @@ fn main() {
             );
             if a.iter().any(|x| x == "--prof") {
                 // ablation: the token without one kind of dispatch
-                let ops = m.sched(next);
+                let ops = m.sched(next, m.pos, true);
                 let small = |k: &str| model::KINDS.contains(&k);
                 let run = |skip: &str| {
                     let on = |k: &str| match skip {
@@ -146,14 +144,14 @@ fn main() {
                     continue;
                 }
                 // one command buffer per visit; compare the named nodes
-                let ops = m.sched(t);
+                let ops = m.sched(t, m.pos, true);
                 let vs = model::visits();
                 let mut worst: BTreeMap<&str, (f64, usize)> = BTreeMap::new();
                 for v in 0..=vs.len() {
                     m.gpu.run(|e| ops.iter().filter(|o| o.1 == v).for_each(|o| o.2(e)));
                     let Some(&(phys, slot, _)) = vs.get(v) else { break };
-                    for nm in ["Qcur", "Kcur", "Vcur", "Rcur", "ffn_inp",
-                        "ffn_moe_weights_scaled", "ffn_moe_out"] {
+                    for nm in ["Qcur", "Kcur", "Vcur", "Rcur", "kqv_out", "gate", "is", "ffn_inp",
+                        "ffn_moe_out"] {
                         let mut r = f32s(&format!("{sd}/{nm}-{slot}.f32"));
                         let mut x = m.peek(nm, phys).unwrap().to_vec();
                         if r.len() == 8 {
@@ -165,7 +163,7 @@ fn main() {
                             let b: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
                             fs::write(format!("{d}/{nm}-{slot}.f32"), b).unwrap();
                         }
-                        let e = rel(&x, &r);
+                        let e = if r.len() == x.len() && nm != "kqv_out" { rel(&x, &r) } else { 0. };
                         let w = worst.entry(nm).or_insert((0., 0));
                         if e > w.0 {
                             *w = (e, slot);

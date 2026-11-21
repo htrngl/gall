@@ -34,8 +34,8 @@ const DK: usize = SK + 24; // dynamic conv taps, k then v
 const GC: usize = DK + 64; // control low rank, 3 x 130
 const SC: usize = GC + 390; // mix scalars, 3 x 8
 const IS: usize = SC + 24; // rms scales: q input, ffn input
-const LGT: usize = IS + 2; // router logits
-const WT: usize = LGT + 128;
+const LGT: usize = IS + 2; // router logits, then the ffn input v . v
+const WT: usize = LGT + 132; // router weights, before the norm
 const GU: usize = WT + 8; // 8 expert gate_up rows
 const HH: usize = GU + 8 * N;
 const MSG: usize = HH + 4 * N; // 12 layers x 4 messages
@@ -236,7 +236,7 @@ impl Model {
             let n = if i % 6 != 5 { SW } else { n_ctx };
             kvo.push(kvo.last().unwrap() + n * 2048);
         }
-        let nc = n_ctx.div_ceil(256).max(4);
+        let nc = n_ctx.div_ceil(128).max(8);
         let pipes = KINDS.map(|k| (k, gpu.pipe(OPS, "", k))).into();
         Model {
             mv: Mv::new(&gpu, ""),
@@ -312,8 +312,7 @@ impl Model {
     }
 
     // the dispatches of one token: (kind, visit, encode)
-    pub fn sched(&self, tok: u32) -> Vec<Op<'_>> {
-        let pos = self.pos;
+    pub fn sched(&self, tok: u32, pos: usize, head: bool) -> Vec<Op<'_>> {
         assert!(pos < self.n_ctx, "context full");
         let mut ops: Vec<Op> = vec![];
         let mut vi = 0;
@@ -389,8 +388,8 @@ impl Model {
             k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd, l.vd,
                 cs, kv + idx * 2048, f32::to_bits(tau), self.hp[0].to_bits(),
                 self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK);
-            let nc = nk.div_ceil(256);
-            k!("attn", [nc, 8, 1], 256, Q, R, PT, kv, nk, pos, l.swa, l.rb);
+            let nc = nk.div_ceil(128);
+            k!("attn", [nc, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb);
             k!("merge", [24, 1, 1], 32, PT, nc, SK, G, O, IS);
             mv!("mv", l.o, O, AO, 3072, N);
             nb += first as usize;
@@ -403,10 +402,10 @@ impl Model {
                 k!("low", [65, 1, 1], 576, VR, m, c, GC);
                 k!("ctl", [72, 1, 1], 32, VR, m, c, GC, XF, l.fnw);
             }
-            k!("rows", [128, 1, 1], 576, XF, l.gi, LGT);
-            k!("top8", [1, 1, 1], 576, LGT, l.pb, WT, VR, IS + 1);
+            k!("rows", [129, 1, 1], 576, XF, l.gi, LGT, VR);
+            k!("top8", [128, 1, 1], 32, LGT, l.pb, WT);
             mv!("up", l.gu, XF, GU, N, N);
-            k!("act", [9, 1, 1], 256, GU, HH, WT, l.us, l.ds, IS + 1);
+            k!("act", [9, 1, 1], 256, GU, HH, WT, l.us, l.ds, LGT + 128);
             mv!("down", l.dn, HH, D, 1152, N);
             fin = [D, F, H, cs + 4352, l.fpc as usize];
             if i == 17 && pass < 2 {
@@ -416,6 +415,11 @@ impl Model {
             vi += 1;
         }
         let [f0, f1, _, f3, f4] = fin;
+        if !head {
+            // only the conv state of the last ffn
+            k!("elem", t32, 32, f0, f1, 0, f3, f4, pos, BK, nb, 0, 0, SC);
+            return ops;
+        }
         k!("dots", [nb + 2, 1, 1], 576, f0, f1, 0, f3, f4, pos, BK, nb, 1, self.oq, SC);
         k!("elem", t32, 32, f0, f1, 0, f3, f4, pos, BK, nb, 1, self.oq, SC, 1, VR, X,
             self.on);
@@ -427,11 +431,25 @@ impl Model {
 
     // decode one token; returns the greedy next id
     pub fn step(&mut self, tok: u32) -> u32 {
-        let ops = self.sched(tok);
+        let ops = self.sched(tok, self.pos, true);
         let t = self.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
         drop(ops);
         (self.t, self.pos) = (t, self.pos + 1);
         self.next()
+    }
+
+    // decode toks (not empty), logits only for the last: no output head
+    // and no wait between the others
+    pub fn feed(&mut self, toks: &[u32]) -> u32 {
+        let (l, h) = toks.split_last().unwrap();
+        for c in h.chunks(4) {
+            let ops = c.iter().enumerate();
+            let ops: Vec<_> = ops.flat_map(|(i, &t)| self.sched(t, self.pos + i, false)).collect();
+            self.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
+            drop(ops);
+            self.pos += c.len();
+        }
+        self.step(*l)
     }
 
     // greedy id of the last step
@@ -456,10 +474,12 @@ impl Model {
             "Vcur" => (K + 1024, 1024),
             "Rcur" => (R, 384),
             "kqv_out" => (O, 3072),
+            "gate" => (G, 3072),
+            "is" => (IS, 1),
             "ffn_inp" => (F, N),
             "ffn_moe_out" => (D, N),
             "ffn_moe_situ" => (HH, 8 * 1152),
-            "ffn_moe_weights_scaled" => (WT, 8),
+            "ffn_moe_weights_scaled" => (WT, 8), // before the norm
             "l_out" => (if phys == 5 { PRE } else { H }, N),
             "result_output" => (LG, 200058),
             _ => return None,
