@@ -63,6 +63,15 @@ measured on this machine, one run each, nothing else loaded.
   390-token prompt + 48 tokens. a code planted 400 tokens into a 31k-token
   prompt is retrieved at 100k context.
 
+- lookatmyquant 5.4GB (`shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB`,
+  mlx runtime `lamq` at `56c570b`) is slower here. warm, greedy, 200
+  tokens: decode 9.2 prose, 7.2 math, 8.1 code t/s; prefill 87 t/s at 703
+  tokens; 6.7-6.9GB peak. with its dspark drafter: 7.6, 10.5, 8.4. the
+  drafter verify kernel (`matmul_rotated_sg8_f16`, sg=32) asks for 1024
+  threads per group and m2 allows 832: it fails until sg=16, ntg=160. the
+  trellis decode is tuned for m5 max (73 t/s there) and is compute-bound on
+  m2. its quality is between UD-IQ1_S and UD-IQ3_XXS by their table.
+
 ## depth
 
 - decode slows with cache depth. at 8.3k tokens deep: f16 KV 12.4 t/s, q8_0
