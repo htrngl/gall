@@ -188,3 +188,28 @@ kernel void amax(U p [[buffer(0)]], A b [[buffer(1)]],
     if (bv[i] > m || (bv[i] == m && bi[i] < k)) m = bv[i], k = bi[i];
   id[p[2]] = k;
 }
+
+// union of the rows' expert ids for drm.metal: slot j of tab is (id, the
+// k of row t or 255). one thread. p: 0 rows
+kernel void uni(U p [[buffer(0)]], U id [[buffer(1)]],
+                device uint *tab [[buffer(2)]]) {
+  uint T = p[0], n = 0;
+  for (uint i = 0; i < 8 * T * (T + 1); i++) tab[i] = i % (T + 1) ? 255 : ~0u;
+  for (uint t = 0; t < T; t++)
+    for (uint k = 0; k < 8; k++) {
+      uint x = id[16 * t + k], j = 0;
+      while (j < n && tab[j * (T + 1)] != x) j++;
+      if (j == n) tab[n++ * (T + 1)] = x;
+      tab[j * (T + 1) + 1 + t] = k;
+    }
+}
+
+// d = sum of the 8 expert outputs at g, per row. grid (72, rows)
+// p: 0 g, 1 d, 2 row stride
+kernel void dsum(U p [[buffer(0)]], A a [[buffer(1)]], GP) {
+  uint e = gp.x * 32 + ln;
+  A g = a + gp.y * p[2] + p[0] + e;
+  float o = 0;
+  for (uint k = 0; k < 8; k++) o += g[k * N];
+  a[gp.y * p[2] + p[1] + e] = o;
+}

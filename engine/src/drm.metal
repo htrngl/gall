@@ -77,3 +77,42 @@ kernel void mm_q5_k_##T(constant PM &p, W w [[buffer(1)]], X x [[buffer(2)]], \
 
 MM8(8)
 MM5(1) MM5(2) MM5(3) MM5(4) MM5(7) MM5(8)
+
+// T rows against one read of an expert slab (or of a dense matrix: slab
+// 0), through u_<fmt>. slot tg.y of tab is (slab, k of row 0..T-1):
+// y[t][k][r] = W[slab][r] x[t][k]; k = 255: row t does not use the slab.
+// x rows are xs apart and x[t][k] is kx floats after x[t][0]; y likewise
+// with ys and n_out. 2 weight rows per threadgroup
+struct PX { uint n_in, n_out, rb, xs, ys, kx; };
+#define XG(F, T) \
+kernel void x_##F##_##T(constant PX &p, W w [[buffer(1)]], X x [[buffer(2)]], \
+        device float *y [[buffer(3)]], device const uint *tab [[buffer(4)]], \
+        uint3 tg [[threadgroup_position_in_grid]], \
+        ushort l [[thread_index_in_threadgroup]]) { \
+    device const uint *u = tab + tg.y*(T + 1); \
+    if (u[0] == ~0u) return; \
+    uint U = p.n_in/8, gb = p.rb*256/p.n_in, r0 = tg.x*2; \
+    W w0 = w + ((ulong)u[0]*p.n_out + r0)*p.rb; \
+    float s[2*T] = {0}; \
+    for (uint k = 0; 32*k + l < U; k++) { \
+        float4 xa[T], xb[T]; \
+        for (uint t = 0; t < T; t++) { \
+            device const packed_float4 *xp = (device const packed_float4 *) \
+                (x + t*p.xs + (u[1 + t] & 7)*p.kx + 256*k + 8*l); \
+            xa[t] = xp[0], xb[t] = xp[1]; \
+        } \
+        for (uint i = 0; i < 2; i++) \
+            for (uint t = 0; t < T; t++) \
+                s[i*T + t] += u_##F(w0 + i*p.rb + k*gb, l, xa[t], xb[t]); \
+    } \
+    for (uint i = 0; i < 2*T; i++) { \
+        float v = simd_sum(s[i]); \
+        uint t = i%T; \
+        if (l == 0 && u[1 + t] != 255) \
+            y[t*p.ys + u[1 + t]*p.n_out + r0 + i/T] = v; \
+    } \
+}
+#define XGS(T) XG(q8_0, T) XG(q4_k, T) XG(q5_k, T) XG(q6_k, T) \
+    XG(iq2_xxs, T) XG(iq2_xs, T) XG(iq2_s, T) XG(iq3_xxs, T) \
+    XG(iq4_nl, T) XG(nvfp4, T)
+XGS(2) XGS(4) XGS(8)
