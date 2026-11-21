@@ -17,7 +17,7 @@ Iron gall ink is made from oak apples and iron.
 ## Install and run
 
 ```sh
-cargo install --git <this repository>
+cargo install --git https://github.com/ltrgoddard/inkling-metal
 gall up          # first run fetches the model (11.7GB); server on port 9940
 gall test        # 64 greedy tokens against a llama.cpp reference
 gall down
