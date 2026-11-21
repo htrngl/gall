@@ -553,6 +553,10 @@ impl Srv {
         }
 
         let t0 = Instant::now();
+        if self.lm.len() != self.fed.len() {
+            self.lm.reset();
+            self.fed.clear();
+        }
         let same = self.fed.iter().zip(&p).take_while(|(a, b)| a == b).count();
         let mut k = same.min(p.len() - 1);
         if k < self.fed.len() && !self.lm.truncate(k) {
@@ -715,10 +719,38 @@ impl Lm for Dummy {
     }
 }
 
+// the engine as an Lm; it cannot roll back yet
+struct Ink(crate::model::Model, Vec<f32>);
+
+impl Lm for Ink {
+    fn reset(&mut self) {
+        self.0.reset()
+    }
+    fn step(&mut self, t: u32) -> &[f32] {
+        self.0.step(t);
+        self.1 = self.0.logits();
+        &self.1
+    }
+    fn len(&self) -> usize {
+        self.0.pos
+    }
+    fn truncate(&mut self, n: usize) -> bool {
+        n == self.0.pos
+    }
+    fn feed(&mut self, toks: &[u32]) -> &[f32] {
+        let (l, h) = toks.split_last().unwrap();
+        for &t in h {
+            self.0.step(t);
+        }
+        self.step(*l)
+    }
+}
+
 pub fn main(a: &[String]) {
     let opt = |k: &str, d: &str| {
         let i = a.iter().position(|x| x == k);
-        i.and_then(|i| a.get(i + 1)).map_or(d, |s| s).to_string()
+        let v = i.and_then(|i| a.get(i + 1)).filter(|v| !v.starts_with("--"));
+        v.map_or(d, |s| s).to_string()
     };
     let g = crate::gguf::open(&a[0]);
     let tok = Tok::new(&g);
@@ -730,8 +762,12 @@ pub fn main(a: &[String]) {
     let ctx: usize = opt("--ctx", "102400").parse().unwrap();
     let say = "<|message_model|><|content_text|>hello from ink\
                <|end_message|><|content_model_end_sampling|>";
-    let say = (tok.enc(&opt("--dummy", say), true), vec![0.0; tok.txt.len()]);
-    let lm: Box<dyn Lm> = Box::new(Dummy(say.0, 0, say.1, 0));
+    let lm: Box<dyn Lm> = if a.iter().any(|x| x == "--dummy") {
+        let say = tok.enc(&opt("--dummy", say), true);
+        Box::new(Dummy(say, 0, vec![0.0; tok.txt.len()], 0))
+    } else {
+        Box::new(Ink(crate::model::Model::open(&a[0], ctx), vec![]))
+    };
     let kv = |k: &str, d: f64| {
         let k = format!("general.sampling.{k}");
         if g.kv.contains_key(k.as_str()) { g.f(&k) } else { d }
