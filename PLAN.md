@@ -9,9 +9,9 @@ macbook air, 24GB, through a patched llama.cpp.
 - weights: `unsloth/Inkling-2-Mini-GGUF` UD-IQ3_XXS (11.7GB) since
   2026-11-21, app id `unsloth/Inkling-2-Mini-GGUF:IQ3_XXS` (section with an
   explicit `model =` in `models.user.ini`; hax preset `inkling` points at
-  it). UD-IQ1_M is deleted. UD-Q3_K_XL (13.6GB) stays only until the
-  grain model daemon moves: `~/.config/grain/config` points at IQ3_XXS,
-  but the root plist still names Q3_K_XL until `sudo grain install`.
+  it). UD-IQ1_M and UD-Q3_K_XL are deleted. `~/.config/grain/config`
+  points at IQ3_XXS; the root model plist still names Q3_K_XL until
+  `sudo grain install`, so grain cannot load a model until then.
   `.bak-q3kxl` copies of the app and hax configs hold the old settings. IQ3_XXS per token reads ~2.8GB:
   experts ~1.3GB (NVFP4 down, IQ3_XXS/IQ2_S gate-up, IQ4_NL), attention
   ~1.2GB (mostly q8_0), q5_K head 0.3GB. served at 15.0 t/s via the app.
