@@ -4,8 +4,8 @@
 //   let (ids, secs) = d.draft(&m, anchor, 7); // tokens after anchor at m.pos
 //   let next = d.pass(&m, &[anchor, ids..]); d.commit(&mut m, rows, kept);
 //   d.generate(&mut m, next, &mut Spec::new(), |tok| more);  // all of it
-// ink dr MODEL DRAFTER REFDIR [-n 64] [-c 4096]: teacher-forced acceptance
-// ink run MODEL --tokens FILE --draft DRAFTER [--block 2] [-n 64] [-c 4096]
+// gall dr MODEL DRAFTER REFDIR [-n 64] [-c 4096]: teacher-forced acceptance
+// gall run MODEL --tokens FILE --draft DRAFTER [--block 2] [-n 64] [-c 4096]
 use crate::gguf::{self, Gguf, Tensor};
 use crate::gpu::*;
 use crate::model::{Model, Op};

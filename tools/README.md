@@ -1,12 +1,12 @@
 # reference dumps (milestone 0)
 
 `refdump.cpp` is a standalone tool on the llama.h C API. it links the
-libraries that `./build` leaves in `src-mix/build/bin` and does not change
-`src-mix`. it feeds a plain-text prompt (no chat template), then decodes
+libraries that `./build` leaves in `llama/src-mix/build/bin` and does not change
+`llama/src-mix`. it feeds a plain-text prompt (no chat template), then decodes
 greedily, and writes tokens, logits and graph nodes to `ref/` (gitignored).
 
 ```sh
-B=src-mix/build/bin; mkdir -p scratch
+B=llama/src-mix/build/bin; mkdir -p scratch
 clang++ -std=c++17 -O2 -w -Isrc-mix/include -Isrc-mix/ggml/include \
   tools/refdump.cpp -o scratch/refdump -L$B -lllama -lggml -lggml-base \
   -Wl,-rpath,$PWD/$B
@@ -108,7 +108,7 @@ control and convolve helpers have no `cb()` names.
 
 ## cb() names in build_moe_ffn (SITU, merged gate_up)
 
-from `src-mix/src/llama-graph.cpp`, in graph order: `ffn_moe_logits`,
+from `llama/src-mix/src/llama-graph.cpp`, in graph order: `ffn_moe_logits`,
 `ffn_moe_probs`, `ffn_moe_probs_biased`, `ffn_moe_argsort` (on
 `topk->src[0]`), `ffn_moe_topk`, `ffn_moe_weights`, `ffn_moe_weights_sum`,
 `ffn_moe_weights_sum_clamped`, `ffn_moe_weights_norm`,

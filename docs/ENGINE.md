@@ -1,7 +1,7 @@
 # inkling engine: brief
 
 a from-scratch decode engine for inkling-2-mini on this m2 air (10-core GPU,
-24GB, ~90GB/s usable). llama.cpp (`./build`, `PLAN.md`) stays the daily
+24GB, ~90GB/s usable). llama.cpp (`./build`, `llama/PLAN.md`) stays the daily
 driver and the reference until milestone 2 passes.
 
 ## goal
@@ -46,13 +46,13 @@ depth (6 layers per block), cross-pass messages into looped layers,
 
 references, read in this order:
 
-1. `src-mix/src/models/inkling2.cpp`, `inkling2-loop.cpp`: the graph
+1. `llama/src-mix/src/models/inkling2.cpp`, `inkling2-loop.cpp`: the graph
    llama.cpp runs; ground truth for our numbers.
 2. lookatmyquant `runtime_mlx/inkling/model.py` (MIT,
    github.com/ShinMegamiBoson/lookatmyquant): the same model as readable
    python, with fused decode kernels in `fast_kernels.py`.
-3. `patches/0001` (banded flash attention with bias and sink),
-   `patches/0002` (NVFP4 mat-vec lane fix).
+3. `llama/patches/0001` (banded flash attention with bias and sink),
+   `llama/patches/0002` (NVFP4 mat-vec lane fix).
 
 ## design
 
@@ -80,7 +80,7 @@ references, read in this order:
 
 each has a pass test. do not start the next before it passes.
 
-0. reference dumps. with `src-mix` `eval-callback` (rebuild with
+0. reference dumps. with `llama/src-mix` `eval-callback` (rebuild with
    `-DLLAMA_BUILD_EXAMPLES=ON` in a scratch build dir), dump per-visit
    hidden states and final logits for 3 fixed prompts (short, 2k, 8k) to
    `ref/` (gitignored). pass: dumps reload and match a second run.
@@ -113,6 +113,6 @@ each has a pass test. do not start the next before it passes.
 
 ## rules
 
-- every experiment through `./wd` (see `PLAN.md`, hazards); unload the
+- every experiment through `./wd` (see `llama/PLAN.md`, hazards); unload the
   app's model first. one model on the GPU at a time.
 - numbers in commits are measured, one line each: what, before, after.

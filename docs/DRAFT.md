@@ -1,7 +1,7 @@
 # dspark drafter: what it is and whether it pays here
 
-source: `src-mix/src/models/dspark.cpp` (`graph_inkling2`,
-`build_inkling2_head`), `src-mix/common/speculative.cpp`
+source: `llama/src-mix/src/models/dspark.cpp` (`graph_inkling2`,
+`build_inkling2_head`), `llama/src-mix/common/speculative.cpp`
 (`common_speculative_impl_draft_dspark`), and the file
 `dspark-Inkling-2-Mini-Q8_0.gguf` (402MB, arch `dflash`, 54 tensors, in the
 hf cache beside the model).
@@ -115,9 +115,9 @@ decode row. measured numbers below replace these estimates.
 
 ## measured
 
-`ink dr $M $D ref/short` (teacher-forced on llama.cpp's greedy text) and
-`ink run $M --tokens F --draft $D --block B -n 120` (free-running; the
-verify is still serial, so the text equals `ink run` without a drafter:
+`gall dr $M $D ref/short` (teacher-forced on llama.cpp's greedy text) and
+`gall run $M --tokens F --draft $D --block B -n 120` (free-running; the
+verify is still serial, so the text equals `gall run` without a drafter:
 checked on 120 tokens).
 
 - features against the ref dump: rel 1.5e-4, 2.6e-4, 9.5e-3, 9.6e-3.

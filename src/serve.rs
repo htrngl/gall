@@ -1,5 +1,5 @@
 // openai-compatible chat server over one model, one request at a time.
-//   ink serve <gguf> [--port 9940] [--ctx 102400] [--effort none]
+//   gall serve <gguf> [--port 9940] [--ctx 102400] [--effort none]
 //             [--alias inkling-2-mini] [--dummy [answer]]
 // POST /v1/chat/completions (stream or not), GET /v1/models, GET /health.
 // the chat template of the gguf is written out in prompt(); the model
@@ -642,7 +642,7 @@ impl Srv {
         let (np, ms) = (p.len() - k, |d: Duration| d.as_secs_f64() * 1e3);
         let rate = |n: usize, d: Duration| n as f64 / d.as_secs_f64().max(1e-9);
         eprintln!(
-            "ink: prompt {} ({k} cached, snap {snap}) {:.1} t/s, first token \
+            "gall: prompt {} ({k} cached, snap {snap}) {:.1} t/s, first token \
              {:.2} s, predicted {n} {:.1} t/s",
             p.len(),
             rate(np, dp),
@@ -697,7 +697,7 @@ impl Srv {
             ("GET", "/health") => reply(&mut c, 200, &obj!["status" => "ok"]),
             ("GET", "/models") => {
                 let m = obj!["id" => self.name.as_str(), "object" => "model",
-                    "owned_by" => "ink"];
+                    "owned_by" => "gall"];
                 reply(&mut c, 200, &obj!["object" => "list", "data" => vec![m]])
             }
             ("POST", "/chat/completions") => match J::parse(&body) {
@@ -771,12 +771,12 @@ pub fn main(a: &[String]) {
     let g = crate::gguf::open(&a[0]);
     let tok = Tok::new(&g);
     if a.get(1).is_some_and(|x| x == "--prompt") {
-        // ink serve <gguf> --prompt <request.json>: the rendered prompt
+        // gall serve <gguf> --prompt <request.json>: the rendered prompt
         let r = J::parse(&std::fs::read(&a[2]).unwrap()).unwrap();
         return print!("{}", prompt(&r, &"none".into()).unwrap().0);
     }
     let ctx: usize = opt("--ctx", "102400").parse().unwrap();
-    let say = "<|message_model|><|content_text|>hello from ink\
+    let say = "<|message_model|><|content_text|>hello from gall\
                <|end_message|><|content_model_end_sampling|>";
     let lm: Box<dyn Lm> = if a.iter().any(|x| x == "--dummy") {
         let say = tok.enc(&opt("--dummy", say), true);
@@ -811,10 +811,10 @@ pub fn main(a: &[String]) {
         sp,
         t,
     };
-    eprintln!("ink: http://127.0.0.1:{port}/v1, context {ctx}");
+    eprintln!("gall: http://127.0.0.1:{port}/v1, context {ctx}");
     for c in l.incoming().flatten() {
         if let Err(e) = s.conn(c) {
-            eprintln!("ink: {e}");
+            eprintln!("gall: {e}");
         }
     }
 }

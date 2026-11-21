@@ -214,7 +214,7 @@ impl Tok {
     }
 }
 
-// ink tok <gguf> <file>: the ids of the file, as llama-tokenize --ids
+// gall tok <gguf> <file>: the ids of the file, as llama-tokenize --ids
 pub fn main(a: &[String]) {
     let t = Tok::new(&crate::gguf::open(&a[0]));
     let s = std::fs::read_to_string(&a[1]).unwrap();

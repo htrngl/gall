@@ -1,9 +1,7 @@
-/src/
-src-mix/
-src-decode/
+ref/
+target/
+scratch/
+llama/src-mix/
+llama/src-b12568/
 *.log
 env
-src-b12568/
-ref/
-engine/target/
-scratch/

@@ -1,9 +1,9 @@
-// ink run MODEL --tokens FILE [-n 64] [-c 4096] [--prof]
-// ink check MODEL REFDIR [-n 64] [-c 4096] [-ub]
-// ink pp MODEL TOKENS [-n all] [-ub 512] [-c 4096] [--cmp] [--ref REFDIR]
-// ink mmb
-// ink tok MODEL FILE
-// ink serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
+// gall run MODEL --tokens FILE [-n 64] [-c 4096] [--prof]
+// gall check MODEL REFDIR [-n 64] [-c 4096] [-ub]
+// gall pp MODEL TOKENS [-n all] [-ub 512] [-c 4096] [--cmp] [--ref REFDIR]
+// gall mmb
+// gall tok MODEL FILE
+// gall serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
 mod dr;
 mod gguf;
 mod gpu;
@@ -55,7 +55,7 @@ fn main() {
     let n: usize = opt("-n").map_or(64, |v| v.parse().unwrap());
     let ctx = opt("-c").map_or(4096, |v| v.parse().unwrap());
     if a[1] == "kb" {
-        // ink kb KERNEL GX,GY THREADS P0,P1,..: time 100 dispatches on zeros
+        // gall kb KERNEL GX,GY THREADS P0,P1,..: time 100 dispatches on zeros
         let g = gpu::Gpu::new();
         let b = [256, 512, 600, 128, 1].map(|n| g.buf(n << 20));
         let defs = std::env::var("DEFS").unwrap_or_default().replace(';', "\n");
@@ -191,7 +191,7 @@ fn main() {
                 }
                 if next != t {
                     flips += 1;
-                    println!("step {g}: ink {next}, ref {t}");
+                    println!("step {g}: gall {next}, ref {t}");
                 }
                 let sd = format!("{d}/s{g:04}");
                 if !fs::exists(&sd).unwrap() {

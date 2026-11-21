@@ -1,5 +1,5 @@
 // prefix snapshots on disk, so a known prompt prefix is not fed again.
-//   let mut s = Snaps::new(path, &m);      // index of ~/.cache/ink/*.snap
+//   let mut s = Snaps::new(path, &m);      // index of ~/.cache/gall/*.snap
 //   let (k, r) = s.prime(&mut m, &p, k, sys); // m holds p[..k], r restored
 // a file: tag line, n, n token ids, the conv rings, the last ROWS rows of
 // each sliding window ring, rows [0, n) of each full-attention slot.
@@ -67,16 +67,16 @@ impl Snaps {
     pub fn new(path: &str, m: &Model) -> Snaps {
         let (md, home) = (fs::metadata(path).unwrap(), std::env::var("HOME"));
         let at = md.modified().unwrap().duration_since(SystemTime::UNIX_EPOCH);
-        let tag = format!("ink snap 1 row {} sw {SW} cs {CS} model {} {}\n",
+        let tag = format!("gall snap 1 row {} sw {SW} cs {CS} model {} {}\n",
             m.snap_row(), md.len(), at.unwrap().as_secs());
-        let dir = PathBuf::from(home.unwrap()).join(".cache/ink");
+        let dir = PathBuf::from(home.unwrap()).join(".cache/gall");
         fs::create_dir_all(&dir).unwrap();
         let ls = fs::read_dir(&dir).unwrap().flatten().map(|e| e.path());
         let ls = ls.filter(|p| p.extension().is_some_and(|x| x == "snap"));
         let ix: Vec<_> = ls
             .filter_map(|p| head(&p, &tag).map(|h| (p, h.1)))
             .collect();
-        eprintln!("ink: {} snapshots in {}", ix.len(), dir.display());
+        eprintln!("gall: {} snapshots in {}", ix.len(), dir.display());
         Snaps { dir, tag, ix }
     }
 
@@ -137,7 +137,7 @@ impl Snaps {
             let t = std::time::Instant::now();
             if self.read(m, i).is_some() {
                 (k, got) = (c[i], c[i]);
-                eprintln!("ink: snap {k} read in {:.2} s", t.elapsed().as_secs_f64());
+                eprintln!("gall: snap {k} read in {:.2} s", t.elapsed().as_secs_f64());
             } else {
                 // a short or foreign file: start again
                 m.reset();
@@ -156,9 +156,9 @@ impl Snaps {
             k = n;
             let t = std::time::Instant::now();
             match self.write(m, &p[..n]) {
-                Ok(()) => eprintln!("ink: snap {n} written in {:.2} s",
+                Ok(()) => eprintln!("gall: snap {n} written in {:.2} s",
                     t.elapsed().as_secs_f64()),
-                Err(e) => eprintln!("ink: snap {n}: {e}"),
+                Err(e) => eprintln!("gall: snap {n}: {e}"),
             }
         }
         (k, got)

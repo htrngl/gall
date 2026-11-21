@@ -19,7 +19,7 @@ macbook air, 24GB, through a patched llama.cpp.
   upstream's own inkling 2 mini, #32694) + the 32 unsloth pins in `pins.txt`
   (their `scripts/unsloth/pr-set.json` at master `e94fed7`, merged in order,
   as their CI does; adds #32704, the loop-slot scale fix, and the
-  `inkling2_loop` path) + `patches/`. installed in
+  `inkling2_loop` path) + `llama/patches/`. installed in
   `~/.llama-app/inkling-metal/`, and `/opt/homebrew/bin/llama` links to it.
   the b12568 build is kept in `~/.llama-app/inkling-metal-old/` and its tree
   in `src-b12568/`; the unsloth prebuilt is in `~/.llama-app/unsloth-b12568/`.
@@ -49,21 +49,21 @@ measured on this machine, one run each, nothing else loaded.
 | device memory, projected | 14.8GB | 16.6GB |
 | same settings at 100k | 22.2GB (does not fit) | 16.6GB |
 
-- `patches/0001`: metal kernel for `FLASH_ATTN_EXT_BANDED`. the relative
+- `llama/patches/0001`: metal kernel for `FLASH_ATTN_EXT_BANDED`. the relative
   position bias and the per-query sink go into the half8x8 flash attention
   kernel, so prefill no longer builds an n_kv x n_ubatch x n_head bias. the
   compute buffer stops growing with context. also takes a q8_0 KV cache.
   `test-backend-ops -o FLASH_ATTN_EXT_BANDED -b MTL0`: 46/46 against CPU.
-- `patches/0002`: NVFP4 expert mat-vec kernel wasted 25-44% of its lane
+- `llama/patches/0002`: NVFP4 expert mat-vec kernel wasted 25-44% of its lane
   iterations on this model's row widths. decode 11.8 -> 13.8 t/s in a
   back-to-back pair.
-- `patches/0006-0008, 0010`: fewer graph nodes per decoded token (12.6k ->
+- `llama/patches/0006-0008, 0010`: fewer graph nodes per decoded token (12.6k ->
   11.2k) in the bias path, `mix()` and `clip()`. GPU time 65.8 -> 61.5 ms
   per token. the `mix()` and `clip()` rewrites are algebraically the same
   but round differently: on a 2.3k-token prompt the temp-0 text diverges
   after 15 tokens, and perplexity on 4 chunks moves 4.580 -> 4.558. drop
   0007 and 0008 (about 3.5 ms per token) for strict identity.
-- `patches/0003-0005, 0009`: perf cases and env-gated profiling, inert unless set.
+- `llama/patches/0003-0005, 0009`: perf cases and env-gated profiling, inert unless set.
   `GGML_METAL_PROF=1` prints encode/gpu/wall per graph, `=2` a per-op table,
   `GGML_METAL_PROF_SKIP=",MUL_MAT,"` skips op types for ablation.
 - temp-0 output of the final build is byte-identical to the prebuilt on a
@@ -139,13 +139,13 @@ near 25 t/s, not 40.
 
 ## ideas left
 
-the custom engine brief, with a fresh IQ3_XXS profile, is `ENGINE.md`.
+the custom engine brief, with a fresh IQ3_XXS profile, is `docs/ENGINE.md`.
 
 1. decode at depth: a banded variant for one query would drop the dense
    per-head bias and mask chain (CONT, CPY, GET_ROWS, ADD over n_kv x 24
    per full layer); then check the vec kernel against bandwidth.
 2. fused control, SITU, convolve and clip kernels: 1-2 ms each.
-3. the lane fix of `patches/0002` for the q5_K output head and the 18
+3. the lane fix of `llama/patches/0002` for the q5_K output head and the 18
    expert tensors that are not NVFP4: ~1 ms and ~1.5 ms.
 4. dspark drafter: 52% acceptance but slower than no drafter on the old
    build; verify cost is now lower, not re-measured.
