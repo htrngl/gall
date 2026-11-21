@@ -132,7 +132,8 @@ kernel void add(U p [[buffer(0)]], A b [[buffer(1)]], GP) {
   b[p[0] + e] += b[p[1] + e];
 }
 
-// j = joint_proj [state, markov_w1[prev], cur, f_rnn] + bias. grid 24
+// j = joint_proj [state, markov_w1[prev], cur, f_rnn] + bias; the last
+// third (the latent) through tanh. grid 24
 // p: 0 state, 1 cur, 2 f_rnn, 3 j, 4 bias, 5 index of prev in id
 kernel void joint(U p [[buffer(0)]], A b [[buffer(1)]], S s [[buffer(2)]],
                   U id [[buffer(4)]], W jp [[buffer(5)]],
@@ -144,22 +145,30 @@ kernel void joint(U p [[buffer(0)]], A b [[buffer(1)]], S s [[buffer(2)]],
     o += bf(w[i]) * b[p[0] + i] + bf(w[256 + i]) * bf(v[i]);
   for (uint i = 0; i < N; i++)
     o += bf(w[512 + i]) * b[p[1] + i] + bf(w[512 + N + i]) * b[p[2] + i];
-  b[p[3] + r] = o;
+  b[p[3] + r] = r < 512 ? o : tanh(o);
 }
 
-// y = cur + hidden_out tanh(j[512..]) + bias, and the state update
-// s = c + sigmoid(j[..256]) (s - c), c = tanh(j[256..512]). grid 72
-// p: 0 state, 1 j, 2 cur, 3 y, 4 bias
-kernel void corr(U p [[buffer(0)]], A b [[buffer(1)]], S s [[buffer(2)]],
-                 W ho [[buffer(5)]], GP) {
-  uint e = gp.x * 32 + ln;
-  float o = b[p[2] + e] + s[p[4] + e];
+// logits = base + wb + P latent for vocab row v, P = output hidden_out
+// as f16; and the state update s = c + sigmoid(j[..256]) (s - c),
+// c = tanh(j[256..512]). grid 6252. p: 0 state, 1 j, 2 base, 3 out, 4 wb
+kernel void pl(U p [[buffer(0)]], A b [[buffer(1)]],
+               const device half *pp [[buffer(5)]], GP) {
+  uint v = gp.x * 32 + ln;
+  float o = b[p[2] + v] + b[p[4] + v];
   for (uint k = 0; k < 256; k++)
-    o += bf(ho[e * 256 + k]) * tanh(b[p[1] + 512 + k]);
-  b[p[3] + e] = o;
-  if (e >= 256) return;
-  float c = tanh(b[p[1] + 256 + e]);
-  b[p[0] + e] = c + (b[p[0] + e] - c) / (1 + exp(-b[p[1] + e]));
+    o += float(pp[v * 256 + k]) * b[p[1] + 512 + k];
+  b[p[3] + v] = o;
+  if (v >= 256) return;
+  float c = tanh(b[p[1] + 256 + v]);
+  b[p[0] + v] = c + (b[p[0] + v] - c) / (1 + exp(-b[p[1] + v]));
+}
+
+// columns p[1].. of P from 8 rows of head outputs. grid 6252. p: 0 src
+kernel void pset(U p [[buffer(0)]], A b [[buffer(1)]],
+                 device half *pp [[buffer(5)]], GP) {
+  uint v = gp.x * 32 + ln;
+  for (uint t = 0; t < 8; t++)
+    pp[v * 256 + p[1] + t] = b[p[0] + t * 201024 + v];
 }
 
 // first argmax of b[p[0]..+p[1]] into id[p[2]]. one group of 768

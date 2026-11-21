@@ -115,4 +115,44 @@ decode row. measured numbers below replace these estimates.
 
 ## measured
 
-(filled in by `ink dr`; see git log.)
+`ink dr $M $D ref/short` (teacher-forced on llama.cpp's greedy text) and
+`ink run $M --tokens F --draft $D --block B -n 120` (free-running; the
+verify is still serial, so the text equals `ink run` without a drafter:
+checked on 120 tokens).
+
+- features against the ref dump: rel 1.5e-4, 2.6e-4, 9.5e-3, 9.6e-3.
+- hit rate per slot, prose, teacher-forced: 0.61, 0.35, 0.18, 0.14, 0.10,
+  0.06, 0.08 (unconditional).
+- tokens per pass (1 + drafts kept):
+
+| prompt | block 1 | block 2 | block 3 | block 7 |
+| --- | ---: | ---: | ---: | ---: |
+| prose (ref/short) | 1.61 | 1.96 | 2.12 | 2.31 |
+| math (induction proof) | | | 2.96 (from the block 7 run) | 4.36 |
+| code (rust file head) | | | 3.51 | 5.52 |
+
+- draft cost, gpu: 7 drafts 31 ms, 3 drafts 22 ms. shares for 7: output
+  head for 7 rows 17 ms (q5_k, one read), `P latent` 7 x 1.2 ms, body
+  5.9 ms (21 q8_0 passes of 8 rows, 255MB), joint + argmax 3 ms.
+- kernel finding, for the batched verify too: a weight pass over 8 inputs
+  costs 1.3x one input for q8_0 when the unit is dequantized once in the
+  kernel text and the input count is a compile-time constant. through
+  mv.metal's `u_<fmt>` per input it is 5x slower (the dequant is repeated),
+  and with a run-time count 2x slower. q5_k: 7 inputs cost 3.1x one.
+
+with t(T) still the estimate above (serial is 52 ms now) and the measured
+draft cost: prose ties at block 1 (83 ms for 1.61 tokens) and loses at
+block 2; math gains ~15% and code ~35% at block 3 (132 ms for 2.96 and
+3.51 tokens). the real t(T) decides; it needs the batched pass.
+
+## left
+
+- batched verify: one pass over `[anchor, drafts]` with per-row features
+  (H after the first `elem` of visits 5, 23, 41; the normed output) and
+  per-row argmax, then `Model::truncate(n + kept + 1)` (the rings hold 12
+  steps). `Dr::inject` then runs per kept row; stale rows in the drafter
+  caches are overwritten before they are read.
+- block size from a running acceptance estimate; 0 on prose.
+- sampling: accept while the target's sample equals the draft.
+- the last drafter layer only needs rows 1..B (q, wo, ffn): ~1.5 ms.
+- the drafter's full-attention layer reads all context (4KB per token).
