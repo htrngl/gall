@@ -24,9 +24,9 @@ const MM: &str = concat!(
     include_str!("mv.metal"),
     include_str!("drm.metal")
 );
-const KINDS: [&str; 15] = [
+const KINDS: [&str; 16] = [
     "tap", "fuse", "norm", "rope", "put", "attn", "silu", "add", "joint", "pl",
-    "pset", "amax", "uni", "dsum", "conf",
+    "pset", "amax", "uni", "dsum", "conf", "amrg",
 ];
 // drm.metal x_*: (type, weight rows per threadgroup at 1 use), as XS there
 const XT: [(u32, usize); 10] = [(8, 4), (12, 2), (13, 2), (14, 2), (16, 8),
@@ -52,6 +52,7 @@ const BL: usize = WB + 201024; // base logits, 8 rows
 const NV: usize = 201024;
 const FR: usize = BL + 8 * NV; // 4 target features per verify row
 const CF: usize = FR + 32 * N; // the drafter's probability of each draft
+const PA: usize = CF + 8; // attention partials: 192 queries x chunks x 130
 
 pub struct Dr {
     g: &'static Gguf,
@@ -120,7 +121,7 @@ impl Dr {
             mv: Mv::new(&m.gpu, ""),
             pipes,
             s: sb,
-            b: m.gpu.buf(4 * (CF + 8)),
+            b: m.gpu.buf(4 * (PA + 192 * 130 * (n_ctx + 8).div_ceil(256))),
             p: m.gpu.buf(2 * 256 * NV),
             c: m.gpu.buf(2 * 2048 * (2048 + n_ctx)),
             id: m.gpu.buf(4 * 8),
@@ -175,7 +176,8 @@ impl Dr {
         (n, 0, Box::new(move |e: &Enc| {
             let mut b = [&self.b, &self.s, &self.c, &self.id].map(|b| (b, 0)).to_vec();
             b.extend(&x);
-            call(e, &self.pipes[n], &a, &b, g, if g[0] == 1 { 768 } else { 32 })
+            let th = if g[0] == 1 { 768 } else if n == "attn" { 512 } else { 32 };
+            call(e, &self.pipes[n], &a, &b, g, th)
         }), None)
     }
 
@@ -408,8 +410,10 @@ impl Dr {
             v.push(self.k("rope", [24, 8, 1], &[QQ, 3072, self.o(l, "attn_q_norm"), n], vec![]));
             v.push(self.k("rope", [8, 8, 1], &[KK, 2048, self.o(l, "attn_k_norm"), n], vec![]));
             let (nk, ring) = if l == 1 { (n - lo, 0) } else { ((n - lo).min(1024), 1024) };
-            let p = [QQ, KK, self.co[l] * 2048, nk, n - nk, ring, AT];
-            v.push(self.k("attn", [24, 8, 1], &p, vec![]));
+            let nc = (nk + 8).div_ceil(256);
+            let p = [QQ, KK, self.co[l] * 2048, nk, n - nk, ring, PA, nc];
+            v.push(self.k("attn", [8, 8, nc], &p, vec![]));
+            v.push(self.k("amrg", [24, 8, 1], &[PA, nc, AT], vec![]));
             v.extend(self.m(l, "attn_output", AT, OO, 0, 8));
             v.push(self.k("add", g8, &[X, OO], vec![]));
             v.push(self.k("norm", g8, &[X, HN, self.o(l, "ffn_norm")], vec![]));
@@ -465,7 +469,7 @@ pub struct Spec {
 impl Spec {
     pub fn new() -> Spec {
         let ms = |v: [f64; 8]| v.map(|x| 1e-3 * x);
-        let tv = [52., 75., 98., 122., 150., 185., 225., 265.];
+        let tv = [51., 73., 96., 123., 159., 197., 255., 266.];
         Spec {
             block: None,
             q: std::array::from_fn(|i| 0.9 / (1. + (1.75 - i as f64 / 2.).exp())),
@@ -559,7 +563,7 @@ pub fn main(a: &[String]) {
     let mut cal = [[0usize; 2]; 10]; // by probability: drafts, hits
     if let Some(i) = a.iter().position(|x| x == "--tv") {
         // ms of a pass by rows (best, mean of 6), on the reference text
-        all[..np].iter().for_each(|&t| _ = dr.step(&mut m, t));
+        dr.feed(&mut m, &all[..np]);
         let mut i0 = np;
         for r in a[i + 1].split(',').map(|v| v.parse::<usize>().unwrap()) {
             let ts: Vec<f64> = (0..6).map(|_| {

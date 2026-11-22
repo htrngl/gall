@@ -11,6 +11,7 @@ typedef const device uint *U;
 typedef device float *A;
 typedef const device float *S;
 typedef const device ushort *W; // bf16
+#define P4(x) ((const device packed_float4 *)(x))
 
 static float bf(ushort u) { return as_type<float>(uint(u) << 16); }
 
@@ -76,47 +77,71 @@ kernel void put(U p [[buffer(0)]], A b [[buffer(1)]],
   c[p[1] + e] = b[p[0] + e];
 }
 
-// block attention: query (head gp.x, row gp.y) over p[3] context keys
-// from position p[4] (ring p[5], 0: none) and the 8 block rows. lane ln
-// takes keys ln + 32 i with an online softmax; the lanes merge. grid
-// (24, 8). p: 0 q, 1 block k/v, 2 cache, 3 nk, 4 pos0, 5 ring, 6 out
+// block attention in two steps, so that no thread runs a long chain and
+// the 3 q heads of a kv head share its keys. 1: kv head gp.x, row gp.y
+// and chunk gp.z of 256 keys: the p[3] context keys from position p[4]
+// (ring p[5], 0: none), then the 8 block rows. each of 16 simdgroups
+// takes 16 keys in turn, a lane 4 dims, with an online softmax; they
+// merge to (acc[128], max, sum) per q head. grid (8, 8, chunks) of 512
+// p: 0 q, 1 block k/v, 2 cache, 3 nk, 4 pos0, 5 ring, 6 partials, 7 chunks
 kernel void attn(U p [[buffer(0)]], A b [[buffer(1)]],
-                 const device half *c [[buffer(3)]], GP) {
-  threadgroup float pm[32], pl[32], pa[32 * 128];
-  S q = b + p[0] + gp.y * 3072 + gp.x * 128;
-  uint h = gp.x / 3 * 128, nk = p[3];
-  float m = -1e30, l = 0, acc[128];
-  for (uint i = 0; i < 128; i++) acc[i] = 0;
-  for (uint j = ln; j < nk + 8; j += 32) {
-    float sc = 0, f, w;
+                 const device half *c [[buffer(3)]], GP,
+                 uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float4 ac[16 * 3 * 32];
+  threadgroup float ms[16 * 3], ls[16 * 3];
+  uint h = gp.x * 128, nk = p[3];
+  float4 q[3], acc[3] = {0, 0, 0};
+  float3 m = -1e30, l = 0, s;
+  for (uint i = 0; i < 3; i++)
+    q[i] = P4(b + p[0] + gp.y * 3072 + (gp.x * 3 + i) * 128)[ln];
+  for (uint j = gp.z * 256 + sg * 16, j1 = min(j + 16, nk + 8); j < j1; j++) {
+    float4 k, v;
     if (j < nk) {
       uint r = p[4] + j;
-      const device half *k = c + p[2] + (p[5] ? r % p[5] : r) * 2048 + h;
-      for (uint i = 0; i < 128; i++) sc += q[i] * float(k[i]);
-      sc *= 0.08838834764;
-      f = exp(m - max(m, sc)), w = exp(sc - max(m, sc));
-      for (uint i = 0; i < 128; i++)
-        acc[i] = acc[i] * f + w * float(k[1024 + i]);
+      const device half4 *x = (const device half4 *)
+        (c + p[2] + (p[5] ? r % p[5] : r) * 2048 + h);
+      k = float4(x[ln]), v = float4(x[256 + ln]);
     } else {
-      S k = b + p[1] + (j - nk) * 2048 + h;
-      for (uint i = 0; i < 128; i++) sc += q[i] * k[i];
-      sc *= 0.08838834764;
-      f = exp(m - max(m, sc)), w = exp(sc - max(m, sc));
-      for (uint i = 0; i < 128; i++) acc[i] = acc[i] * f + w * k[1024 + i];
+      S x = b + p[1] + (j - nk) * 2048 + h;
+      k = P4(x)[ln], v = P4(x)[256 + ln];
     }
-    l = l * f + w, m = max(m, sc);
+    for (uint i = 0; i < 3; i++)
+      s[i] = simd_sum(dot(k, q[i])) * 0.08838834764;
+    float3 mx = max(m, s), f = exp(m - mx), w = exp(s - mx);
+    for (uint i = 0; i < 3; i++) acc[i] = acc[i] * f[i] + w[i] * v;
+    l = l * f + w, m = mx;
   }
-  pm[ln] = m, pl[ln] = l;
-  for (uint i = 0; i < 128; i++) pa[ln * 128 + i] = acc[i];
+  for (uint i = 0; i < 3; i++) {
+    ac[(sg * 3 + i) * 32 + ln] = acc[i];
+    if (!ln) ms[sg * 3 + i] = m[i], ls[sg * 3 + i] = l[i];
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint t = 0; t < 32; t++) m = max(m, pm[t]);
-  l = 0;
-  for (uint t = 0; t < 32; t++) l += pl[t] * exp(pm[t] - m);
-  for (uint d = ln; d < 128; d += 32) {
-    float o = 0;
-    for (uint t = 0; t < 32; t++) o += pa[t * 128 + d] * exp(pm[t] - m);
-    b[p[6] + gp.y * 3072 + gp.x * 128 + d] = o / l;
+  if (sg > 2) return;
+  float4 o = 0;
+  float mm = -1e30, ll = 0;
+  for (uint g = 0; g < 16; g++) mm = max(mm, ms[g * 3 + sg]);
+  for (uint g = 0; g < 16; g++) {
+    float w = exp(ms[g * 3 + sg] - mm);
+    ll += w * ls[g * 3 + sg], o += w * ac[(g * 3 + sg) * 32 + ln];
   }
+  A out = b + p[6] + ((gp.y * 24 + gp.x * 3 + sg) * p[7] + gp.z) * 130;
+  ((device packed_float4 *)out)[ln] = o;
+  if (!ln) out[128] = mm, out[129] = ll;
+}
+
+// 2: the chunks of q head gp.x, row gp.y into its output. grid (24, 8)
+// p: 0 partials, 1 chunks, 2 out
+kernel void amrg(U p [[buffer(0)]], A b [[buffer(1)]], GP) {
+  S o = b + p[0] + (gp.y * 24 + gp.x) * p[1] * 130;
+  float m = -1e30, l = 0;
+  float4 acc = 0;
+  for (uint i = 0; i < p[1]; i++) m = max(m, o[i * 130 + 128]);
+  for (uint i = 0; i < p[1]; i++) {
+    float w = exp(o[i * 130 + 128] - m);
+    l += w * o[i * 130 + 129], acc += w * P4(o + i * 130)[ln];
+  }
+  ((device packed_float4 *)(b + p[2] + gp.y * 3072 + gp.x * 128))[ln] =
+    acc / l;
 }
 
 // g = silu(g) * u. grid (288, rows). p: 0 g, 1 u
