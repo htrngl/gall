@@ -7,11 +7,11 @@ let cache = fm.homeDirectoryForCurrentUser.appendingPathComponent(".cache/gall")
 let key = cache.appendingPathComponent("key")
 let endpoint = "http://127.0.0.1:9940"
 
-struct Health: Decodable {
+struct Health: Decodable, Equatable {
     var loaded: Bool
     var busy: Bool?
     var last: Last?
-    struct Last: Decodable {
+    struct Last: Decodable, Equatable {
         var cacheN, promptN: Int?
         var predictedPerSecond: Double?
     }
@@ -126,9 +126,8 @@ func alert(_ s: String) {
             NSApp.setActivationPolicy(.accessory)
             await start()
             for t in 0... {
-                if fetching {
-                    phase = "Downloading \(Int(got() / 12.7e7))%"
-                }
+                let p = "Downloading \(Int(got() / 12.7e7))%"
+                if fetching, p != phase { phase = p }
                 if open || t % 10 == 0 { await poll() }
                 await sleep(1)
             }
@@ -145,9 +144,13 @@ func alert(_ s: String) {
         return try? dec.decode(Health.self, from: b)
     }
 
+    // only a change is published: each one rebuilds the open menu, which
+    // closes a submenu under the pointer
     func poll() async {
-        h = await health()
-        mem = h == nil ? nil : footprint()
+        let n = await health()
+        let g = n == nil ? nil : footprint().map { ($0 * 10).rounded() / 10 }
+        if n != h { h = n }
+        if g != mem { mem = g }
     }
 
     // the first run checks the mac and fetches the model; up is a no-op

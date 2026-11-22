@@ -15,7 +15,8 @@ func copy(_ s: String) {
         MenuBarExtra {
             Menu(m: m)
         } label: {
-            Image(nsImage: leaf(m.h?.loaded == true ? 1 : 0.35))
+            Image(nsImage: leaf(m.h.map { $0.loaded || $0.busy == true }
+                                == true ? 1 : 0.35))
         }
         .menuBarExtraStyle(.menu)
     }
@@ -42,21 +43,21 @@ struct Menu: View {
         if let g = m.mem { Text(String(format: "Memory %.1f GB", g)) }
         if let l = m.last { Text(l) }
         Divider()
-        Button("Copy Endpoint") { copy(endpoint + "/v1") }
+        Button("Copy endpoint") { copy(endpoint + "/v1") }
         if m.net {
-            Button("Copy Key") {
+            Button("Copy key") {
                 copy((try? String(contentsOf: key))?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
             }
         }
-        Button("Unload Now") { m.park() }.disabled(m.h?.loaded != true)
-        Button("Open Log") {
+        Button("Unload now") { m.park() }.disabled(m.h?.loaded != true)
+        Button("Open log") {
             let l = cache.appendingPathComponent("serve.log").path
             _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/open"),
                                  arguments: ["-a", "Console", l])
         }
         SwiftUI.Menu("Settings") {
-            Picker("Unload After", selection: pick("idle", 15)) {
+            Picker("Unload after", selection: pick("idle", 15)) {
                 Text("5 min").tag(5)
                 Text("15 min").tag(15)
                 Text("60 min").tag(60)
@@ -66,8 +67,8 @@ struct Menu: View {
                 Text("32k").tag(32768)
                 Text("100k").tag(102400)
             }
-            Toggle("Start at Login", isOn: login)
-            Toggle("Allow Other Devices on the Network",
+            Toggle("Start at login", isOn: login)
+            Toggle("Allow other devices on the network",
                    isOn: pick("net", false))
         }
         Divider()

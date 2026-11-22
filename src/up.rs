@@ -56,24 +56,25 @@ fn sys(k: &str) -> i32 {
 }
 
 // one model fits on the gpu: open the machine lock (./wd holds it already
-// when WDL is set), park at memory pressure (warn), and leave before memory
-// runs out
+// when WDL is set), park at memory pressure (warn) that lasts 30 s (a load
+// raises it for a moment), and leave before memory runs out
 static FD: AtomicI32 = AtomicI32::new(-1);
 pub fn guard(park: impl Fn() + Send + 'static) {
     if env::var("WDL").is_err() {
         let f = fs::File::create("/tmp/gall.lock").unwrap();
         FD.store(f.into_raw_fd(), Relaxed);
     }
-    thread::spawn(move || loop {
+    thread::spawn(move || (0..).fold(0, |n, _| {
         let l = sys("kern.memorystatus_vm_pressure_level");
         if l >= 4 || sys("kern.memorystatus_level") < 6 {
             eprintln!("gall: memory is short, leaving");
             exit(1)
-        } else if l >= 2 {
+        } else if n >= 30 {
             park()
         }
         thread::sleep(Duration::from_secs(1));
-    });
+        if l >= 2 { n + 1 } else { 0 }
+    }));
 }
 
 // take the lock while a model is loaded, waiting for it; false gives it back
