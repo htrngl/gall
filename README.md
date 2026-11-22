@@ -37,7 +37,8 @@ model path.
 The server provides an OpenAI-compatible chat API at
 `http://127.0.0.1:9940/v1`. It supports these endpoints:
 
-- `/v1/chat/completions`, with streaming, tools, reasoning, and images.
+- `/v1/chat/completions`, with streaming, tools, reasoning, images, and
+  JSON `response_format`.
 - `/v1/models`.
 - `/health`.
 
@@ -48,6 +49,12 @@ reads. Gall's vision encoder reads `mmproj-F16.gguf` from the model's
 directory; `gall up` downloads that file (0.6 GB). An image uses one token
 for each 40 x 40 pixels. Images above 1,024 tokens (`GALL_IMAGE_TOKENS`)
 are scaled down.
+
+With `response_format` of type `json_object` or `json_schema`, the answer
+text is JSON that fits the schema. The server checks `type`, `properties`,
+`required`, `additionalProperties: false`, `items`, `enum`, `const`,
+`anyOf`, and `oneOf`; it does not check other keywords. It also appends a
+system line with the schema to the prompt.
 
 To require authentication, use `gall serve <gguf> --api-key-file F`.
 Every request except `/health` must supply the key from `F` in the
@@ -142,8 +149,8 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
   0.8 s and a 960 x 1280 image (768 tokens) takes 4.2 s. Its output is within 2.9e-3 (relative) of llama.cpp's
   (`gall vis`, `tools/imgref.cpp`). The rows of the 32 newest images are
   kept in `~/.cache/gall/img`.
-- Unsupported features include grammar constraints, `response_format`,
-  concurrent requests, and drafting in the server.
+- Unsupported features include GBNF grammars, concurrent requests, and
+  drafting in the server.
 - A proposed 4-bit attention requantization has a projected cost of
   3.7 ms per token. It requires the 53 GB original model and a quality check.
 

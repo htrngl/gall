@@ -554,6 +554,132 @@ fn sample(l: &[f32], p: &Sp, rng: &mut u64) -> u32 {
     c[i.unwrap_or(c.len() - 1)].1
 }
 
+// ---- response_format: text that is json and fits a schema (type,
+// properties, required, additionalProperties: false, items, enum, const,
+// anyOf, oneOf; other keywords are not checked)
+
+fn ws(b: &[u8], i: &mut usize) {
+    while b.get(*i).is_some_and(|c| b" \n\r\t".contains(c)) {
+        *i += 1;
+    }
+}
+
+// a value of schema s at b[*i..]. Some(true): read whole; Some(false): b
+// ends inside a value that still fits; None: no fit
+fn fits(b: &[u8], i: &mut usize, s: &J) -> Option<bool> {
+    for k in ["anyOf", "oneOf"] {
+        if s[k] != NULL {
+            let f = |s| {
+                let mut j = *i;
+                fits(b, &mut j, s).map(|d| (d, j))
+            };
+            let (d, j) = s[k].a().iter().filter_map(f).max()?;
+            *i = j;
+            return Some(d);
+        }
+    }
+    ws(b, i);
+    let Some(&c) = b.get(*i) else { return Some(false) };
+    let ty = match c {
+        b'{' => "object",
+        b'[' => "array",
+        b'"' => "string",
+        b't' | b'f' => "boolean",
+        b'n' => "null",
+        b'-' | b'0'..=b'9' => "number",
+        _ => return None,
+    };
+    let int = |t: &J| t.s() == Some("integer");
+    let ok = |t: &J| t.s() == Some(ty) || ty == "number" && int(t);
+    let (want, a) = (&s["type"], *i);
+    if !(*want == NULL || ok(want) || want.a().iter().any(ok)) {
+        return None;
+    }
+    let done = raw(b, i, s, int(want))?;
+    let en = s["enum"].a().iter().chain((s["const"] != NULL).then_some(&s["const"]));
+    let (mut en, t) = (en.peekable(), &b[a..*i]);
+    let is = |e: &J| match done {
+        true => J::parse(t).as_ref() == Some(e),
+        _ => e.to_string().as_bytes().starts_with(t),
+    };
+    (en.peek().is_none() || en.any(is)).then_some(done)
+}
+
+fn raw(b: &[u8], i: &mut usize, s: &J, int: bool) -> Option<bool> {
+    let c = b[*i];
+    if c == b'{' || c == b'[' {
+        let (obj, mut seen) = (c == b'{', vec![]);
+        *i += 1;
+        ws(b, i);
+        if b.get(*i) == Some(&(c + 2)) {
+            *i += 1;
+        } else {
+            loop {
+                let mut sub = &s["items"];
+                if obj {
+                    ws(b, i);
+                    let a = *i;
+                    match b.get(a) {
+                        Some(b'"') if raw(b, i, &NULL, false)? => {}
+                        c => return c.is_none_or(|c| *c == b'"').then_some(false),
+                    }
+                    let J::Str(k) = J::parse(&b[a..*i])? else { return None };
+                    ws(b, i);
+                    match b.get(*i) {
+                        Some(b':') => *i += 1,
+                        c => return c.is_none().then_some(false),
+                    }
+                    sub = &s["properties"][k.as_str()];
+                    if *sub == NULL && s["additionalProperties"] == J::Bool(false) {
+                        return None;
+                    }
+                    seen.push(k);
+                }
+                if !fits(b, i, sub)? {
+                    return Some(false);
+                }
+                ws(b, i);
+                match b.get(*i) {
+                    Some(b',') => *i += 1,
+                    Some(&e) if e == c + 2 => break *i += 1,
+                    e => return e.is_none().then_some(false),
+                }
+            }
+        }
+        let has = |r: &J| r.s().is_some_and(|r| seen.iter().any(|k| k == r));
+        return s["required"].a().iter().all(has).then_some(true);
+    } else if c == b'"' {
+        *i += 1;
+        loop {
+            match b.get(*i) {
+                None => return Some(false),
+                Some(b'"') => break *i += 1,
+                Some(b'\\') => *i += 2,
+                Some(0..32) => return None,
+                _ => *i += 1,
+            }
+        }
+        return (*i <= b.len()).then_some(true).or(Some(false));
+    } else if let Some(w) = ["true", "false", "null"].iter().find(|w| w.as_bytes()[0] == c) {
+        let n = (b.len() - *i).min(w.len());
+        *i += n;
+        return (b[*i - n..*i] == w.as_bytes()[..n]).then_some(n == w.len());
+    }
+    let a = *i;
+    while b.get(*i).is_some_and(|c| b"-+.eE0123456789".contains(c)) {
+        *i += 1;
+    }
+    let t = std::str::from_utf8(&b[a..*i]).unwrap();
+    let num = |t: &str| t.parse::<f64>().is_ok() && !t.starts_with('+');
+    if int && t.contains(['.', 'e', 'E']) {
+        None
+    } else if *i == b.len() {
+        (num(t) || num(&format!("{t}0"))).then_some(false)
+    } else {
+        num(t).then_some(true)
+    }
+}
+
 // ---- http
 
 fn head(w: &mut impl Write, code: u16, kind: &str, more: &str) -> io::Result<()> {
@@ -632,10 +758,22 @@ struct Srv {
 
 impl Srv {
     fn chat(&mut self, r: &J, w: &mut TcpStream) -> io::Result<()> {
-        let (o, n, urls) = match prompt(r, &self.effort) {
+        let (mut o, n, urls) = match prompt(r, &self.effort) {
             Ok(p) => p,
             Err(e) => return reply(w, 400, &err(&e)),
         };
+        // response_format: the schema, and a line that tells the model
+        let rf = &r["response_format"];
+        let js = match rf["type"].s() {
+            Some("json_schema") => Some(rf["json_schema"]["schema"].clone()),
+            Some("json_object") => Some(obj!["type" => "object"]),
+            _ => None,
+        };
+        if let Some(s) = &js {
+            o += &format!("<|message_system|><|content_text|>Answer with one \
+                JSON value and nothing else. It must fit this JSON schema: \
+                {s}{END}");
+        }
         // the rows of each image, as token ids, go in at its place; a
         // full image store empties itself and the second try starts again
         type R = Result<Vec<Range<u32>>, String>;
@@ -680,6 +818,7 @@ impl Srv {
         let stops: Vec<_> = stops.into_iter().filter(|s| !s.is_empty()).collect();
         let hold = stops.iter().map(|s| s.len()).max().unwrap_or(1) - 1;
         let stream = r["stream"].t();
+
         let (id, name) = (format!("chatcmpl-{}", now.as_nanos()), &self.name);
         let chunk = |delta: J, fin: J| {
             obj!["id" => id.as_str(), "object" => "chat.completion.chunk",
@@ -718,7 +857,31 @@ impl Srv {
             if n == max || self.fed.len() >= self.ctx {
                 break "length";
             }
-            let t = sample(lg, &sp, &mut rng);
+            // response_format: of the text tokens, take one that keeps the
+            // text a fit; the message ends when the value is whole
+            let fit = |t: u32| {
+                let (mut x, stop) = (b[1].clone(), t == end);
+                let y = if stop { b" " as &[u8] } else { &self.tok.txt[t as usize] };
+                // no space at the start, nor after a space
+                let sp = |c: &u8| c.is_ascii_whitespace();
+                if !stop && y.iter().all(sp) && x.last().is_none_or(sp) {
+                    return false;
+                }
+                x.extend(y);
+                let mut i = 0;
+                match js.as_ref().and_then(|s| fits(&x, &mut i, s)) {
+                    Some(d) => (d || !stop) && x[i..].trim_ascii().is_empty(),
+                    None => false,
+                }
+            };
+            let fit = |t: u32| fit(t) && (t == end || !self.tok.ctl[t as usize]);
+            let mut t = sample(lg, &sp, &mut rng);
+            if js.is_some() && st == text && !fit(t) {
+                // the likeliest token that fits
+                let mut ix: Vec<u32> = (0..lg.len() as u32).collect();
+                ix.sort_unstable_by(|a, b| lg[*b as usize].total_cmp(&lg[*a as usize]));
+                t = ix.into_iter().find(|&t| fit(t)).unwrap_or(end);
+            }
             n += 1;
             if t == self.tok.eos {
                 break "stop";
@@ -975,6 +1138,11 @@ pub fn main(a: &[String]) {
         // gall serve <gguf> --prompt <request.json>: the rendered prompt
         let r = J::parse(&std::fs::read(&a[2]).unwrap()).unwrap();
         return print!("{}", prompt(&r, &"none".into()).unwrap().0);
+    }
+    if a.get(1).is_some_and(|x| x == "--fits") {
+        // gall serve <gguf> --fits <schema json> <text>: the fit and its end
+        let (s, mut i) = (J::parse(a[2].as_bytes()).unwrap(), 0);
+        return println!("{:?} {i}", fits(a[3].as_bytes(), &mut i, &s));
     }
     let ctx: usize = opt("--ctx", "102400").parse().unwrap();
     let say = "<|message_model|><|content_text|>hello from gall\
