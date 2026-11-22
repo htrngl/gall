@@ -23,7 +23,7 @@ gall test        # 64 greedy tokens against a llama.cpp reference
 gall down
 ```
 
-- `gall up [ctx]` starts the server in the background with a 32,768-token
+- `gall up [ctx]` starts the server in the background with a 102,400-token
   context by default. It uses a GGUF in the Hugging Face cache if one is
   there, else it downloads to `~/.cache/gall`. `GALL_MODEL=path` overrides.
 - `gall log` follows the request log. `gall model` prints the model path.
@@ -36,10 +36,11 @@ gall down
   seconds without a request. It first stores the conversation as a prefix
   snapshot. The next chat request loads the model again (0.06 s with the
   file in the page cache) and continues from the snapshot. `/health` shows
-  `"loaded"`. The lock stays held while the model is unloaded.
-- Only one model fits on the GPU. `gall` takes a lock (`/tmp/gall.lock`) and
-  refuses to start beside another instance; it exits if memory runs short.
-  Unload other local models first.
+  `"loaded"`. The lock is given back while the model is unloaded.
+- Only one model fits on the GPU. `gall` takes a lock (`/tmp/gall.lock`)
+  while a model is loaded. A second server, or `./wd`, waits for it; with
+  `--idle-unload`, the server and a measurement take turns. It exits if
+  memory runs short. Unload other local models first.
 - The prefix of each conversation (system prompt and tools) is stored in
   `~/.cache/gall`, so a new conversation with the same prefix starts in
   about a second.

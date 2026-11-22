@@ -1,7 +1,8 @@
 // gall up [ctx] | down | log | model | test: the server as a background
 // process (port 9940; log and pid in ~/.cache/gall), the model path, and a
 // greedy self-test against 64 reference tokens from llama.cpp
-use std::os::{fd::AsRawFd, unix::process::CommandExt};
+use std::os::{fd::IntoRawFd, unix::process::CommandExt};
+use std::sync::atomic::{AtomicI32, Ordering::Relaxed};
 use std::process::{exit, Command, Stdio};
 use std::{env, fs, net::TcpStream, path::PathBuf, thread, time::Duration};
 
@@ -48,17 +49,13 @@ fn sys(k: &str) -> i32 {
     v
 }
 
-// one model fits on the gpu: take the machine lock (./wd holds it already
+// one model fits on the gpu: open the machine lock (./wd holds it already
 // when WDL is set), and leave before memory runs out
+static FD: AtomicI32 = AtomicI32::new(-1);
 pub fn guard() {
     if env::var("WDL").is_err() {
         let f = fs::File::create("/tmp/gall.lock").unwrap();
-        let l = libc::LOCK_EX | libc::LOCK_NB;
-        if unsafe { libc::flock(f.as_raw_fd(), l) } != 0 {
-            eprintln!("gall: /tmp/gall.lock is held, a model is loaded");
-            exit(1)
-        }
-        std::mem::forget(f);
+        FD.store(f.into_raw_fd(), Relaxed);
     }
     thread::spawn(|| loop {
         if sys("kern.memorystatus_vm_pressure_level") >= 4
@@ -69,6 +66,18 @@ pub fn guard() {
         }
         thread::sleep(Duration::from_secs(1));
     });
+}
+
+// take the lock while a model is loaded, waiting for it; false gives it back
+pub fn lock(on: bool) {
+    let f = FD.load(Relaxed);
+    let op = |o| f >= 0 && unsafe { libc::flock(f, o) } != 0;
+    if !on {
+        op(libc::LOCK_UN);
+    } else if op(libc::LOCK_EX | libc::LOCK_NB) {
+        eprintln!("gall: /tmp/gall.lock is held, waiting");
+        op(libc::LOCK_EX);
+    }
 }
 
 pub fn main(a: &[String]) {
@@ -86,7 +95,7 @@ pub fn main(a: &[String]) {
         _ if up() => {}
         _ => {
             let (m, f) = (model(), fs::File::create(&log).unwrap());
-            let ctx = a.get(1).map_or("32768", |s| s);
+            let ctx = a.get(1).map_or("102400", |s| s);
             let mut c = Command::new(env::current_exe().unwrap())
                 .args(["serve", &m, "--ctx", ctx])
                 .stdin(Stdio::null()).stdout(f.try_clone().unwrap())

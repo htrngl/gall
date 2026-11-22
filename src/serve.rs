@@ -83,6 +83,8 @@ impl Lm for Lazy {
     fn park(&mut self, toks: &[u32]) {
         if let Some(mut m) = self.0.take() {
             m.park(toks);
+            drop(m);
+            crate::up::lock(false);
             eprintln!("gall: unloaded");
         }
     }
@@ -858,6 +860,7 @@ pub fn main(a: &[String]) {
         crate::up::guard();
         let p = a[0].clone();
         Box::new(move || {
+            crate::up::lock(true);
             let m = crate::model::Model::open(&p, ctx);
             let s = crate::model::snap::Snaps::new(&p, &m);
             Box::new(Ink(m, vec![], s))
