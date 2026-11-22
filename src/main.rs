@@ -5,7 +5,7 @@
 //   it writes a snapshot)
 // gall pp MODEL TOKENS [-n all] [-ub 512] [-c 4096] [--cmp] [--ref REFDIR]
 // gall mmb
-// gall mvtest [FILTER | synth | rq [NAME]] (env M: the gguf; see mvtest.rs)
+// gall mvtest [FILTER | synth] (env M: the gguf; see mvtest.rs)
 // gall tok MODEL FILE
 // gall vis MMPROJ IMAGE [REF.f32]
 // gall serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
@@ -17,7 +17,6 @@ mod gpu;
 mod model;
 mod mv;
 mod mvtest;
-mod rq;
 mod serve;
 mod tok;
 mod up;

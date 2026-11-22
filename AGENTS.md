@@ -76,8 +76,6 @@ The header of `src/main.rs` lists the other commands, including `run`,
   host, and the allocator that unmaps large buffers when they drop.
 - `src/mv.*`, `grids.metal`, `mvtest.rs`: Matrix-vector kernels for the 12
   weight formats, and their test.
-- `src/rq.rs`: Attention weights requantized at load (`RQ`, disabled by
-  default).
 - `src/model.rs`, `ops.metal`: Single-token decode, key-value (KV) cache
   rings, and rollback.
 - `src/pf*`: Batched prefill.
@@ -90,8 +88,7 @@ The header of `src/main.rs` lists the other commands, including `run`,
   `target/Gall.app`.
 - `tools/`: Reference dumps from llama.cpp, the HTTP smoke test and the
   memory measurement.
-- `llama/`: The patched llama.cpp reference build and its
-  [notes](llama/PLAN.md). `llama/build` installs it for the llama app.
+- `llama/`: The patched llama.cpp reference build (`llama/build`).
 
 ## Measurements
 

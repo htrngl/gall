@@ -1,7 +1,7 @@
 #!/bin/sh -e
-# engine = ggml-org/llama.cpp b12600 + unsloth pin set (pins.txt, in order,
-# as their CI merges it) + patches/. installs to ~/.llama-app/inkling-metal
-# and points /opt/homebrew/bin/llama (what the Llama app runs) at it.
+# the reference build: ggml-org/llama.cpp b12600 + the unsloth pin set
+# (pins.txt, in order, as their CI merges it) + patches/, built in
+# src-mix/build (tools/refdump links its libraries)
 cd "$(dirname "$0")"
 U=e94fed794a234b2d48a236762dafd5527dc085b1 # unslothai master, merge tooling
 G="git -C src-mix -c user.name=mix -c user.email=mix@localhost"
@@ -21,9 +21,6 @@ if [ ! -d src-mix ]; then
 fi
 cmake -S src-mix -B src-mix/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_METAL_EMBED_LIBRARY=ON \
-  -DGGML_RPC=ON -DCMAKE_INSTALL_RPATH=@loader_path \
+  -DCMAKE_INSTALL_RPATH=@loader_path \
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON >/dev/null
 ninja -C src-mix/build
-D=~/.llama-app/inkling-metal
-rsync -a --delete src-mix/build/bin/ $D/
-ln -sfn $D/llama /opt/homebrew/bin/llama

@@ -137,7 +137,6 @@ pub struct Model {
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
     pf: Option<pf::Pf>,
-    rq: crate::rq::Rq,
     pre: Option<(usize, Cb)>, // the encoded token of a position
 }
 
@@ -311,7 +310,6 @@ impl Model {
             t: 0.,
             ck: None,
             pf: None,
-            rq: crate::rq::Rq::open(g, &gpu, &crate::up::cache()),
             pre: None,
             g,
             gpu,
@@ -461,7 +459,7 @@ impl Model {
         macro_rules! mv {
             ($n:expr, $t:expr, $x:expr, $y:expr, $ni:expr, $no:expr) => {{
                 let (t, x, y): (T, usize, usize) = ($t, $x, $y);
-                let (ty, w) = self.rq.w(&self.gpu, t);
+                let (ty, w) = (t.ty, self.gpu.w(t));
                 ops.push((crate::mv::name(ty), vi, Box::new(move |e: &Enc| {
                     let id = (&self.id, io);
                     let (x, y) = ((&self.a, ro + 4 * x), (&self.a, ro + 4 * y));

@@ -155,32 +155,6 @@ was 4e-9 at 10.5k and 4e-8 at 29.9k. Against `ref/8k.b256`, a 32-step
 check found no greedy mismatches and mean KL of 1.30e-3 (1.32e-3 with
 f16 only). There is no 100k throughput measurement.
 
-## Optional requantization
-
-`RQ` is disabled by default because it changes the weights. `RQ=5`
-requantizes the 100 Q8_0 attention projections into a 293 MB buffer.
-The first run takes about five seconds; later runs read a cache in
-`~/.cache/gall/*.rq`. Prefill and the drafter still use the file’s tensors.
-
-| Setting | GPU time/token | Relative weight error |
-| --- | ---: | ---: |
-| Original Q8_0 | 48.7 ms | — |
-| `RQ=5` | 45.1 ms | 4.5% |
-| `RQ=6` | 46.5 ms | 2.3% |
-
-On `ref/short`, mean KL changed from 1.05e-4 to 3.15e-3 at five bits and
-2.77e-3 at six bits, with no greedy mismatches in 64 steps. On `ref/2k`,
-the corresponding means were 1.1e-3, 2.4e-3 and 1.4e-3, with two and one
-mismatches in the requantized runs. On 500 tokens of each of two texts,
-the measured negative log-likelihood change at four bits was
--0.001 ± 0.004.
-
-`RQ=4` and `RQ=5,5:h` (also requantizing the head) are accepted. Selecting
-particular projection kinds or layers gave no better result than changing
-the bit width. At six bits, the custom format was no faster than Q6_K
-(10.0 versus 9.9 ms for the attention read); at five bits it took 8.9 ms
-versus Q5_K’s 11.0 ms.
-
 ## Vision
 
 `src/vis.*` decodes images through ImageIO and runs the vision encoder on
@@ -218,5 +192,4 @@ uses the GPU takes `/tmp/gall.lock`; run other programs through
 --dummy` or `tools/smoke.py`, which do not load the model onto the GPU.
 
 See [reference tools](../tools/README.md) for dump formats and numerical
-comparison, [drafter notes](DRAFT.md) for speculative decoding, and
-[llama.cpp history](../llama/PLAN.md) for the earlier reference work.
+comparison, and [drafter notes](DRAFT.md) for speculative decoding.
