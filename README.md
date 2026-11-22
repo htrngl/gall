@@ -30,6 +30,8 @@ gall down
 - The server speaks the OpenAI chat API at `http://127.0.0.1:9940/v1`:
   `/v1/chat/completions` (streaming, tools, reasoning), `/v1/models`,
   `/health`. Point any OpenAI-compatible client at it.
+- `gall serve <gguf> --api-key-file F` asks every request but `/health` for
+  the key in `F` (`authorization: Bearer KEY`).
 - Only one model fits on the GPU. `gall` takes a lock (`/tmp/gall.lock`) and
   refuses to start beside another instance; it exits if memory runs short.
   Unload other local models first.

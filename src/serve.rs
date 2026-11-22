@@ -1,7 +1,9 @@
 // openai-compatible chat server over one model, one request at a time.
 //   gall serve <gguf> [--port 9940] [--ctx 102400] [--effort none]
-//             [--alias inkling-2-mini] [--dummy [answer]]
+//             [--alias inkling-2-mini] [--api-key-file F]
+//             [--dummy [answer]]
 // POST /v1/chat/completions (stream or not), GET /v1/models, GET /health.
+// with a key, all but /health need "authorization: bearer KEY".
 // the chat template of the gguf is written out in prompt(); the model
 // answers in blocks, <|message_model|> then <|content_thinking|>,
 // <|content_text|> or NAME<|content_invoke_tool_json|>, each closed by
@@ -475,9 +477,10 @@ fn err(m: &str) -> J {
     obj!["error" => obj!["message" => m, "type" => "invalid_request_error"]]
 }
 
-// method, path, body
-fn request(c: &TcpStream) -> Option<(String, String, Vec<u8>)> {
+// method, path, body, authorization
+fn request(c: &TcpStream) -> Option<(String, String, Vec<u8>, String)> {
     let (mut r, mut l, mut n) = (BufReader::new(c), String::new(), 0);
+    let mut auth = String::new();
     r.read_line(&mut l).ok()?;
     let mut it = l.split_whitespace().map(str::to_string);
     let mp = (it.next()?, it.next()?);
@@ -489,13 +492,15 @@ fn request(c: &TcpStream) -> Option<(String, String, Vec<u8>)> {
             break;
         } else if let Some(v) = h.strip_prefix("content-length:") {
             n = v.trim().parse().ok()?;
+        } else if let Some(v) = h.strip_prefix("authorization:") {
+            auth = v.trim().into();
         } else if h.starts_with("expect:") {
             (&*c).write_all(b"HTTP/1.1 100 Continue\r\n\r\n").ok()?;
         }
     }
     let mut b = vec![0; n];
     r.read_exact(&mut b).ok()?;
-    Some((mp.0, mp.1, b))
+    Some((mp.0, mp.1, b, auth))
 }
 
 // the whole utf-8 of b past *sent, less the last hold bytes
@@ -517,6 +522,7 @@ struct Srv {
     ctx: usize,
     effort: J,
     name: String,
+    auth: Option<String>, // "bearer KEY", lowercase as request() reads it
     sp: Sp,
     t: [u32; 5], // model, thinking, text, tool json, end
 }
@@ -690,11 +696,14 @@ impl Srv {
     fn conn(&mut self, mut c: TcpStream) -> io::Result<()> {
         c.set_nodelay(true)?;
         c.set_read_timeout(Some(Duration::from_secs(30)))?;
-        let Some((m, p, body)) = request(&c) else { return Ok(()) };
+        let Some((m, p, body, a)) = request(&c) else { return Ok(()) };
         let p = p.trim_start_matches("/v1");
         match (m.as_str(), p) {
             ("OPTIONS", _) => head(&mut c, 204, "text/plain", ""),
             ("GET", "/health") => reply(&mut c, 200, &obj!["status" => "ok"]),
+            _ if self.auth.as_ref().is_some_and(|k| *k != a) => {
+                reply(&mut c, 401, &err("invalid api key"))
+            }
             ("GET", "/models") => {
                 let m = obj!["id" => self.name.as_str(), "object" => "model",
                     "owned_by" => "gall"];
@@ -809,6 +818,10 @@ pub fn main(a: &[String]) {
         ctx,
         effort: opt("--effort", "none").into(),
         name: opt("--alias", "inkling-2-mini"),
+        auth: a.iter().position(|x| x == "--api-key-file").map(|_| {
+            let k = std::fs::read_to_string(opt("--api-key-file", ""));
+            format!("bearer {}", k.unwrap().trim().to_ascii_lowercase())
+        }),
         sp,
         t,
     };
