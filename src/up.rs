@@ -9,6 +9,7 @@ use std::{env, fs, net::TcpStream, path::PathBuf, thread, time::Duration};
 const REPO: &str = "unsloth/Inkling-2-Mini-GGUF";
 const FILE: &str = "Inkling-2-Mini-UD-IQ3_XXS.gguf";
 pub const MMPROJ: &str = "mmproj-F16.gguf"; // the vision encoder
+pub const DRAFT: &str = "dspark-Inkling-2-Mini-Q8_0.gguf"; // the drafter
 
 pub fn cache() -> PathBuf {
     let d = PathBuf::from(env::var("HOME").unwrap()).join(".cache/gall");
@@ -27,7 +28,7 @@ pub fn model() -> String {
     let hit = fs::read_dir(hub).ok().into_iter().flatten()
         .flatten().map(|d| d.path().join(FILE)).find(|p| p.exists());
     let p = hit.unwrap_or(cache().join(FILE));
-    for (f, gb) in [(FILE, 11.7), (MMPROJ, 0.6)] {
+    for (f, gb) in [(FILE, 11.7), (MMPROJ, 0.6), (DRAFT, 0.4)] {
         let p = p.with_file_name(f);
         if p.exists() {
             continue;

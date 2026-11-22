@@ -3,8 +3,9 @@
 //   let next = d.step(&mut m, tok);     // target step + context inject
 //   let ds = d.draft(&m, anchor, 7); // (token, probability) after anchor
 //   let next = d.pass(&m, &[anchor, ids..]); d.commit(&mut m, rows, kept);
-//   let (done, next) = d.round(&mut m, next, &mut spec);  // all of it
-//   d.generate(&mut m, next, &mut Spec::new(), |tok| more);  // in a loop
+//   let row = d.next(&mut m, &mut spec, tok);  // all of it: feed tok;
+//   m.logits_row(row) and id[16 row + 8] are what follows it
+//   d.generate(&mut m, next, &mut Spec::new(), |tok| more);  // greedy loop
 // gall dr MODEL DRAFTER REFDIR [-n 64] [-c 4096] [--ub] [--tv 2,4,8]:
 // teacher-forced acceptance; --tv: ms of a pass by rows
 // gall run MODEL --tokens FILE --draft DRAFTER [--block B] [-n 64] [-c 4096]
@@ -71,6 +72,7 @@ pub struct Dr {
     t0: Buf, // the same for a dense matrix: slab 0, used by every row
     o: HashMap<&'static str, usize>, // f32 tensors in s
     co: [usize; 3],                  // cache rows before each layer
+    n_ctx: usize,
     // positions with context: the last run of inject() in a row. what a
     // snapshot restored or the model stepped alone is not in it
     span: std::cell::Cell<(usize, usize)>,
@@ -127,6 +129,7 @@ impl Dr {
             c: m.gpu.buf(2 * 2048 * (2048 + n_ctx)),
             id: m.gpu.buf(4 * 8),
             co: [0, 1024, 1024 + n_ctx],
+            n_ctx,
             span: Default::default(),
             g,
             w,
@@ -347,57 +350,65 @@ impl Dr {
         r
     }
 
-    // one round of greedy decode from the pending token `next`: the tokens
-    // it put into the model (next first) and the new pending token. with
-    // drafting on: a draft, then a pass over the anchor and the drafts
-    // that st.plan() takes; the drafts after those stay for the next
-    // rounds while they hold. else serial steps, and a draft now and then
-    // to keep score
-    pub fn round(&self, m: &mut Model, mut next: u32, st: &mut Spec) -> (Vec<u32>, u32) {
+    // feed tok, the token after those the model holds; the activation row
+    // whose logits (`Model::logits_row`) and greedy id follow it. tok is
+    // any token, sampled or not: a row verified ahead is used only while
+    // the tokens fed are its drafts, so the logits are those of a serial
+    // step. with drafting on, a new pass is over tok and the drafts that
+    // st.plan() takes, from a new draft or from what is left of the last
+    // one if that held; else a serial step, and a draft now and then to
+    // keep score. m.pos counts the tokens fed; rows ahead lie past it
+    pub fn next(&self, m: &mut Model, st: &mut Spec, tok: u32) -> usize {
+        if st.pos != m.pos {
+            st.drop();
+        }
+        let hit = st.d.get(st.r - 1).copied().is_some_and(|d| st.see(d.1, d.0 == tok));
+        if hit && st.r <= st.j {
+            let ops = self.inject(m.pos, st.r);
+            m.gpu.go(|e| ops.iter().for_each(|o| o.2(e)));
+            (m.pos, st.r, st.n, st.rows[1]) = (m.pos + 1, st.r + 1, st.n + 1, st.rows[1] + 1);
+            st.pos = m.pos;
+            return st.r - 1;
+        }
+        // the draft past the verified rows was scored by tok as well: if
+        // it holds, so does the rest
+        st.kept[st.r - 1] += (st.j > 0) as usize;
+        let mut d = if hit { st.d.split_off(st.r) } else { vec![] };
         let (t0, on) = (Instant::now(), st.block.map_or(st.on(), |b| b > 0));
         let ema = |x: &mut f64, t: Instant| *x += 0.1 * (t.elapsed().as_secs_f64() - *x);
-        let mut d = std::mem::take(&mut st.left);
-        if st.at != (m.pos, next) {
-            d.clear();
-        }
         let nd = st.block.unwrap_or(if on || st.n >= st.due[0] { st.nb() } else { 0 });
         if d.is_empty() && nd > 0 {
-            d = self.draft(m, next, nd);
+            d = self.draft(m, tok, nd);
             ema(&mut st.td[nd], t0);
             st.fresh(&d, on);
         }
-        let (t1, mut j, mut k) = (Instant::now(), st.plan(&d).0, 0);
-        j *= on as usize;
-        let mut done = vec![next];
+        let (t1, room) = (Instant::now(), self.n_ctx - 1 - m.pos);
+        let j = (st.plan(&d).0 * on as usize).min(room);
         if j == 0 {
-            next = self.step(m, next);
+            self.step(m, tok);
         } else {
-            done.extend(d[..j].iter().map(|x| x.0));
-            let r = self.pass(m, &done);
-            k = (0..j).take_while(|&i| st.see(d[i].1, d[i].0 == r[i])).count();
-            self.commit(m, j + 1, k);
-            done.truncate(k + 1);
-            (st.kept[k], next) = (st.kept[k] + 1, r[k]);
+            let toks: Vec<u32> = [tok].into_iter().chain(d[..j].iter().map(|x| x.0)).collect();
+            self.pass(m, &toks);
+            (m.pos, m.top) = (m.pos + 1, m.pos + 1 + j);
         }
         ema(&mut st.tv[j + 1], t1);
-        // the draft after the last one verified is scored by the new
-        // pending token; if it holds, so does the rest of the draft
-        if k == j && j < d.len() && st.see(d[j].1, d[j].0 == next) {
-            (st.left, st.at) = (d.split_off(j + 1), (m.pos, next));
-        }
-        st.n += done.len();
-        (done, next)
+        (st.d, st.j, st.r, st.pos) = (d, j, 1, m.pos);
+        (st.n, st.rows[0]) = (st.n + 1, st.rows[0] + j);
+        0
     }
 
     // greedy decode from `next` until emit returns false
     pub fn generate(&self, m: &mut Model, mut next: u32, st: &mut Spec, mut emit: impl FnMut(u32) -> bool) {
-        loop {
-            let (done, n) = self.round(m, next, st);
-            next = n;
-            if !done.iter().all(|&x| emit(x)) {
-                return;
-            }
+        while emit(next) {
+            let r = self.next(m, st, next);
+            next = slice::<u32>(&m.id)[16 * r + 8];
         }
+    }
+
+    // the model moved on without the drafter (a snapshot, a prefix fed by
+    // other code): no context before pos
+    pub fn forget(&self, pos: usize) {
+        self.span.set((pos, pos));
     }
 
     // nb tokens after anchor a at position m.pos, each with the drafter's
@@ -471,10 +482,13 @@ pub struct Spec {
     pub tv: [f64; 9],         // a pass by rows
     pub td: [f64; 8],         // a draft by length
     pub kept: [usize; 8],     // passes by drafts kept
+    pub rows: [usize; 2],     // drafts verified, and kept
     pub drafts: usize,
     pub n: usize,
-    left: Vec<(u32, f32)>, // drafts not yet used, after the pending
-    at: (usize, u32),      // token `at.1` at position `at.0`
+    d: Vec<(u32, f32)>, // the draft in hand, after the last pass's token
+    j: usize,           // its first j are verified: rows 1..=j of the pass
+    r: usize,           // d[r - 1] is the draft of the token to come
+    pos: usize,         // the model's position then
     due: [usize; 2],       // off: the next draft is at n = due[0]; the gap
     hits: [f64; 2],        // of this draft, and their mean
 }
@@ -490,10 +504,13 @@ impl Spec {
             tv: std::array::from_fn(|i| 1e-3 * tv[i.max(1) - 1]),
             td: ms([0., 15., 18., 21., 24., 26., 28., 31.]),
             kept: [0; 8],
+            rows: [0; 2],
             drafts: 0,
             n: 0,
-            left: vec![],
-            at: (0, 0),
+            d: vec![],
+            j: 0,
+            r: 1,
+            pos: 0,
             due: [0; 2],
             hits: [0., 2.],
         }
@@ -502,6 +519,12 @@ impl Spec {
     // a probability's place in q: half steps of its logit, 0.12 to 0.97
     fn bin(p: f32) -> usize {
         (4. + 2. * (p / (1. - p)).ln()).clamp(0., 11.) as usize
+    }
+
+    // forget the draft in hand: the model was moved by other hands
+    pub fn drop(&mut self) {
+        (self.j, self.r) = (0, 1);
+        self.d.clear();
     }
 
     fn see(&mut self, p: f32, hit: bool) -> bool {

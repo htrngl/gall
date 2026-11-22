@@ -642,8 +642,13 @@ impl Model {
 
     // logits of the last step, unpadded vocabulary, after the softcap
     pub fn logits(&self) -> Vec<f32> {
+        self.logits_row(0)
+    }
+
+    // those of activation row r of a batched pass (dr.rs)
+    pub fn logits_row(&self, r: usize) -> Vec<f32> {
         let n = self.g.u("inkling2.vocab_size_unpadded");
-        slice::<f32>(&self.a)[LG..LG + n].to_vec()
+        slice::<f32>(&self.a)[r * self.rs() + LG..][..n].to_vec()
     }
 
     // a region of the activations by ref dump name
