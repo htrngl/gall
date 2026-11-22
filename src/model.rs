@@ -51,7 +51,7 @@ const LG: usize = MSG + 48 * N; // logits
 const PT: usize = LG + 201024; // attention scratch, to the end: scores
 // (24 per key), their maxima per 8 keys, the 24 maxima, partials per 256
 const CH: usize = 6656; // conv channels per slot
-const W8: usize = 1024; // full attention reads the int8 copy from this depth
+const W8: usize = 4096; // full attention reads the int8 copy from this depth
 const CS: usize = 16 * CH; // conv state floats per slot, a ring of 16
 const SW: usize = 2048; // sliding window ring
 
@@ -262,7 +262,7 @@ impl Model {
         Model {
             mv: Mv::new(&gpu, ""),
             pipes,
-            a: gpu.buf(4 * ROWS * (PT + nk * 27 + 24 + (nk.div_ceil(256).max(65) + 64) * 24 * 132)),
+            a: gpu.buf(4 * ROWS * (PT + nk * 27 + 48 + (nk.div_ceil(256).max(65) + 64) * 24 * 132)),
             s: sb,
             sh: hb,
             kv: gpu.buf(2 * kvo[48]),
@@ -454,7 +454,7 @@ impl Model {
                 self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK);
             let ng = nk.div_ceil(128);
             let nm = self.n_ctx.max(1024) + 256;
-            let (mx, gm, pa) = (PT + 24 * nm, PT + 27 * nm, PT + 27 * nm + 24);
+            let (mx, gm, pa) = (PT + 24 * nm, PT + 27 * nm, PT + 27 * nm + 48);
             let th = (ng * 16).next_multiple_of(32).min(1024);
             let nc = if l.swa || !w8 {
                 k!("score", [ng, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb, mx);
@@ -464,14 +464,13 @@ impl Model {
                 nk.div_ceil(256)
             } else {
                 // int8 first, f16 for the keys with weight
-                let (k8, cw) = (k8(slot), (nk / 64).clamp(16, 256));
+                let (k8, cw) = (k8(slot), (nk / 64).min(256));
                 k!("pack", [1, 4, 1], 32, kv + pos * 2048, k8 + pos * 1152);
                 k!("scorew", [ng * 16, 2, 1], 32, Q, R, PT, k8, nk, pos, 0, l.rb, mx);
-                k!("smax", [24, 1, 1], th, mx, ng * 16, 0, gm, th);
+                k!("smax", [24, 1, 1], th, mx, ng * 16, 0, gm, th, lt);
                 let nc = nk.div_ceil(cw);
                 k!("gatherw", [nc, 2, 1], 32, gm, 0, PT, 0, nk, 0, 0, 0, pa, 0, 0, k8, cw);
-                k!("fix", [64, 8, 1], 32, gm, Q, PT, kv, nk, 0, 0, 0, pa, 0, lt, k8,
-                    nk.div_ceil(64), nc);
+                k!("fix", [64, 8, 1], 32, Q, R, PT, kv, nk, pos, 0, l.rb, pa, gm, 0, 0, 64, nc);
                 nc + 64
             };
             let ns = nc.min(16);

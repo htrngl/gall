@@ -53,8 +53,8 @@ minutes of load the figures drop by roughly 10%.
 | | llama.cpp (`llama/`) | gall |
 | --- | --- | --- |
 | decode, short context | 15 t/s | 19.5 t/s cold, ~18 warm |
-| decode, 8k deep | 12.4 t/s | 17.6 t/s |
-| decode, 31.5k deep (real prompt) | not measured cleanly | 13.8-14.6 t/s |
+| decode, 10.5k deep (real prompt) | 12.4 t/s (8k) | 16.4-16.8 t/s |
+| decode, 29.9k deep (real prompt) | not measured cleanly | 15.3-15.4 t/s |
 | prefill, 512 tokens | 121 t/s | 108-125 t/s |
 | prefill, 10.5k tokens | 89 t/s (to 8.3k) | 106 t/s |
 | new chat with a stored prefix, first token | | 0.5-1.2 s |
@@ -93,10 +93,20 @@ reference dumps made with `tools/refdump` against the llama.cpp build in
 
 - weights are 45 of 51 ms per token. every format costs 7-12 ps per element;
   two tuning passes on the expert gate-up kernels found nothing more.
-- depth is bound by the KV read (81 GB/s): 56.7 ms at 8k, 67 at 32k, 102 at
-  100k (the last two synthetic).
-- `KV=q8` stores the full-attention caches as int8: half the cache memory at
-  100k, no faster, off by default, its prefill path untested.
+- depth is bound by the cache read (85 GB/s). from 4096 tokens deep the 8
+  full-attention visits read an int8 copy of the cache (2304 bytes per key,
+  f16 is 4096), and the f16 rows only of the keys within 1% of the greatest
+  weight. gpu ms per token, real prompts, f16 only against the default, back
+  to back: 56.8 against 56.2 at 10.5k, 64.6 against 61.3 at 29.9k. 100k is
+  not measured.
+- against f16 only over 16 steps: no greedy token differs; kl mean 4e-9 at
+  10.5k and 5e-5 at 29.9k (one step has 8.7e-4, the other 15 average 2e-7).
+  `gall check ref/8k.b256 -ub -n 32`: 0 greedy mismatches, kl mean 1.30e-3
+  (f16 only: 1.32e-3).
+- the copy takes 18KB of memory per token of depth, as well as the 33KB of
+  the f16 rows, and none until it is written (footprint at a 102,400-token
+  context and a short prompt: 4.63GB with and without it). `VT=0` turns it
+  off; `VT` is the weight threshold (0.01).
 - the drafter runs and its batched verify gives the same text as greedy, but
   a 4-row verify takes 250 ms against 52 ms per serial token, so the block
   size stays 0. it needs dequant-once expert kernels.

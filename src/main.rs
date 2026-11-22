@@ -1,6 +1,6 @@
 // gall run MODEL --tokens FILE [-n 64] [-c 4096] [--prof] [--state FILE]
 //   [--vt 0,0.01]
-// gall check MODEL REFDIR [-n 64] [-c 4096] [-ub]
+// gall check MODEL REFDIR [-n 64] [-c 4096] [-ub [--state FILE]]
 // gall pp MODEL TOKENS [-n all] [-ub 512] [-c 4096] [--cmp] [--ref REFDIR]
 // gall mmb
 // gall tok MODEL FILE
@@ -45,6 +45,20 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
     (d / b.iter().map(|y| (*y as f64).powi(2)).sum::<f64>().max(1e-30)).sqrt()
 }
 
+// feed the prompt. --state FILE keeps the cache before its last token
+fn prime(m: &mut model::Model, toks: &[u32], st: Option<String>) -> u32 {
+    let (Some(st), (l, h)) = (st, toks.split_last().unwrap()) else { return m.feed(toks) };
+    if let Ok(mut f) = fs::File::open(&st) {
+        m.raw().into_iter().for_each(|b| f.read_exact(b).unwrap());
+        m.pos = h.len();
+    } else {
+        m.feed(h);
+        let mut f = fs::File::create(st).unwrap();
+        m.raw().into_iter().for_each(|b| f.write_all(b).unwrap());
+    }
+    m.step(*l)
+}
+
 fn main() {
     let mut a: Vec<String> = std::env::args().collect();
     if a.len() < 2 {
@@ -75,6 +89,14 @@ fn main() {
         // gall kb KERNEL GX,GY THREADS P0,P1,..: time 100 dispatches on zeros
         let g = gpu::Gpu::new();
         let b = [256, 512, 600, 128, 1, 1, 400].map(|n| g.buf(n << 20));
+        // FILL=R: the activations are random in [-R, 0]
+        if let Ok(r) = std::env::var("FILL") {
+            let (r, mut x) = (r.parse::<f32>().unwrap(), 1u32);
+            for v in gpu::slice::<f32>(&b[0]) {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                *v = -r * (x >> 8) as f32 / (1 << 24) as f32;
+            }
+        }
         let defs = std::env::var("DEFS").unwrap_or_default().replace(';', "\n");
         let pipe = g.pipe(include_str!("ops.metal"), &defs, &a[2]);
         let v = |s: &str| s.split(',').map(|x| x.parse().unwrap()).collect::<Vec<usize>>();
@@ -97,22 +119,8 @@ fn main() {
     match a[1].as_str() {
         "run" => {
             let toks = ids(&opt("--tokens").expect("--tokens FILE"));
-            // --state F: the cache after the prompt, kept in F
-            let (t0, st) = (Instant::now(), opt("--state"));
-            let mut next = 0;
-            if let Some(mut f) = st.as_ref().and_then(|f| fs::File::open(f).ok()) {
-                let mut h = [0; 8];
-                f.read_exact(&mut h).unwrap();
-                (m.pos, next) = (toks.len(), u32::from_le_bytes(h[..4].try_into().unwrap()));
-                m.raw().into_iter().for_each(|b| f.read_exact(b).unwrap());
-            } else {
-                next = m.feed(&toks);
-                if let Some(f) = &st {
-                    let mut f = fs::File::create(f).unwrap();
-                    f.write_all(&(next as u64).to_le_bytes()).unwrap();
-                    m.raw().into_iter().for_each(|b| f.write_all(b).unwrap());
-                }
-            }
+            let t0 = Instant::now();
+            let next = prime(&mut m, &toks, opt("--state"));
             let pp = t0.elapsed().as_secs_f64();
             // --deep N: time decode as if N tokens deep, on a stale cache
             m.pos = opt("--deep").map_or(m.pos, |v| v.parse().unwrap());
@@ -225,7 +233,7 @@ fn main() {
             // LOGITS=file keeps every row
             let (mut next, ub) = (0, opt("-ub").is_some());
             if ub {
-                next = m.feed(&toks);
+                next = prime(&mut m, &toks, opt("--state"));
             }
             for (i, &t) in toks.iter().chain(&gen[..n.min(gen.len() - 1)]).enumerate() {
                 let Some(g) = i.checked_sub(toks.len()) else {
