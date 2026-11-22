@@ -1,8 +1,9 @@
 // prefix snapshots on disk, so a known prompt prefix is not fed again.
 //   let mut s = Snaps::new(path, &m);      // index of ~/.cache/gall/*.snap
 //   let (k, r) = s.prime(&mut m, &p, k, sys); // m holds p[..k], r restored
-// a file: tag line, n, n token ids, the conv rings, the last ROWS rows of
-// each sliding window ring, rows [0, n) of each full-attention slot.
+// a file: tag line, n, n token ids, the ring rows past n that a batched
+// pass took (Model::top), the conv rings, the last ROWS rows of each
+// sliding window ring, rows [0, n) of each full-attention slot.
 use super::*;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -67,7 +68,7 @@ impl Snaps {
     pub fn new(path: &str, m: &Model) -> Snaps {
         let (md, home) = (fs::metadata(path).unwrap(), std::env::var("HOME"));
         let at = md.modified().unwrap().duration_since(SystemTime::UNIX_EPOCH);
-        let tag = format!("gall snap 1 row {} sw {SW} cs {CS} model {} {}\n",
+        let tag = format!("gall snap 2 row {} sw {SW} cs {CS} model {} {}\n",
             m.snap_row(), md.len(), at.unwrap().as_secs());
         let dir = PathBuf::from(home.unwrap()).join(".cache/gall");
         fs::create_dir_all(&dir).unwrap();
@@ -88,7 +89,8 @@ impl Snaps {
         let tmp = p.with_extension("tmp");
         let mut w = BufWriter::with_capacity(1 << 20, fs::File::create(&tmp)?);
         w.write_all(self.tag.as_bytes())?;
-        for t in [toks.len() as u32].iter().chain(toks) {
+        let top = Some(m.top.wrapping_sub(m.pos) as u32).filter(|a| *a <= 8);
+        for t in [toks.len() as u32].iter().chain(toks).chain(&[top.unwrap_or(0)]) {
             w.write_all(&t.to_le_bytes())?;
         }
         w.write_all(slice::<u8>(&m.cs))?;
@@ -113,6 +115,7 @@ impl Snaps {
     fn read(&self, m: &mut Model, i: usize) -> Option<()> {
         let (p, toks) = &self.ix[i];
         let mut r = head(p, &self.tag)?.0;
+        m.top = toks.len() + u32s(&mut r, 1)?[0] as usize;
         r.read_exact(slice::<u8>(&m.cs)).ok()?;
         let kv = slice::<u8>(&m.kv);
         for x in m.snap_rows(toks.len()) {

@@ -17,10 +17,10 @@ pub mod snap;
 
 const N: usize = 2304;
 const OPS: &str = include_str!("ops.metal");
-pub const KINDS: [&str; 19] = [
+pub const KINDS: [&str; 20] = [
     "dots", "elem", "low", "ctl", "rows", "post", "score", "smax", "gather",
     "merge", "top8", "act", "msg", "amax", "best", "pack", "scorew", "gatherw",
-    "fix",
+    "fix", "keep",
 ];
 // regions of the activation buffer, in floats. 0 means "none" in params.
 const PRE: usize = N; // prelude output
@@ -49,7 +49,8 @@ const GU: usize = WT + 8; // 8 expert gate_up rows
 const HH: usize = GU + 8 * N;
 const MSG: usize = HH + 4 * N; // 12 layers x 4 messages
 const LG: usize = MSG + 48 * N; // logits
-const PT: usize = LG + 201024; // attention scratch, to the end: scores
+pub const FT: usize = LG + 201024; // the residual entering visits 5, 23, 41
+const PT: usize = FT + 3 * N; // attention scratch, to the end: scores
 // (24 per key), their maxima per 8 keys, the 24 maxima, partials per 256
 const CH: usize = 6656; // conv channels per slot
 const W8: usize = 4096; // full attention reads the int8 copy from this depth
@@ -106,6 +107,7 @@ pub struct Model {
     pub gpu: Gpu,
     mv: Mv,
     pipes: HashMap<&'static str, Pipe>,
+    zp: std::cell::OnceCell<HashMap<&'static str, Pipe>>, // ops.metal ZR
     pub a: Buf,
     s: Buf,
     sh: Buf,
@@ -131,6 +133,8 @@ pub struct Model {
     // within vt of the greatest weight. 0: f16 only
     pub vt: f32,
     pub pos: usize,
+    pub top: usize, // a batched pass (dr.rs) wrote the conv rings up to here
+    taps: bool,     // keep the drafter's features at FT
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
     pf: Option<pf::Pf>,
@@ -274,6 +278,7 @@ impl Model {
         Model {
             mv: Mv::new(&gpu, ""),
             pipes,
+            zp: Default::default(),
             a: gpu.buf(4 * ROWS * (PT + nk * 27 + 48 + (nk.div_ceil(256).max(65) + 64) * 24 * 132)),
             s: sb,
             sh: hb,
@@ -302,6 +307,8 @@ impl Model {
             hi: Cell::new(0),
             vt: std::env::var("VT").map_or(0.01, |v| v.parse().unwrap()),
             pos: 0,
+            top: 0,
+            taps: false,
             t: 0.,
             ck: None,
             pf: None,
@@ -346,6 +353,11 @@ impl Model {
         true
     }
 
+    // keep the drafter's features of every token from now on
+    pub fn taps(&mut self) {
+        (self.taps, self.pre) = (true, None);
+    }
+
     // the f16 rows from n on change without their int8 copy, so a token
     // encoded ahead is void too: it holds no copy of the rows before it
     fn stale(&mut self, n: usize) {
@@ -381,7 +393,9 @@ impl Model {
     // forget all but the first n tokens: a few steps back by the rings,
     // or back to the checkpoint. false: not possible, reset
     pub fn truncate(&mut self, n: usize) -> bool {
-        if n <= self.pos && self.pos - n <= 12 {
+        // rows of a batched pass that were not kept took ring rows too
+        let top = if self.top > self.pos + 8 { self.pos } else { self.top.max(self.pos) };
+        if n <= self.pos && top - n <= 12 {
             self.ck.take_if(|c| c.0 > n);
         } else if let Some((_, cs, w)) = self.ck.as_ref().filter(|c| c.0 == n) {
             slice::<f32>(&self.cs).copy_from_slice(cs);
@@ -409,23 +423,38 @@ impl Model {
 
     // sched() on activation row `row` (and its 16 ids)
     pub fn sched_row(&self, tok: u32, pos: usize, head: bool, row: usize) -> Vec<Op<'_>> {
-        let (ro, io) = (4 * row * self.rs(), 64 * row);
-        assert!(pos < self.n_ctx, "context full");
+        self.sched_z(&[tok], pos, head, row)
+    }
+
+    // sched() of toks at pos.. on the activation rows from `row`: every
+    // small op is one dispatch for all rows (ops.metal ZR), a weight op
+    // is that of the first row, for dr.rs to run on all
+    pub fn sched_z(&self, toks: &[u32], pos: usize, head: bool, row: usize) -> Vec<Op<'_>> {
+        let (ro, io, nz) = (4 * row * self.rs(), 64 * row, toks.len());
+        assert!(pos + nz <= self.n_ctx, "context full");
         let mut ops: Vec<Op> = vec![];
-        let mut vi = 0;
+        let (mut vi, mut tz) = (0, [0u32; 8]); // tz: tau of each row
+        let pz = if nz == 1 { &self.pipes } else {
+            self.zp.get_or_init(|| KINDS.iter().chain(&["stor"]).map(|&k| {
+                (k, self.gpu.pipe(OPS, "#define ZR\n", k))
+            }).collect())
+        };
         // an ops.metal kernel
         macro_rules! k {
             ($n:expr, $g:expr, $th:expr, $($p:expr),*) => {{
-                let mut p = [0u32; 24];
+                let mut p = [0u32; 32];
                 let v = [$($p as u32),*];
                 p[..v.len()].copy_from_slice(&v);
-                let pipe = &self.pipes[$n];
+                p[23] = self.rs() as u32;
+                p[24..].copy_from_slice(&tz);
+                let (pipe, mut g): (_, [usize; 3]) = (&pz[$n], $g);
+                g[2] = nz;
                 ops.push(($n, vi, Box::new(move |e: &Enc| {
                     let b = [&self.a, &self.s, &self.kv, &self.cs, &self.id, &self.sh,
                         &self.k8];
                     let mut b = b.map(|b| (b, 0));
                     (b[0].1, b[4].1) = (ro, io);
-                    call(e, pipe, &p, &b, $g, $th)
+                    call(e, pipe, &p, &b, g, $th)
                 }), None));
             }};
         }
@@ -446,16 +475,25 @@ impl Model {
             }};
         }
         let t32 = [18, 1, 1];
-        ops.push(("row", 0, Box::new(move |e: &Enc| {
-            let y = (&self.a, ro + 4 * VR);
-            match tok {
+        for (z, &tok) in toks.iter().enumerate() {
+            let y = (&self.a, ro + 4 * (z * self.rs() + VR));
+            ops.push(("row", 0, Box::new(move |e: &Enc| match tok {
                 TID => {
                     let w = self.gpu.w(self.emb);
                     self.mv.row_id(e, self.emb.ty, w, (&self.id, io + 36), y, N)
                 }
                 _ => self.embd(e, tok, y),
-            }
-        }), None));
+            }), None));
+        }
+        let tok = toks[0]; // an image row comes alone
+        // ZR: the conv input of every row, before a mix reads the ring
+        macro_rules! stor {
+            ($x:expr, $st:expr) => {
+                if nz > 1 && $x > 0 {
+                    k!("stor", t32, 32, $x, 0, 0, $st, 0, pos);
+                }
+            };
+        }
         k!("dots", [2, 1, 1], 576, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC);
         // an image row is the stream as it is: no norm (ones, no scale)
         let (tn, sc) = if tok < IMG || tok == TID { (self.tn, 1) } else { (0, 0) };
@@ -492,10 +530,14 @@ impl Model {
                 fin = [0, PRE, 0, 0, 0];
             }
             let ([f0, f1, f2, f3, f4], [w0, w1, w2]) = (fin, l.nw);
+            stor!(f0, f3);
             k!("dots", [nb + 2, l.nq.max(1) as usize, 1], 576, f0, f1, f2, f3, f4, pos,
                 BK, nb, l.nq, l.aq, SC);
             k!("elem", t32, 32, f0, f1, f2, f3, f4, pos, BK, nb, l.nq, l.aq, SC, nx,
                 VR, X, w0, w1, w2);
+            if let Some(i) = [5, 23, 41].iter().position(|&v| v == vi && self.taps) {
+                k!("keep", t32, 32, H, FT + i * N);
+            }
             if lp {
                 k!("low", [65, 3, 1], 576, VR, msg, l.ctl, GC);
                 k!("ctl", [72, 3, 1], 32, VR, msg, l.ctl, GC, X, w0, w1, w2);
@@ -505,33 +547,44 @@ impl Model {
             mv!("mv", l.v, x(2), K + 1024, N, 1024);
             mv!("mv", l.rel, x(0), R, N, 384);
             mv!("mv", l.gate, x(0), G, N, 3072);
-            let (idx, nk, tau) = if l.swa {
-                (pos % SW, (pos + 1).min(1024), 1.)
+            // (cache row, keys, tau) of the token at p
+            let at = |p: usize| if l.swa {
+                (p % SW, (p + 1).min(1024), 1.)
             } else {
-                let t = ((pos + 1) as f32 / self.hp[2]).max(1.).ln();
-                (pos, pos + 1, 1. + self.hp[3] * t)
+                let t = ((p + 1) as f32 / self.hp[2]).max(1.).ln();
+                (p, p + 1, 1. + self.hp[3] * t)
             };
+            let ((idx, nk, tau), nkm) = (at(pos), at(pos + nz - 1).1);
+            (0..nz).for_each(|z| tz[z] = at(pos + z).2.to_bits());
             let (cs, kv) = (slot * CS, self.kvo[slot]);
-            k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd, l.vd,
-                cs, kv + idx * 2048, f32::to_bits(tau), self.hp[0].to_bits(),
-                self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK);
-            let ng = nk.div_ceil(128);
+            // ZR: the cache row follows from the ring size, and a first
+            // run only stores the conv inputs
+            let (kw, ring) = match nz {
+                1 => (kv + idx * 2048, 0),
+                _ => (kv, if l.swa { SW } else { 0 }),
+            };
+            for so in [2, 0].into_iter().skip((nz == 1) as usize) {
+                k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd,
+                    l.vd, cs, kw, f32::to_bits(tau), self.hp[0].to_bits(),
+                    self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK, so, ring);
+            }
+            let ng = nkm.div_ceil(128);
             let nm = self.n_ctx.max(1024) + 256;
             let (mx, gm, pa) = (PT + 24 * nm, PT + 27 * nm, PT + 27 * nm + 48);
             let th = (ng * 16).next_multiple_of(32).min(1024);
             let nc = if l.swa || !w8 {
                 k!("score", [ng, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb, mx);
                 k!("smax", [24, 1, 1], th, mx, ng * 16, SK, gm, th);
-                k!("gather", [nk.div_ceil(256), 8, 1], 512, gm, 0, PT, kv, nk, pos, l.swa,
+                k!("gather", [nkm.div_ceil(256), 8, 1], 512, gm, 0, PT, kv, nk, pos, l.swa,
                     0, pa);
-                nk.div_ceil(256)
+                nkm.div_ceil(256)
             } else {
                 // int8 first, f16 for the keys with weight
                 let (k8, cw) = (k8(slot), (nk / 64).min(256));
-                k!("pack", [1, 4, 1], 32, kv + pos * 2048, k8 + pos * 1152);
+                k!("pack", [nz, 4, 1], 32, kv + pos * 2048, k8 + pos * 1152);
                 k!("scorew", [ng * 16, 2, 1], 32, Q, R, PT, k8, nk, pos, 0, l.rb, mx);
                 k!("smax", [24, 1, 1], th, mx, ng * 16, 0, gm, th, lt);
-                let nc = nk.div_ceil(cw);
+                let nc = nkm.div_ceil(cw);
                 k!("gatherw", [nc, 2, 1], 32, gm, 0, PT, 0, nk, 0, 0, 0, pa, 0, 0, k8, cw);
                 k!("fix", [64, 8, 1], 32, Q, R, PT, kv, nk, pos, 0, l.rb, pa, gm, 0, 0, 64, nc);
                 nc + 64
@@ -541,6 +594,7 @@ impl Model {
             mv!("mv", l.o, O, AO, 3072, N);
             nb += first as usize;
             let (r, st) = (if first { 0 } else { H }, cs + 2048);
+            stor!(AO, st);
             k!("dots", [nb + 2, 1, 1], 576, AO, r, F, st, l.apc, pos, BK, nb, 1, l.fq, SC);
             k!("elem", t32, 32, AO, r, F, st, l.apc, pos, BK, nb, 1, l.fq, SC, 1, VR,
                 XF, l.fnw);
@@ -556,6 +610,7 @@ impl Model {
             mv!("down", l.dn, HH, D, 1152, N);
             fin = [D, F, H, cs + 4352, l.fpc as usize];
             if i == 17 && pass < 2 {
+                stor!(D, fin[3]);
                 k!("elem", t32, 32, D, F, H, fin[3], fin[4], pos, BK, nb, 0, 0, SC);
                 let (b, q) = (BK + 2 * N, self.mq);
                 k!("dots", [3, 48, 1], 576, 0, H, 0, 0, 0, pos, b, 1, 0, q, GC);
@@ -564,6 +619,7 @@ impl Model {
             vi += 1;
         }
         let [f0, f1, _, f3, f4] = fin;
+        stor!(f0, f3);
         if !head {
             // only the conv state of the last ffn
             k!("elem", t32, 32, f0, f1, 0, f3, f4, pos, BK, nb, 0, 0, SC);
@@ -620,7 +676,15 @@ impl Model {
             drop(ops);
             self.pos += c.len();
         }
-        self.step(*l)
+        if *l < IMG {
+            return self.step(*l);
+        }
+        // step() reads the token table: an image row goes the long way
+        let ops = self.sched(*l, self.pos, true);
+        self.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
+        drop(ops);
+        self.pos += 1;
+        self.next()
     }
 
     // the experts of the last visit
@@ -635,8 +699,13 @@ impl Model {
 
     // logits of the last step, unpadded vocabulary, after the softcap
     pub fn logits(&self) -> Vec<f32> {
+        self.logits_row(0)
+    }
+
+    // those of activation row r of a batched pass (dr.rs)
+    pub fn logits_row(&self, r: usize) -> Vec<f32> {
         let n = self.g.u("inkling2.vocab_size_unpadded");
-        slice::<f32>(&self.a)[LG..LG + n].to_vec()
+        slice::<f32>(&self.a)[r * self.rs() + LG..][..n].to_vec()
     }
 
     // a region of the activations by ref dump name

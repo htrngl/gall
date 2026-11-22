@@ -108,6 +108,17 @@ impl Gpu {
         p
     }
 
+    // encode with f and commit; the next command buffer runs after it
+    pub fn go(&self, f: impl FnOnce(&Enc)) {
+        autoreleasepool(|_| {
+            let cb = self.q.commandBuffer().unwrap();
+            let e = cb.computeCommandEncoder().unwrap();
+            f(&e);
+            e.endEncoding();
+            cb.commit();
+        })
+    }
+
     // encode with f, commit, wait. returns gpu seconds.
     pub fn run(&self, f: impl FnOnce(&Enc)) -> f64 {
         autoreleasepool(|_| {
@@ -125,17 +136,34 @@ impl Gpu {
     }
 }
 
-pub fn call<P>(e: &Enc, p: &Pipe, args: &P, bufs: &[B], groups: [usize; 3], threads: usize) {
-    let sz = |[width, height, depth]: [usize; 3]| MTLSize { width, height, depth };
-    // a larger threadgroup runs nothing, without an error
-    assert!(threads <= p.maxTotalThreadsPerThreadgroup(), "threadgroup of {threads}");
+fn bind<P>(e: &Enc, p: &Pipe, args: &P, bufs: &[B]) {
     unsafe {
         e.setComputePipelineState(p);
         e.setBytes_length_atIndex(NonNull::from(args).cast(), size_of::<P>(), 0);
         for (i, (b, o)) in bufs.iter().enumerate() {
             e.setBuffer_offset_atIndex(Some(b), *o, i + 1);
         }
-        e.dispatchThreadgroups_threadsPerThreadgroup(sz(groups), sz([threads, 1, 1]));
+    }
+}
+
+fn sz([width, height, depth]: [usize; 3]) -> MTLSize {
+    MTLSize { width, height, depth }
+}
+
+pub fn call<P>(e: &Enc, p: &Pipe, args: &P, bufs: &[B], groups: [usize; 3], threads: usize) {
+    // a larger threadgroup runs nothing, without an error
+    assert!(threads <= p.maxTotalThreadsPerThreadgroup(), "threadgroup of {threads}");
+    bind(e, p, args, bufs);
+    e.dispatchThreadgroups_threadsPerThreadgroup(sz(groups), sz([threads, 1, 1]));
+}
+
+// call() with the grid (3 u32) read from `ind` when the dispatch runs
+pub fn calli<P>(e: &Enc, p: &Pipe, args: &P, bufs: &[B], ind: B, threads: usize) {
+    bind(e, p, args, bufs);
+    unsafe {
+        e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+            ind.0, ind.1, sz([threads, 1, 1]),
+        )
     }
 }
 

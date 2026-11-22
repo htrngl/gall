@@ -19,7 +19,7 @@ and libc. It does not use ggml or MLX.
 
 ```sh
 cargo install --git https://github.com/ltrgoddard/gall
-gall up          # Downloads the model (12.3 GB) on first use; starts the server on port 9940
+gall up          # Downloads the model (12.7 GB) on first use; starts the server on port 9940
 gall test        # Checks 64 greedy tokens against a llama.cpp reference
 gall down
 ```
@@ -123,7 +123,7 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
 - `src/tok.rs`, `serve.rs`, `snap.rs`, `up.rs`: Tokenizer, chat template,
   server, prefix snapshots, and server lifecycle commands.
 - `src/vis.*`: Image decoding (ImageIO) and the vision encoder.
-- `src/dr*`: The dspark drafter. See the limitations below.
+- `src/dr*`: The dspark drafter and its batched verification.
 - [Engine brief](docs/ENGINE.md) and [drafter notes](docs/DRAFT.md).
 - `tools/`: Tools for reference dumps from llama.cpp.
 - `llama/`: The patched llama.cpp reference build and its
@@ -157,10 +157,18 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
   235 ms (259 ms with f16 only), and the logits equal those without the
   restore. `VT=0` disables the copy. `VT` sets the
   weight threshold (default 0.01).
-- The drafter's batched verification produces the same text as greedy
-  decoding. Verification of four rows takes 250 ms, compared
-  with 52 ms per serial token. The block size remains 0.
-  The drafter needs expert kernels that dequantize weights once per batch.
+- With `dspark-Inkling-2-Mini-Q8_0.gguf` beside the model, the server
+  verifies drafted tokens ahead in batches of 2 to 8 rows. A pass of two
+  or four rows takes 70 or 117 ms, compared with 49 ms per serial token.
+  The logits of every step remain those of the model, so sampling is
+  unchanged: with one seed, the messages are equal with and without the
+  drafter. The server drafts only where the drafter is confident.
+  On 120-token answers at temperature 0, it measured 20.5 to 20.7 t/s
+  for prose, 20.4 to 23.4 t/s for a proof, and 20.4 to 21.4 t/s for code.
+  With the default sampling, the same requests measured 20.2 to 20.5,
+  20.0 to 21.8, and 20.2 to 20.4 t/s. `--no-draft` disables the drafter.
+  It is off under `response_format`. See the
+  [drafter notes](docs/DRAFT.md).
 - Prefill uses half-precision tiles, as llama.cpp does. The `HT` setting in
   `pfm.metal` selects float precision at approximately 0.8 times the speed.
 - The vision encoder runs on the GPU. A 640 x 488 image (208 tokens) takes
@@ -169,7 +177,7 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
   kept in `~/.cache/gall/img`.
 - The server runs one chat at a time; other chats wait in a queue, and
   `/health` and `/v1/models` answer meanwhile.
-- Unsupported features include GBNF grammars and drafting in the server.
+- Unsupported features include GBNF grammars.
 - `RQ=5` requantizes the 100 q8_0 attention projections (234 dispatches
   per token) from their q8_0 values to 5 bits, in a 293 MB buffer. The
   first run takes about 5 s. Later runs read `~/.cache/gall/*.rq` with no

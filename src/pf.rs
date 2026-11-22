@@ -84,21 +84,33 @@ impl Model {
     // evaluate toks but for a tail for step(): passes of ub tokens, then
     // one of the rest less the last token, if that is 16 or more.
     // self.t is the gpu seconds
-    pub fn prefill<'a>(&mut self, mut toks: &'a [u32], ub: usize) -> &'a [u32] {
+    pub fn prefill<'a>(&mut self, toks: &'a [u32], ub: usize) -> &'a [u32] {
+        self.prefill_tap(toks, ub, None)
+    }
+
+    // prefill(); tap(model, f) after each pass, before pos moves: f is the
+    // drafter's 4 features of each token of the pass (DRAFT.md), 4 N each
+    pub fn prefill_tap<'a>(&mut self, mut toks: &'a [u32], ub: usize,
+                           mut tap: Option<&mut dyn FnMut(&Model, &[f32])>) -> &'a [u32] {
         self.t = 0.;
         self.stale(self.pos);
         while toks.len() > 16 {
             let (n, tb) = (ub.min(toks.len() - 1), ub.div_ceil(32) * 32);
             let pf = self.pf.take().filter(|p| p.tb >= tb);
             let pf = pf.unwrap_or_else(|| Pf::new(&self.gpu, tb));
-            self.t += self.pass(&pf, &toks[..n]);
+            let mut ft = vec![0.; if tap.is_some() { 4 * N * n } else { 0 }];
+            self.t += self.pass(&pf, &toks[..n], &mut ft);
+            if let Some(f) = &mut tap {
+                f(self, &ft);
+            }
             (self.pf, self.pos, toks) = (Some(pf), self.pos + n, &toks[n..]);
         }
         toks
     }
 
-    // one pass over 16 <= t <= tb tokens; gpu seconds
-    fn pass(&self, pf: &Pf, toks: &[u32]) -> f64 {
+    // one pass over 16 <= t <= tb tokens; gpu seconds. ft, if not empty,
+    // takes the residual entering visits 5, 23, 41 and the normed output
+    fn pass(&self, pf: &Pf, toks: &[u32], ft: &mut [f32]) -> f64 {
         let (t, pos, tb) = (toks.len(), self.pos, pf.tb);
         assert!(pos + t <= self.n_ctx, "context full");
         let (col, tl) = (slice::<u32>(&pf.col), slice::<u32>(&pf.tl));
@@ -243,8 +255,19 @@ impl Model {
                 }
                 if v < vs.len() {
                     head(e, v);
+                } else if !ft.is_empty() {
+                    k!(e, "prep", g1, 32, H, BK, nbs[v - 1].1, 1, self.oq, X, 1, 0, 0,
+                        0, self.on, 0, 0, VT);
                 }
             });
+            let i = [5, 23, 41, 48].iter().position(|&x| x == v);
+            if let Some(i) = i.filter(|_| !ft.is_empty()) {
+                let o = if i == 3 { X } else { H };
+                for (k, f) in ft.chunks_mut(4 * N).enumerate() {
+                    let a = &slice::<f32>(&pf.a)[k * STR + o..][..N];
+                    f[i * N..][..N].copy_from_slice(a);
+                }
+            }
             // sort the (token, k) pairs by expert; an expert is padded to 8
             let id = slice::<u32>(&pf.id);
             let mut by = vec![vec![]; 128];

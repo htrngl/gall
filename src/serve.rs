@@ -1,17 +1,19 @@
 // openai-compatible chat server over one model: chats queue, one at a time.
 //   gall serve <gguf> [--port 9940] [--ctx 102400] [--effort none]
 //             [--alias inkling-2-mini] [--api-key-file F]
-//             [--idle-unload SECONDS] [--dummy [answer]]
+//             [--idle-unload SECONDS] [--no-draft] [--dummy [answer]]
 // POST /v1/chat/completions (stream or not), GET /v1/models, GET /health.
 // with a key, all but /health need "authorization: bearer KEY". after
 // --idle-unload seconds idle the model goes to disk (a snapshot of the last
-// conversation) and out of memory, until the next chat request.
+// conversation) and out of memory, until the next chat request. with the
+// dspark drafter beside the model, tokens are verified ahead in batches
+// where that pays (dr.rs); the logits of every step stay those of the model.
 // the chat template of the gguf is written out in prompt(); the model
 // answers in blocks, <|message_model|> then <|content_thinking|>,
 // <|content_text|> or NAME<|content_invoke_tool_json|>, each closed by
 // <|end_message|>. a new prompt that extends the last one is fed from
 // where they part.
-use crate::{model::Model, tok::Tok, vis::Vis};
+use crate::{dr::{Dr, Spec}, model::Model, tok::Tok, vis::Vis};
 use std::{collections::HashMap, ops::Range};
 use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -49,6 +51,10 @@ pub trait Lm {
     // the token ids that stand for the image at url (data: or http)
     fn image(&mut self, _url: &str) -> Result<Range<u32>, String> {
         Err("this server has no vision model".into())
+    }
+    // drafting for the steps to come, on or off; what it did, for the log
+    fn draft(&mut self, _on: bool) -> String {
+        String::new()
     }
 }
 
@@ -99,6 +105,9 @@ impl Lm for Lazy {
     }
     fn image(&mut self, u: &str) -> Result<Range<u32>, String> {
         self.get().image(u)
+    }
+    fn draft(&mut self, on: bool) -> String {
+        self.get().draft(on)
     }
 }
 
@@ -848,6 +857,8 @@ impl Srv {
         let k = k.max(snap); // not fed for this request
         self.fed.clear();
         self.fed.extend(&p);
+        // a constrained answer takes tokens the drafter does not foresee
+        self.lm.draft(js.is_none());
         let mut lg = self.lm.feed(&p[at..]);
         let t1 = Instant::now();
 
@@ -945,11 +956,12 @@ impl Srv {
         let rate = |n: usize, d: Duration| n as f64 / d.as_secs_f64().max(1e-9);
         eprintln!(
             "gall: prompt {} ({k} cached, snap {snap}) {:.1} t/s, first token \
-             {:.2} s, predicted {n} {:.1} t/s",
+             {:.2} s, predicted {n} {:.1} t/s{}",
             p.len(),
             rate(np, dp),
             dp.as_secs_f64(),
-            rate(n, dg)
+            rate(n, dg),
+            self.lm.draft(true)
         );
         let usage = obj!["prompt_tokens" => p.len(), "completion_tokens" => n,
             "total_tokens" => p.len() + n];
@@ -1043,39 +1055,65 @@ impl Lm for Dummy {
 }
 
 // the engine as an Lm; a checkpoint at each feed (the prompt). the
-// vision encoder, and the row count of each image held, by its url's hash
+// vision encoder, and the row count of each image held, by its url's hash;
+// the drafter, its estimates and the counts at the last report
+type Draft = (Dr, Spec, [usize; 3]);
 struct Ink(crate::model::Model, Vec<f32>, crate::model::snap::Snaps,
-    Option<Vis>, HashMap<u64, usize>);
+    Option<Vis>, HashMap<u64, usize>, Option<Draft>);
 
 impl Lm for Ink {
     fn reset(&mut self) {
+        self.draft(true);
         self.0.reset()
     }
+    // a row verified ahead answers without a pass (Dr::next)
     fn step(&mut self, t: u32) -> &[f32] {
-        self.0.step(t);
-        self.1 = self.0.logits();
+        let r = match &mut self.5 {
+            Some((d, s, _)) => d.next(&mut self.0, s, t),
+            None => {
+                self.0.step(t);
+                0
+            }
+        };
+        self.1 = self.0.logits_row(r);
         &self.1
     }
     fn len(&self) -> usize {
         self.0.pos
     }
     fn truncate(&mut self, n: usize) -> bool {
+        self.draft(true);
         self.0.truncate(n)
     }
     // the checkpoint is before the last token: the same prompt again
     // (regenerate) goes back to it
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
         let (l, h) = toks.split_last().unwrap();
-        if !h.is_empty() {
-            self.0.feed(h);
-        }
+        match &self.5 {
+            _ if h.is_empty() => 0,
+            Some((d, ..)) => d.feed(&mut self.0, h),
+            None => self.0.feed(h),
+        };
         self.0.save();
-        self.0.step(*l);
-        self.1 = self.0.logits();
-        &self.1
+        self.step(*l)
     }
+    // what prime restores or feeds has no drafter context
     fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
-        self.2.prime(&mut self.0, p, k, sys)
+        let r = self.2.prime(&mut self.0, p, k, sys);
+        if let Some((d, ..)) = self.5.as_ref().filter(|_| r.0 > k) {
+            d.forget(r.0);
+        }
+        r
+    }
+    // also drops the rows verified ahead: the model is about to move
+    fn draft(&mut self, on: bool) -> String {
+        let Some((_, s, c)) = &mut self.5 else { return String::new() };
+        s.drop();
+        s.block = (!on).then_some(0);
+        let n = [s.drafts, s.rows[0], s.rows[1]];
+        let d = [0, 1, 2].map(|i| n[i] - c[i]);
+        *c = n;
+        format!(", {} drafts, {} of {} rows ahead kept", d[0], d[2], d[1])
     }
     fn image(&mut self, url: &str) -> Result<Range<u32>, String> {
         let v = self.3.as_ref().ok_or("no mmproj file beside the model")?;
@@ -1164,14 +1202,18 @@ pub fn main(a: &[String]) {
         Box::new(move || Box::new(Dummy(say.clone(), 0, vec![0.0; n], 0)))
     } else {
         crate::up::guard();
-        let p = a[0].clone();
+        let (p, draft) = (a[0].clone(), !a.iter().any(|x| x == "--no-draft"));
         Box::new(move || {
             crate::up::lock(true);
-            let m = crate::model::Model::open(&p, ctx);
+            let mut m = crate::model::Model::open(&p, ctx);
             let s = crate::model::snap::Snaps::new(&p, &m);
             let v = std::path::Path::new(&p).with_file_name(crate::up::MMPROJ);
             let v = v.exists().then(|| Vis::open(v.to_str().unwrap()));
-            Box::new(Ink(m, vec![], s, v, HashMap::new()))
+            let d = std::path::Path::new(&p).with_file_name(crate::up::DRAFT);
+            let d = (d.exists() && draft).then(|| {
+                (Dr::open(&mut m, d.to_str().unwrap(), ctx), Spec::new(), [0; 3])
+            });
+            Box::new(Ink(m, vec![], s, v, HashMap::new(), d))
         })
     };
     let lm = Box::new(Lazy(Some(load()), load));
