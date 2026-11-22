@@ -249,6 +249,11 @@ text is equal to plain greedy in every row.
   and gated; gated stays off (17.0 against 18.1 t/s, the plain run first
   and the machine warmer for the second).
 
+- 3556-token code prompt (the head of `src/tok.rs`), 96 tokens, text
+  equal: plain then drafted 18.1, 17.7 t/s; drafted then plain 19.0, 16.2.
+  the second run of a pair is on a warmer machine (its serial step 60-62
+  ms against 55), so the gain is between the two: about 7%.
+
 ## prompt context
 
 `Dr::feed` is `Model::feed` with the drafter's features: the batched
