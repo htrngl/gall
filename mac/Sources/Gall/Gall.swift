@@ -91,7 +91,7 @@ func alert(_ s: String) {
     @Published var h: Health?
     @Published var phase = "" // overrides the status while not empty
     @Published var mem: Double?
-    var open = false, fetching = false
+    var fetching = false
     let d = UserDefaults.standard
 
     var idle: Int { d.object(forKey: "unload") as? Int ?? 900 } // seconds
@@ -112,23 +112,15 @@ func alert(_ s: String) {
             + "cached, \(r) t/s"
     }
 
+    // a poll a second: the icon follows a load or an unload at once
     init() {
-        let n = NotificationCenter.default
-        n.addObserver(forName: NSMenu.didBeginTrackingNotification,
-                      object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.open = true }
-        }
-        n.addObserver(forName: NSMenu.didEndTrackingNotification,
-                      object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.open = false }
-        }
         Task {
             NSApp.setActivationPolicy(.accessory)
             await start()
-            for t in 0... {
+            while true {
                 let p = "Downloading \(Int(got() / 12.7e7))%"
                 if fetching, p != phase { phase = p }
-                if open || t % 10 == 0 { await poll() }
+                await poll()
                 await sleep(1)
             }
         }
