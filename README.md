@@ -47,15 +47,16 @@ gall down
 
 ## Measured
 
-2026-11-21, this machine, one run each. the air has no fan: after about 2.5
-minutes of load the figures drop by roughly 10%.
+2026-11-21 (short-context decode and 512-token prefill: 2026-11-22), this
+machine, one run each. the air has no fan: after about 2.5 minutes of load
+the figures drop by roughly 10%.
 
 | | llama.cpp (`llama/`) | gall |
 | --- | --- | --- |
-| decode, short context | 15 t/s | 19.5 t/s cold, ~18 warm |
+| decode, short context | 15 t/s | 20.5 t/s cold |
 | decode, 8k deep | 12.4 t/s | 17.6 t/s |
 | decode, 31.5k deep (real prompt) | not measured cleanly | 13.8-14.6 t/s |
-| prefill, 512 tokens | 121 t/s | 108-125 t/s |
+| prefill, 512 tokens | 121 t/s | 130 t/s |
 | prefill, 10.5k tokens | 89 t/s (to 8.3k) | 106 t/s |
 | new chat with a stored prefix, first token | | 0.5-1.2 s |
 
@@ -91,8 +92,15 @@ reference dumps made with `tools/refdump` against the llama.cpp build in
 
 ## State
 
-- weights are 45 of 51 ms per token. every format costs 7-12 ps per element;
-  two tuning passes on the expert gate-up kernels found nothing more.
+- weights are 44.2 of 48.2 ms per token, small kernels 4.9, in 1071
+  dispatches. a token is one command buffer, encoded while the token before
+  it runs; wall time is 0.4 ms over gpu time.
+- the experts are 23 ms of the token and bound by arithmetic, not by the
+  read. an iq3_xxs gate-up visit takes 0.30 ms: 0.20 for the loads (the bytes
+  alone are 0.19 at 86 GB/s), 0.04 for the signs, 0.04 for byte to float and
+  the dot, 0.01 for the grid tables. three tuning passes found nothing more.
+- the k-quants unpack 4 bytes in one word: the q5_k head reads at 73 GB/s
+  (4.4 ms), q6_k at 87.
 - depth is bound by the KV read (81 GB/s): 56.7 ms at 8k, 67 at 32k, 102 at
   100k (the last two synthetic).
 - `KV=q8` stores the full-attention caches as int8: half the cache memory at

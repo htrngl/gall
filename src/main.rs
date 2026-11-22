@@ -146,8 +146,18 @@ fn main() {
                 ops.iter().for_each(|o| *by.entry(o.0).or_default() += 1);
                 eprintln!("{} dispatches, {:.1} ms", ops.len(), 1e3 * all);
                 by.extend([("small", 0), ("weights", 0)]);
+                // then the kind alone: ms, us per dispatch
                 for (k, c) in by {
-                    eprintln!("{k:8} {c:5} {:7.2} ms", 1e3 * (run("") - run(k)));
+                    let f = |_| m.gpu.run(|e| {
+                        ops.iter().filter(|o| o.0 == k).for_each(|o| o.2(e))
+                    });
+                    let t = c.min(1) as f64 * (0..8).map(f).fold(1., f64::min);
+                    eprintln!(
+                        "{k:8} {c:5} {:7.2} ms, alone {:6.2} ms {:6.1} us",
+                        1e3 * (run("") - run(k)),
+                        1e3 * t,
+                        1e6 * t / c.max(1) as f64
+                    );
                 }
             }
         }
