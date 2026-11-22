@@ -234,8 +234,7 @@ impl Model {
                 if v == 0 {
                     for (i, &x) in toks.iter().enumerate() {
                         let y = (&pf.a, 4 * (i * STR + H));
-                        let (emb, x) = (self.emb, x as usize);
-                        self.mv.row(e, emb.ty, self.gpu.w(emb), x, y, N);
+                        self.embd(e, x, y);
                     }
                     k!(e, "prep", g1, 32, H, BK, 0, 0, 0, H, 1, 0, 0, 0, self.tn, 0,
                         0, VT);

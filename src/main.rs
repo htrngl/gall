@@ -3,6 +3,7 @@
 // gall pp MODEL TOKENS [-n all] [-ub 512] [-c 4096] [--cmp] [--ref REFDIR]
 // gall mmb
 // gall tok MODEL FILE
+// gall vis MMPROJ IMAGE [REF.f32]
 // gall serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
 // gall up [CTX] [SERVE FLAGS] | down | log | model | test (see up.rs)
 mod dr;
@@ -13,6 +14,7 @@ mod mv;
 mod serve;
 mod tok;
 mod up;
+mod vis;
 use std::{collections::BTreeMap, fs, time::Instant};
 
 fn ids(p: &str) -> Vec<u32> {
@@ -63,6 +65,7 @@ fn main() {
         "run" if a.iter().any(|x| x == "--draft") => return dr::run(&a[2..]),
         "mmb" => return model::pf::bench(),
         "tok" => return tok::main(&a[2..]),
+        "vis" => return vis::main(&a[2..]),
         "serve" => return serve::main(&a[2..]),
         _ => {}
     }

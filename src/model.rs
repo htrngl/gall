@@ -89,6 +89,8 @@ struct L {
 // (kind, visit, encode, a weight op's (mode, tensor, x, y) in floats)
 pub type Op<'a> =
     (&'static str, usize, Box<dyn Fn(&Enc) + 'a>, Option<(&'static str, T, usize, usize)>);
+pub const IMG: u32 = 1 << 24; // token ids from here are image rows
+const IMR: usize = 8192; // image rows kept
 pub const ROWS: usize = 8; // activation rows, for dr.rs's batched verify
 
 pub struct Model {
@@ -104,6 +106,8 @@ pub struct Model {
     pub id: Buf,
     l: Vec<L>,
     emb: T,
+    im: Buf, // image embeddings, f32 rows
+    pub ni: usize,
     out: T,
     tn: u32,
     oq: u32,
@@ -264,6 +268,8 @@ impl Model {
             id: gpu.buf(4 * 16 * ROWS),
             l,
             emb: &g.t["token_embd.weight"],
+            im: gpu.buf(4 * N * IMR),
+            ni: 0,
             out: &g.t["output.weight"],
             tn,
             oq,
@@ -290,6 +296,22 @@ impl Model {
     // halfs per key of a full-attention slot
     pub fn row(q8: bool) -> usize {
         if q8 { 1088 } else { 2048 }
+    }
+
+    // a token's embedding: a row of the table, or an image row past IMG
+    pub fn embd(&self, e: &Enc, tok: u32, y: B) {
+        match tok.checked_sub(IMG) {
+            Some(i) => self.mv.row(e, 0, (&self.im, 0), i as usize, y, N),
+            None => self.mv.row(e, self.emb.ty, self.gpu.w(self.emb), tok as usize, y, N),
+        }
+    }
+
+    // keep image rows; their token ids, or None when the store is full
+    pub fn image(&mut self, e: &[f32]) -> Option<std::ops::Range<u32>> {
+        let (a, b) = (self.ni, self.ni + e.len() / N);
+        slice::<f32>(&self.im).get_mut(a * N..b * N)?.copy_from_slice(e);
+        self.ni = b;
+        Some(IMG + a as u32..IMG + b as u32)
     }
 
     pub fn reset(&mut self) {
@@ -380,9 +402,9 @@ impl Model {
                 }), Some(($n, t, x, y))));
             }};
         }
-        let (emb, t32) = (self.emb, [18, 1, 1]);
+        let t32 = [18, 1, 1];
         ops.push(("row", 0, Box::new(move |e: &Enc| {
-            self.mv.row(e, emb.ty, self.gpu.w(emb), tok as usize, (&self.a, ro + 4 * VR), N)
+            self.embd(e, tok, (&self.a, ro + 4 * VR))
         }), None));
         k!("dots", [2, 1, 1], 576, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC);
         k!("elem", t32, 32, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC, 1, VR, H, self.tn,

@@ -82,6 +82,10 @@ impl Snaps {
 
     // write the state of m, which holds toks
     pub fn write(&mut self, m: &Model, toks: &[u32]) -> std::io::Result<()> {
+        // image ids do not outlive the process
+        if toks.iter().any(|&t| t >= super::IMG) {
+            return Ok(());
+        }
         let mut h = DefaultHasher::new();
         (&self.tag, toks).hash(&mut h);
         let p = self.dir.join(format!("{:016x}.snap", h.finish()));

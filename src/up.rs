@@ -8,6 +8,7 @@ use std::{env, fs, net::TcpStream, path::PathBuf, thread, time::Duration};
 
 const REPO: &str = "unsloth/Inkling-2-Mini-GGUF";
 const FILE: &str = "Inkling-2-Mini-UD-IQ3_XXS.gguf";
+pub const MMPROJ: &str = "mmproj-F16.gguf"; // the vision encoder
 
 pub fn cache() -> PathBuf {
     let d = PathBuf::from(env::var("HOME").unwrap()).join(".cache/gall");
@@ -26,10 +27,14 @@ pub fn model() -> String {
     let hit = fs::read_dir(hub).ok().into_iter().flatten()
         .flatten().map(|d| d.path().join(FILE)).find(|p| p.exists());
     let p = hit.unwrap_or(cache().join(FILE));
-    if !p.exists() {
-        eprintln!("gall: fetching {FILE} (11.7GB) to {}", p.display());
+    for (f, gb) in [(FILE, 11.7), (MMPROJ, 0.6)] {
+        let p = p.with_file_name(f);
+        if p.exists() {
+            continue;
+        }
+        eprintln!("gall: fetching {f} ({gb}GB) to {}", p.display());
         let part = p.with_extension("part");
-        let url = format!("https://huggingface.co/{REPO}/resolve/main/{FILE}");
+        let url = format!("https://huggingface.co/{REPO}/resolve/main/{f}");
         let c = Command::new("curl").args(["-fL", "-C", "-", "-o"])
             .arg(&part).arg(url).status();
         if !c.is_ok_and(|s| s.success()) {

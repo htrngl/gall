@@ -11,7 +11,8 @@
 // <|content_text|> or NAME<|content_invoke_tool_json|>, each closed by
 // <|end_message|>. a new prompt that extends the last one is fed from
 // where they part.
-use crate::tok::Tok;
+use crate::{tok::Tok, vis::Vis};
+use std::{collections::HashMap, ops::Range};
 use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -43,6 +44,10 @@ pub trait Lm {
     fn park(&mut self, _toks: &[u32]) {}
     fn loaded(&self) -> bool {
         true
+    }
+    // the token ids that stand for the image at url (data: or http)
+    fn image(&mut self, _url: &str) -> Result<Range<u32>, String> {
+        Err("this server has no vision model".into())
     }
 }
 
@@ -90,6 +95,9 @@ impl Lm for Lazy {
     }
     fn loaded(&self) -> bool {
         self.0.is_some()
+    }
+    fn image(&mut self, u: &str) -> Result<Range<u32>, String> {
+        self.get().image(u)
     }
 }
 
@@ -341,7 +349,31 @@ fn effort(e: &J) -> Result<String, String> {
 
 // r: the request; eff: the reasoning effort if the request has none
 // the prompt, and the length of its system region
-fn prompt(r: &J, eff: &J) -> Result<(String, usize), String> {
+fn b64(s: &str) -> Vec<u8> {
+    let (mut o, mut a, mut n) = (vec![], 0u32, 0);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - 65,
+            b'a'..=b'z' => c - 71,
+            b'0'..=b'9' => c + 4,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        };
+        (a, n) = (a << 6 | v as u32, n + 6);
+        if n >= 8 {
+            n -= 8;
+            o.push((a >> n) as u8);
+        }
+    }
+    o
+}
+
+// the prompt, the length of its system region, the image urls in order
+// (each stands as IMAGE in the text)
+const IMAGE: &str = "<|unused_200054|>";
+fn prompt(r: &J, eff: &J) -> Result<(String, usize, Vec<String>), String> {
+    let mut urls = vec![];
     let (mut o, mut sys) = (String::new(), None);
     let tools = r["tools"].a();
     if !tools.is_empty() {
@@ -389,19 +421,30 @@ fn prompt(r: &J, eff: &J) -> Result<(String, usize), String> {
         if !rc.is_empty() {
             o += &format!("{h}<|content_thinking|>{rc}{END}");
         }
-        let mut text = |t: &str| o += &format!("{h}<|content_text|>{t}{END}");
+        let mut part = |k: &str, t: &str| o += &format!("{h}<|content_{k}|>{t}{END}");
         match &m["content"] {
             J::Str(c) => {
                 if !c.is_empty() || calls.is_empty() && rc.is_empty() {
-                    text(c)
+                    part("text", c)
                 }
             }
             c => {
                 for p in c.a() {
                     match (p, p["type"].s()) {
-                        (J::Str(s), _) => text(s),
+                        (J::Str(s), _) => part("text", s),
                         (_, None | Some("text" | "input_text")) => {
-                            text(p["text"].s().unwrap_or(""))
+                            part("text", p["text"].s().unwrap_or(""))
+                        }
+                        (_, Some("image" | "input_image" | "image_url")) => {
+                            if !["user", "tool"].contains(&role) {
+                                return Err("Image content is only supported \
+                                    for user and tool messages".into());
+                            }
+                            let u = [&p["image_url"]["url"], &p["image_url"],
+                                &p["url"], &p["image"]];
+                            let u = u.iter().find_map(|u| u.s());
+                            urls.push(u.ok_or("image part without a url")?.into());
+                            part("image", IMAGE);
                         }
                         (_, Some(t)) => {
                             return Err(format!(
@@ -439,7 +482,7 @@ fn prompt(r: &J, eff: &J) -> Result<(String, usize), String> {
     }
     let o = o + &eff.unwrap_or_default();
     let n = sys.unwrap_or(o.len());
-    Ok((o, n))
+    Ok((o, n, urls))
 }
 
 // ---- sampling: top_k, top_p, min_p, temperature, in llama.cpp's order
@@ -584,11 +627,31 @@ struct Srv {
 
 impl Srv {
     fn chat(&mut self, r: &J, w: &mut TcpStream) -> io::Result<()> {
-        let (p, sys) = match prompt(r, &self.effort) {
-            Ok((p, n)) => (self.tok.enc(&p, true), self.tok.enc(&p[..n], true)),
+        let p = match prompt(r, &self.effort) {
+            Ok((p, n, u)) => (self.tok.enc(&p, true), self.tok.enc(&p[..n], true), u),
             Err(e) => return reply(w, 400, &err(&e)),
         };
+        let (mut p, sys, urls) = p;
         let sys = if p.starts_with(&sys) { sys.len() } else { 0 };
+        // each IMAGE token becomes the ids of its image's rows; a full
+        // image store empties itself and the second try starts it again
+        let ph = self.tok.id(IMAGE);
+        if !urls.is_empty() || p.contains(&ph) {
+            let t = Instant::now();
+            type R = Result<Vec<Range<u32>>, String>;
+            let mut get = || urls.iter().map(|u| self.lm.image(u)).collect::<R>();
+            let ids = get().or_else(|_| get());
+            let ids = match ids {
+                Ok(i) if i.len() == p.iter().filter(|&&t| t == ph).count() => i,
+                Ok(_) => return reply(w, 400, &err("stray image token")),
+                Err(e) => return reply(w, 400, &err(&e)),
+            };
+            let mut ids = ids.into_iter();
+            let f = |t| if t == ph { ids.next().unwrap() } else { t..t + 1 };
+            p = p.into_iter().flat_map(f).collect();
+            eprintln!("gall: {} images in {:.2} s", urls.len(),
+                t.elapsed().as_secs_f64());
+        }
         if p.is_empty() || p.len() >= self.ctx {
             let e = format!("{} prompt tokens, context {}", p.len(), self.ctx);
             return reply(w, 400, &err(&e));
@@ -798,8 +861,10 @@ impl Lm for Dummy {
     }
 }
 
-// the engine as an Lm; a checkpoint after each feed (the prompt)
-struct Ink(crate::model::Model, Vec<f32>, crate::model::snap::Snaps);
+// the engine as an Lm; a checkpoint after each feed (the prompt). the
+// vision encoder, and the ids of the images seen by a hash of their url
+struct Ink(crate::model::Model, Vec<f32>, crate::model::snap::Snaps,
+    Option<Vis>, HashMap<u64, Range<u32>>);
 
 impl Lm for Ink {
     fn reset(&mut self) {
@@ -824,6 +889,33 @@ impl Lm for Ink {
     }
     fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
         self.2.prime(&mut self.0, p, k, sys)
+    }
+    fn image(&mut self, url: &str) -> Result<Range<u32>, String> {
+        let v = self.3.as_ref().ok_or("no mmproj file beside the model")?;
+        let mut h = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(url, &mut h);
+        let key = std::hash::Hasher::finish(&h);
+        if let Some(r) = self.4.get(&key) {
+            return Ok(r.clone());
+        }
+        let b = match url.split_once(";base64,") {
+            Some((_, b)) if url.starts_with("data:") => b64(b),
+            _ if url.starts_with("http") => {
+                let c = std::process::Command::new("curl")
+                    .args(["-sfL", "--max-time", "30", "--", url]).output();
+                c.map(|o| o.stdout).unwrap_or_default()
+            }
+            _ => vec![],
+        };
+        let (w, h, rgb) = crate::vis::decode(&b, v.max)
+            .ok_or("the image could not be read")?;
+        let Some(r) = self.0.image(&v.embed(w, h, &rgb)) else {
+            (self.0.ni, self.4) = (0, HashMap::new());
+            self.0.reset();
+            return Err("the image store was full; send the request again".into());
+        };
+        self.4.insert(key, r.clone());
+        Ok(r)
     }
     fn park(&mut self, toks: &[u32]) {
         let t = Instant::now();
@@ -863,7 +955,9 @@ pub fn main(a: &[String]) {
             crate::up::lock(true);
             let m = crate::model::Model::open(&p, ctx);
             let s = crate::model::snap::Snaps::new(&p, &m);
-            Box::new(Ink(m, vec![], s))
+            let v = std::path::Path::new(&p).with_file_name(crate::up::MMPROJ);
+            let v = v.exists().then(|| Vis::open(v.to_str().unwrap()));
+            Box::new(Ink(m, vec![], s, v, HashMap::new()))
         })
     };
     let lm = Box::new(Lazy(Some(load()), load));
