@@ -16,7 +16,7 @@ func copy(_ s: String) {
             Menu(m: m)
         } label: {
             Image(nsImage: leaf(m.h.map { $0.loaded || $0.busy == true }
-                                == true ? 1 : 0.35))
+                                == true))
         }
         .menuBarExtraStyle(.menu)
     }

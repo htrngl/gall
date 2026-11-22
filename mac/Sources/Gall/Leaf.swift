@@ -32,11 +32,10 @@ func path(_ d: String) -> NSBezierPath {
     return b
 }
 
-func leaf(_ alpha: Double) -> NSImage {
+// filled while the model is loaded or answering, else in outline; the
+// midrib is cut out of the filled leaf
+func leaf(_ on: Bool) -> NSImage {
     let i = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
-        let g = NSGraphicsContext.current!.cgContext
-        g.setAlpha(alpha) // dims the whole, with no darker crossings
-        g.beginTransparencyLayer(auxiliaryInfo: nil)
         let t = NSAffineTransform()
         t.translateX(by: 9, yBy: 9)
         t.scale(by: 1.3)
@@ -44,11 +43,18 @@ func leaf(_ alpha: Double) -> NSImage {
         t.rotate(byDegrees: 45)
         t.translateX(by: -9, yBy: -9)
         t.concat()
-        let b = path(outline + " M 9 16.6 L 9 4")
-        (b.lineWidth, b.lineCapStyle, b.lineJoinStyle) = (0.7, .round, .round)
+        let line = { (d: String, w: Double) in
+            let b = path(d)
+            (b.lineWidth, b.lineCapStyle, b.lineJoinStyle) = (w, .round, .round)
+            return b
+        }
         NSColor.black.set()
-        b.stroke()
-        g.endTransparencyLayer()
+        line(outline + " M 9 16.6 L 9 13", 0.7).stroke()
+        if on {
+            path(outline).fill()
+            NSGraphicsContext.current?.compositingOperation = .clear
+        }
+        line("M 9 13 L 9 4", on ? 0.5 : 0.7).stroke()
         return true
     }
     i.isTemplate = true
