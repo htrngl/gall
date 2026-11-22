@@ -29,7 +29,12 @@ The app runs its bundled `gall` (`up`, `down`, `model`) and reads
 `target/Gall.app`. It signs with `$GALL_SIGN` (ad hoc without it). With
 `$GALL_NOTARY`, a `notarytool` keychain profile name, it also makes and
 notarizes a dmg. The hardened runtime needs no entitlement for the Metal
-runtime compile, so `mac/gall.entitlements` is empty.
+runtime compile, so `mac/gall.entitlements` is empty. The Swift binary is
+`Contents/MacOS/GallMenu`, beside `Contents/MacOS/gall`: on a
+case-insensitive disk `Gall` and `gall` are one file. The icons are drawn
+from one outline: `mac/Sources/Gall/Leaf.swift` (menu bar) and
+`mac/leaf.svg` (`mac/AppIcon.icns`, made with `qlmanage`, `sips` and
+`iconutil`).
 
 ## Scope
 
