@@ -2,6 +2,7 @@
 //   let mv = Mv::new(&gpu, "");
 //   mv.dense(e, ty, w, x, y, n_in, n_out)         y = W x
 //   mv.row(e, ty, w, i, y, n_in)                  y = row i of W
+//   mv.row_id(e, ty, w, ids, y, n_in)             y = row ids[0] of W
 //   mv.experts_up(e, ty, w, ids, x, y, n_in, n_out)    y[k] = W[ids[k]] x
 //   mv.experts_down(e, ty, w, ids, x, y, n_in, n_out)  y = sum W[ids[k]] x[k]
 // w, x, y, ids are (buffer, byte offset); x and y are f32, ids NE u32.
@@ -87,9 +88,19 @@ impl Mv {
     }
 
     pub fn row(&self, e: &Enc, ty: u32, w: B, i: usize, y: B, n_in: usize) {
+        let w = (w.0, w.1 + i * (n_in / blk(ty).0 * blk(ty).1));
+        self.rw(e, ty, w, None, y, n_in);
+    }
+
+    // row ids[0] of W
+    pub fn row_id(&self, e: &Enc, ty: u32, w: B, ids: B, y: B, n_in: usize) {
+        self.rw(e, ty, w, Some(ids), y, n_in);
+    }
+
+    fn rw(&self, e: &Enc, ty: u32, w: B, ids: Option<B>, y: B, n_in: usize) {
         let rb = n_in / blk(ty).0 * blk(ty).1;
-        let p = P(n_in as u32, 1, rb as u32, 0);
-        let b = [(w.0, w.1 + i * rb), y, y];
+        let p = P(n_in as u32, 1, rb as u32, ids.is_some() as u32);
+        let b = [w, y, y, ids.unwrap_or(y)];
         call(e, &self.p[&("row", ty)].0, &p, &b, [n_in.div_ceil(32), 1, 1], 32);
     }
 }
