@@ -463,24 +463,25 @@ fn prompt(r: &J, eff: &J) -> Result<Prompt, String> {
         }
         for tc in calls {
             let f = &tc["function"];
-            let bad = "tool call arguments must be an object";
             let n = f["name"].s().ok_or("tool call needs a function name")?;
             let args = match &f["arguments"] {
-                J::Str(s) => J::parse(s.as_bytes()).ok_or(bad)?,
-                a => a.clone(),
+                J::Str(s) => J::parse(s.as_bytes()),
+                a => Some(a.clone()),
             };
-            let J::Obj(mut kv) = args.or(obj![]) else { return Err(bad.into()) };
-            kv.sort_by(|a, b| a.0.cmp(&b.0));
-            let kv: Vec<_> = kv
-                .iter()
-                .map(|(k, v)| format!("{}:{v}", J::from(k.as_str())))
-                .collect();
-            o += &format!(
-                "<|message_model|>{n}<|content_invoke_tool_json|>\
-                 {{\"name\":{},\"args\":{{{}}}}}{END}",
-                J::from(n),
-                kv.join(",")
-            );
+            let body = match (args.map(|a| a.or(obj![])), &f["arguments"]) {
+                (Some(J::Obj(mut kv)), _) => {
+                    kv.sort_by(|a, b| a.0.cmp(&b.0));
+                    let kv: Vec<_> = kv
+                        .iter()
+                        .map(|(k, v)| format!("{}:{v}", J::from(k.as_str())))
+                        .collect();
+                    format!("{{\"name\":{},\"args\":{{{}}}}}", J::from(n), kv.join(","))
+                }
+                // a call the model wrote badly comes back as it wrote it
+                (_, J::Str(s)) => s.clone(),
+                (_, a) => a.to_string(),
+            };
+            o += &format!("<|message_model|>{n}<|content_invoke_tool_json|>{body}{END}");
         }
         if asst {
             o += "<|content_model_end_sampling|>";
