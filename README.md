@@ -19,7 +19,7 @@ and libc. It does not use ggml or MLX.
 
 ```sh
 cargo install --git https://github.com/ltrgoddard/gall
-gall up          # Downloads the model (11.7 GB) on first use; starts the server on port 9940
+gall up          # Downloads the model (12.3 GB) on first use; starts the server on port 9940
 gall test        # Checks 64 greedy tokens against a llama.cpp reference
 gall down
 ```
@@ -37,11 +37,18 @@ model path.
 The server provides an OpenAI-compatible chat API at
 `http://127.0.0.1:9940/v1`. It supports these endpoints:
 
-- `/v1/chat/completions`, with streaming, tools, and reasoning.
+- `/v1/chat/completions`, with streaming, tools, reasoning, and images.
 - `/v1/models`.
 - `/health`.
 
 Configure an OpenAI-compatible client to use the server's base URL.
+Send an image as an `image_url` content part in a user or tool message.
+The URL can be a `data:` URL or an http URL, in any format that ImageIO
+reads. Gall's vision encoder reads `mmproj-F16.gguf` from the model's
+directory; `gall up` downloads that file (0.6 GB). An image uses one token
+for each 40 x 40 pixels. Images above 1,024 tokens (`GALL_IMAGE_TOKENS`)
+are scaled down.
+
 To require authentication, use `gall serve <gguf> --api-key-file F`.
 Every request except `/health` must supply the key from `F` in the
 `Authorization: Bearer KEY` header.
@@ -107,6 +114,7 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
 - `src/pf*`: Batched prefill.
 - `src/tok.rs`, `serve.rs`, `snap.rs`, `up.rs`: Tokenizer, chat template,
   server, prefix snapshots, and server lifecycle commands.
+- `src/vis.rs`: Image decoding (ImageIO) and the vision encoder (Accelerate).
 - `src/dr*`: The dspark drafter. See the limitations below.
 - [Engine brief](docs/ENGINE.md) and [drafter notes](docs/DRAFT.md).
 - `tools/`: Tools for reference dumps from llama.cpp.
@@ -130,8 +138,12 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
   The drafter needs expert kernels that dequantize weights once per batch.
 - Prefill uses half-precision tiles, as llama.cpp does. The `HT` setting in
   `pfm.metal` selects float precision at approximately 0.8 times the speed.
-- Unsupported features include grammar constraints, `response_format`, image
-  support, concurrent requests, and drafting in the server.
+- The vision encoder runs on the CPU. A 640 x 488 image (208 tokens) takes
+  3.3 s. Its output is within 2.1e-3 (relative) of llama.cpp's
+  (`gall vis`, `tools/imgref.cpp`). The server does not store a prefix
+  snapshot for a prompt that contains an image.
+- Unsupported features include grammar constraints, `response_format`,
+  concurrent requests, and drafting in the server.
 - A proposed 4-bit attention requantization has a projected cost of
   3.7 ms per token. It requires the 53 GB original model and a quality check.
 
