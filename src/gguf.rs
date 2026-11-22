@@ -1,6 +1,6 @@
 // gguf reader: mmap the file, index kv and tensors. nothing is copied.
 //   let g = gguf::open(path);
-//   g.u("inkling2.embedding_length"), g.f(..), g.s(..), g.nums(..),
+//   g.u("inkling2.embedding_length"), g.f(..), g.nums(..),
 //   g.strs("tokenizer.ggml.tokens") -> iterator of &[u8]
 //   g.t["blk.0.attn_q.weight"] -> Tensor { dims, ty, off, len }
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ pub enum Val {
     U(u64),
     I(i64),
     F(f64),
-    S(&'static [u8]),
+    S,
     A(u32, usize, &'static [u8]), // item type, count, raw items
 }
 
@@ -84,7 +84,10 @@ impl Cur {
             11 => Val::I(self.u(8) as i64),
             6 => Val::F(f32::from_bits(self.u(4) as u32) as f64),
             12 => Val::F(f64::from_bits(self.u(8))),
-            8 => Val::S(self.s()),
+            8 => {
+                self.s();
+                Val::S
+            }
             9 => {
                 let (ty, n) = (self.u(4) as u32, self.u(8) as usize);
                 let a = self.1;
@@ -156,12 +159,6 @@ impl Gguf {
     }
     pub fn u(&self, k: &str) -> usize {
         self.f(k) as usize
-    }
-    pub fn s(&self, k: &str) -> &'static str {
-        match self.kv[k] {
-            Val::S(s) => unsafe { std::str::from_utf8_unchecked(s) },
-            _ => panic!("gguf: {k} is not a string"),
-        }
     }
     // a numeric array (or a scalar, as one item)
     pub fn nums(&self, k: &str) -> Vec<f64> {

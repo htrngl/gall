@@ -6,9 +6,10 @@ Copyright (c) 2023-2026 The ggml authors:
 - src/mv.metal, src/mv.rs: the dequantization formulas of the GGUF weight
   formats (ggml-quants.c, ggml-metal.metal). the mat-vec loops are gall's.
 - src/ucat.bin: unicode categories generated from unicode-data.cpp.
-- src/model.rs, ops.metal, pf*, dr*, tok.rs, serve.rs: written for gall;
-  they implement the model, tokenizer and chat template as llama.cpp
-  defines them (src/models/inkling2.cpp and others).
+- src/model.rs, ops.metal, pf*, dr*, vis.*, tok.rs, serve.rs: written for
+  gall; they implement the model, drafter, vision encoder, tokenizer and
+  chat template as llama.cpp defines them (src/models/inkling2.cpp,
+  tools/mtmd/models/inkling2v.cpp and others).
 - llama/patches: patches to llama.cpp itself, under its license.
 
 the MIT permission notice in LICENSE applies to that material as well.

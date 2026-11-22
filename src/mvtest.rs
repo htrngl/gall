@@ -1,21 +1,14 @@
-// mvtest [filter]: every weight kernel against the scalar reference,
+// gall mvtest [filter]: every weight kernel against the scalar reference,
 // with its read rate. env: M (gguf), DEFS (extra #defines, ';' = newline).
-// mvtest synth | rq [name]: attention in other formats (timing), and the
+// gall mvtest synth | rq [name]: attention in other formats (timing), and the
 // requantized tensors of rq.rs (error, kernels).
-#[path = "../gguf.rs"]
-mod gguf;
-#[path = "../gpu.rs"]
-mod gpu;
-#[path = "../mv.rs"]
-mod mv;
-#[path = "../rq.rs"]
-mod rq;
-use gpu::*;
+use crate::gpu::*;
+use crate::{gguf, mv, rq};
 use std::collections::BTreeMap;
 
-fn main() {
+pub fn main() {
     let g = gguf::open(&std::env::var("M").expect("M=model.gguf"));
-    let filt = std::env::args().nth(1).unwrap_or_default();
+    let filt = std::env::args().nth(2).unwrap_or_default();
     let defs = std::env::var("DEFS").unwrap_or_default().replace(';', "\n") + "\n";
     let mut gpu = Gpu::new();
     gpu.map(&g);
@@ -168,7 +161,7 @@ fn main() {
     // (rq.rs). per bit width: relative error, worst error of the mat-vec
     // and row kernels against the scalar reference, ms of one mat-vec
     if filt == "rq" {
-        let f = std::env::args().nth(2).unwrap_or_default();
+        let f = std::env::args().nth(3).unwrap_or_default();
         let mut ts: Vec<_> = g.t.values().filter(|t| t.name.contains(&f)).collect();
         ts.retain(|t| t.ty == 8 || t.name == "output.weight");
         ts.sort_by_key(|t| t.off);

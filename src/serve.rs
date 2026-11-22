@@ -1231,11 +1231,6 @@ pub fn main(a: &[String]) {
         let r = J::parse(&std::fs::read(&a[2]).unwrap()).unwrap();
         return print!("{}", prompt(&r, &"none".into()).unwrap().0);
     }
-    if a.get(1).is_some_and(|x| x == "--fits") {
-        // gall serve <gguf> --fits <schema json> <text>: the fit and its end
-        let (s, mut i) = (J::parse(a[2].as_bytes()).unwrap(), 0);
-        return println!("{:?} {i}", fits(a[3].as_bytes(), &mut i, &s));
-    }
     let ctx: usize = opt("--ctx", "102400").parse().unwrap();
     let say = "<|message_model|><|content_text|>hello from gall\
                <|end_message|><|content_model_end_sampling|>";

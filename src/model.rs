@@ -32,7 +32,6 @@ const AO: usize = 8 * N; // attention output after wo
 const D: usize = 9 * N; // expert output
 const BK: usize = 10 * N; // normalized block stack, 5 deep
 const VR: usize = 15 * N; // mixed inputs before the norm, 3
-const TMP: usize = 18 * N; // control inputs, 3 x 2N
 const Q: usize = 24 * N; // q, gate, attention out: 3072 each
 const G: usize = Q + 3072;
 const O: usize = G + 3072;

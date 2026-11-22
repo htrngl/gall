@@ -5,6 +5,7 @@
 //   it writes a snapshot)
 // gall pp MODEL TOKENS [-n all] [-ub 512] [-c 4096] [--cmp] [--ref REFDIR]
 // gall mmb
+// gall mvtest [FILTER | synth | rq [NAME]] (env M: the gguf; see mvtest.rs)
 // gall tok MODEL FILE
 // gall vis MMPROJ IMAGE [REF.f32]
 // gall serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
@@ -14,6 +15,7 @@ mod gguf;
 mod gpu;
 mod model;
 mod mv;
+mod mvtest;
 mod rq;
 mod serve;
 mod tok;
@@ -74,7 +76,9 @@ fn main() {
         fs::create_dir_all(&d).unwrap();
         let f = [("tokens", include_str!("../tests/short/tokens.txt")),
             ("gen", include_str!("../tests/short/gen.txt"))];
-        f.map(|(n, s)| fs::write(d.join(n).with_extension("txt"), s).unwrap());
+        for (n, s) in f {
+            fs::write(d.join(n).with_extension("txt"), s).unwrap();
+        }
         a = ["gall", "check", &up::model(), d.to_str().unwrap()]
             .map(String::from).into();
     }
@@ -84,6 +88,7 @@ fn main() {
         "run" if a.iter().any(|x| x == "--draft") => return dr::run(&a[2..]),
         "mmb" => return model::pf::bench(),
         "tok" => return tok::main(&a[2..]),
+        "mvtest" => return mvtest::main(),
         "vis" => return vis::main(&a[2..]),
         "serve" => return serve::main(&a[2..]),
         _ => {}
