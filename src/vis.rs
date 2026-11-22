@@ -81,7 +81,7 @@ pub fn decode(b: &[u8], max: usize) -> Option<(usize, usize, Vec<u8>)> {
 pub struct Vis {
     g: Gguf,
     gpu: Gpu,
-    k: [Pipe; 5],
+    k: [Pipe; 6],
     mm: Pipe,
     s: Buf,         // per layer: ln1 w b, ln2 w b, ls1, ls2, biases
     pub max: usize, // tokens per image
@@ -89,6 +89,7 @@ pub struct Vis {
 
 const VS: usize = 14 * 1024; // floats per position
 const SL: usize = 15 * 1024; // small floats per layer
+const QC: usize = 256; // queries per attention pass
 
 // y (m x n) = a (m x k, row stride la) b^T (n x k, row stride lb)
 fn mm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
@@ -105,7 +106,7 @@ impl Vis {
         gpu.map(&g);
         let max = std::env::var("GALL_IMAGE_TOKENS").ok();
         let d = format!("#define VS {VS}\n");
-        let k = ["vln", "vqkv", "vatt", "vres", "vgelu"];
+        let k = ["vln", "vqkv", "vsc", "vres", "vgelu", "vwv"];
         let k = k.map(|k| gpu.pipe(include_str!("vis.metal"), &d, k));
         let (mm, s) = (gpu.pipe(crate::model::pf::MM, "", "mm_f16"),
             gpu.buf(4 * SL * g.u("clip.vision.block_count")));
@@ -207,8 +208,8 @@ impl Vis {
         });
         let tl: Vec<u32> = tiles(n).chain(tiles(nt)).collect();
         let (g, t0) = (&self.gpu, n.div_ceil(32));
-        let (a, tb, rb) = (g.buf(4 * VS * (np + 8)), g.buf(4 * tl.len()),
-            g.buf(8 * 32 * n));
+        let (a, tb, rb, sb) = (g.buf(4 * VS * (np + 8)), g.buf(4 * tl.len()),
+            g.buf(8 * 32 * n), g.buf(4 * QC * 16 * n));
         slice::<u32>(&tb).copy_from_slice(&tl);
         let av = slice::<f32>(&a);
         for (i, r) in x.chunks(E).enumerate() {
@@ -232,9 +233,9 @@ impl Vis {
             let b = [g.w(w), (&a, 0), (&a, 0), (&tb, 0), (&tb, 12 * tl.0)];
             call(e, &self.mm, &p, &b, [no / 64, tl.1, 1], 128)
         };
-        let k = |e: &Enc, k: usize, gr: [usize; 2], p: [usize; 5]| {
-            let b = [(&a, 0), (&self.s, 0), (&rb, 0)];
-            let gr = [gr[0].div_ceil(32), gr[1], 1];
+        let k = |e: &Enc, k: usize, gr: [usize; 3], p: [usize; 5]| {
+            let b = [(&a, 0), (&self.s, 0), (&rb, 0), (&sb, 0)];
+            let gr = [gr[0].div_ceil(32), gr[1], gr[2]];
             call(e, &self.k[k], &p.map(|v| v as u32), &b, gr, 32)
         };
         // fields of a position: x, y, q k v, o, two of 4096
@@ -242,19 +243,23 @@ impl Vis {
         let all = (0, t0);
         g.run(|e| for l in 0..self.g.u("clip.vision.block_count") {
             let (w, s) = (|s: &str| format!("v.blk.{l}.{s}.weight"), l * SL);
-            k(e, 0, [n, 1], [n, 0, y, s, s + E]);
+            k(e, 0, [n, 1, 1], [n, 0, y, s, s + E]);
             mm(e, &w("attn_q"), y, q, all);
             mm(e, &w("attn_k"), y, q + E, all);
             mm(e, &w("attn_v"), y, q + 2 * E, all);
-            k(e, 1, [n, 16], [n, q, 0, 0, s + 6 * E]);
-            k(e, 2, [n, 16], [n, q, y, 0, 0]);
+            k(e, 1, [n, 16, 1], [n, q, 0, 0, s + 6 * E]);
+            for q0 in (0..n).step_by(QC) {
+                let nq = QC.min(n - q0);
+                k(e, 2, [nq, 16, 1], [n, q, 0, q0, 0]);
+                k(e, 5, [nq, 16, 4], [n, q, y, q0, 0]);
+            }
             mm(e, &w("attn_out"), y, o, all);
-            k(e, 3, [n, 1], [n, 0, o, s + 4 * E, s + 9 * E]);
-            k(e, 0, [n, 1], [n, 0, y, s + 2 * E, s + 3 * E]);
+            k(e, 3, [n, 1, 1], [n, 0, o, s + 4 * E, s + 9 * E]);
+            k(e, 0, [n, 1, 1], [n, 0, y, s + 2 * E, s + 3 * E]);
             mm(e, &w("ffn_up"), y, f, all);
-            k(e, 4, [n, 64], [n, f, 0, 1, s + 11 * E]);
+            k(e, 4, [n, 64, 1], [n, f, 0, 1, s + 11 * E]);
             mm(e, &w("ffn_down"), f, o, all);
-            k(e, 3, [n, 1], [n, 0, o, s + 5 * E, s + 10 * E]);
+            k(e, 3, [n, 1, 1], [n, 0, o, s + 5 * E, s + 10 * E]);
         });
         // 2x2 patches side by side (row-major inside the square), projector
         let (tw, x) = (gw / 2, av[..n * VS].to_vec());
@@ -265,7 +270,7 @@ impl Vis {
         }
         g.run(|e| {
             mm(e, "mm.1.weight", f, f2, (t0, nt.div_ceil(32)));
-            k(e, 4, [nt, 64], [nt, f2, 0, 0, 0]);
+            k(e, 4, [nt, 64, 1], [nt, f2, 0, 0, 0]);
             mm(e, "mm.2.weight", f2, f, (t0, nt.div_ceil(32)));
         });
         (0..nt).flat_map(|t| av[t * VS + f..][..2304].iter().copied()).collect()

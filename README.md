@@ -139,8 +139,7 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
 - Prefill uses half-precision tiles, as llama.cpp does. The `HT` setting in
   `pfm.metal` selects float precision at approximately 0.8 times the speed.
 - The vision encoder runs on the GPU. A 640 x 488 image (208 tokens) takes
-  1.2 s; a 960 x 1280 image (768 tokens) takes 12.6 s, most of it in
-  attention. Its output is within 2.9e-3 (relative) of llama.cpp's
+  0.8 s and a 960 x 1280 image (768 tokens) takes 4.2 s. Its output is within 2.9e-3 (relative) of llama.cpp's
   (`gall vis`, `tools/imgref.cpp`). The server does not store a prefix
   snapshot for a prompt that contains an image.
 - Unsupported features include grammar constraints, `response_format`,

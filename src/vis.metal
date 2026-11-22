@@ -41,42 +41,65 @@ kernel void vqkv(constant VP &p, device float *a [[buffer(1)]],
     }
 }
 
-// head tg.y of 32 queries over the n keys: y = softmax(q k / 8) v, with a
-// running maximum. q at x, k and v after it. the threadgroup loads 32
-// keys at a time, a key per thread, and every query reads them there
-kernel void vatt(constant VP &p, device float *a [[buffer(1)]],
+// attention in two kernels, so that a thread keeps few registers. a
+// threadgroup is 32 queries from query w on, of head tg.y; it loads 32
+// keys at a time, a key per thread, and every query reads them there.
+// scores q k / 8 of the n keys, to sc; q at x, k after it
+kernel void vsc(constant VP &p, device const float *a [[buffer(1)]],
+        device float *sc [[buffer(4)]],
         uint2 tg [[threadgroup_position_in_grid]],
         ushort t [[thread_index_in_threadgroup]]) {
-    threadgroup float4 sk[512], sv[512];
-    uint qi = tg.x*32 + t, h = p.x + 64*tg.y;
+    threadgroup float4 sk[512];
+    uint qi = p.w + tg.x*32 + t, h = p.x + 64*tg.y;
     F4 q = (F4)(a + (ulong)min(qi, p.n - 1)*VS + h);
-    float4 qv[16], acc[16];
-    for (uint i = 0; i < 16; i++) qv[i] = float4(q[i])*0.125f, acc[i] = 0;
-    float m = -1e30f, sum = 0;
+    device float *o = sc + ((ulong)(tg.x*32 + t)*16 + tg.y)*p.n;
+    float4 qv[16];
+    for (uint i = 0; i < 16; i++) qv[i] = float4(q[i])*0.125f;
     for (uint j = 0; j < p.n; j += 32) {
         F4 k = (F4)(a + (ulong)min(j + t, p.n - 1)*VS + h + 1024);
-        for (uint i = 0; i < 16; i++)
-            sk[16*t + i] = k[i], sv[16*t + i] = k[256 + i];
+        for (uint i = 0; i < 16; i++) sk[16*t + i] = k[i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint c = 0; c < min(32u, p.n - j); c++) {
-            float4 d4 = 0;
-            for (uint i = 0; i < 16; i++) d4 += qv[i]*sk[16*c + i];
-            float d = d4.x + d4.y + d4.z + d4.w;
+        for (uint c = 0; c < min(32u, p.n - j) && qi < p.n; c++) {
+            float4 d = 0;
+            for (uint i = 0; i < 16; i++) d += qv[i]*sk[16*c + i];
+            o[j + c] = d.x + d.y + d.z + d.w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// y = softmax(sc) v for 16 dims (tg.z) of the head, with a running
+// maximum; v is 2048 past x
+kernel void vwv(constant VP &p, device float *a [[buffer(1)]],
+        device const float *sc [[buffer(4)]],
+        uint3 tg [[threadgroup_position_in_grid]],
+        ushort t [[thread_index_in_threadgroup]]) {
+    threadgroup float4 sv[128];
+    uint qi = p.w + tg.x*32 + t, h = 64*tg.y + 16*tg.z;
+    device const float *s = sc + ((ulong)(tg.x*32 + t)*16 + tg.y)*p.n;
+    float4 acc[4] = {0, 0, 0, 0};
+    float m = -1e30f, sum = 0;
+    for (uint j = 0; j < p.n; j += 32) {
+        F4 v = (F4)(a + (ulong)min(j + t, p.n - 1)*VS + p.x + 2048 + h);
+        for (uint i = 0; i < 4; i++) sv[4*t + i] = v[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint c = 0; c < min(32u, p.n - j) && qi < p.n; c++) {
+            float d = s[j + c];
             if (d > m) {
                 float f = exp(m - d);
                 sum *= f, m = d;
-                for (uint i = 0; i < 16; i++) acc[i] *= f;
+                for (uint i = 0; i < 4; i++) acc[i] *= f;
             }
             float w = exp(d - m);
             sum += w;
-            for (uint i = 0; i < 16; i++) acc[i] += w*sv[16*c + i];
+            for (uint i = 0; i < 4; i++) acc[i] += w*sv[4*c + i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (qi >= p.n) return;
     device packed_float4 *y =
-        (device packed_float4 *)(a + (ulong)qi*VS + p.y + 64*tg.y);
-    for (uint i = 0; i < 16; i++) y[i] = acc[i]/sum;
+        (device packed_float4 *)(a + (ulong)qi*VS + p.y + h);
+    for (uint i = 0; i < 4; i++) y[i] = acc[i]/sum;
 }
 
 // x += (y + s[b..]) * s[w..]
