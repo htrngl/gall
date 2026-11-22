@@ -30,10 +30,19 @@ been tested.
 1. Download `Gall.dmg` from the
    [releases page](https://github.com/ltrgoddard/gall/releases).
 2. Drag `Gall.app` to Applications and open it.
-3. Let Gall download the model files (12.7 GB). Progress appears in the
+3. The current release is not notarized by Apple, so macOS blocks the
+   first launch. Select **Done**, then open **System Settings** >
+   **Privacy & Security**, find the message about Gall and select
+   **Open Anyway**, then confirm. You only do this once.
+4. Let Gall download the model files (12.7 GB). Progress appears in the
    menu bar.
-4. Select **Copy endpoint** and paste it into a client that supports an
+5. Select **Copy endpoint** and paste it into a client that supports an
    OpenAI-compatible API. Use `inkling-2-mini` as the model name.
+
+To skip step 3 from a terminal, run
+`xattr -dr com.apple.quarantine /Applications/Gall.app` before you open
+the app. Compare the download with `Gall.dmg.sha256` from the same release
+if you want to check it.
 
 The endpoint is `http://127.0.0.1:9940/v1`. Gall supplies the model server;
 you use your own chat or coding client. **Ready** and **Unloaded** both

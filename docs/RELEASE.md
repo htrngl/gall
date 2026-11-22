@@ -53,6 +53,16 @@ cancelled download followed by a retry, app launch, a chat client
 connection, Instant unload, quit, and start at login. Check the oldest
 macOS version claimed by the release before describing it as tested.
 
+## Ad hoc release
+
+Without a Developer ID, publish the ad hoc build. Gatekeeper blocks the
+first launch of a downloaded copy; the README tells users how to allow it.
+
+```sh
+git tag v0.1.0 && git push origin main v0.1.0
+gh release create v0.1.0 target/Gall.dmg target/Gall.dmg.sha256
+```
+
 ## Signed distribution
 
 Set the version in `Cargo.toml`; the build uses it for both bundle version
