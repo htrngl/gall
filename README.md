@@ -1,67 +1,91 @@
-# gall
+# Gall
 
-A from-scratch inference engine for Thinking Machines' Inkling-2-Mini (26B
-MoE, 3.4B active, 48 layer visits per token) on Apple silicon. A Rust host
-and Metal kernels read the unsloth UD-IQ3_XXS GGUF in place. It does not use
-ggml or MLX; its four dependencies are Metal bindings and libc.
+Gall is an inference engine for Thinking Machines' Inkling-2-Mini on Apple
+silicon. The mixture-of-experts (MoE) model has 26 billion parameters,
+3.4 billion active parameters, and 48 layer visits per token.
 
-Iron gall ink is made from oak apples and iron.
+The engine uses a Rust host and Metal kernels to read the Unsloth
+UD-IQ3_XXS GGUF file in place. Its four dependencies provide Metal bindings
+and libc. It does not use ggml or MLX.
 
 ## Requirements
 
-- An Apple silicon Mac with 24GB of memory. gall was written and measured on
-  one machine, an M2 MacBook Air (10-core GPU). Other machines are untested.
+- An Apple silicon Mac with 24 GB of memory. Development and measurements
+  used an M2 MacBook Air with a 10-core GPU. Other machines are untested.
 - Rust (`cargo`) and `curl`.
-- 12GB of disk for the model.
+- 12 GB of disk space for the model.
 
 ## Install and run
 
 ```sh
 cargo install --git https://github.com/ltrgoddard/gall
-gall up          # first run fetches the model (11.7GB); server on port 9940
-gall test        # 64 greedy tokens against a llama.cpp reference
+gall up          # Downloads the model (11.7 GB) on first use; starts the server on port 9940
+gall test        # Checks 64 greedy tokens against a llama.cpp reference
 gall down
 ```
 
-- `gall up [ctx] [serve flags]` starts the server in the background with a
-  102,400-token context by default. It uses a GGUF in the Hugging Face cache if one is
-  there, else it downloads to `~/.cache/gall`. `GALL_MODEL=path` overrides.
-- `gall log` follows the request log. `gall model` prints the model path.
-- The server speaks the OpenAI chat API at `http://127.0.0.1:9940/v1`:
-  `/v1/chat/completions` (streaming, tools, reasoning), `/v1/models`,
-  `/health`. Point any OpenAI-compatible client at it.
-- `gall serve <gguf> --api-key-file F` asks every request but `/health` for
-  the key in `F` (`authorization: Bearer KEY`).
-- `gall serve <gguf> --idle-unload N` frees the model's memory after `N`
-  seconds without a request. It first stores the conversation as a prefix
-  snapshot. The next chat request loads the model again (0.06 s with the
-  file in the page cache) and continues from the snapshot. `/health` shows
-  `"loaded"`. The lock is given back while the model is unloaded.
-- Only one model fits on the GPU. `gall` takes a lock (`/tmp/gall.lock`)
-  while a model is loaded. A second server, or `./wd`, waits for it; with
-  `--idle-unload`, the server and a measurement take turns. It exits if
-  memory runs short. Unload other local models first.
-- The prefix of each conversation (system prompt and tools) is stored in
-  `~/.cache/gall`, so a new conversation with the same prefix starts in
-  about a second.
+`gall up [ctx] [serve flags]` starts the server in the background.
+The default context is 102,400 tokens. Gall uses a GGUF file from the
+Hugging Face cache if available. Otherwise, it downloads the model to
+`~/.cache/gall`. Set `GALL_MODEL=path` to use a different model file.
 
-## Measured
+Use `gall log` to follow the request log. Use `gall model` to print the
+model path.
 
-2026-11-21, this machine, one run each. the air has no fan: after about 2.5
-minutes of load the figures drop by roughly 10%.
+### API
 
-| | llama.cpp (`llama/`) | gall |
+The server provides an OpenAI-compatible chat API at
+`http://127.0.0.1:9940/v1`. It supports these endpoints:
+
+- `/v1/chat/completions`, with streaming, tools, and reasoning.
+- `/v1/models`.
+- `/health`.
+
+Configure an OpenAI-compatible client to use the server's base URL.
+To require authentication, use `gall serve <gguf> --api-key-file F`.
+Every request except `/health` must supply the key from `F` in the
+`Authorization: Bearer KEY` header.
+
+### Memory and prefix cache
+
+`gall serve <gguf> --idle-unload N` releases model memory after `N` seconds
+without a request. Before unloading, the server saves the conversation as
+a prefix snapshot. The next chat request reloads the model and continues
+from that snapshot. The measured reload time is 0.06 seconds when the file
+is in the page cache. The `/health` response includes a `"loaded"` field.
+
+Only one model fits in the tested machine's GPU memory. Gall holds
+`/tmp/gall.lock` while a model is loaded and releases the lock when it
+unloads the model. A second server or `./wd` waits for this lock.
+The `--idle-unload` option lets the server and measurement commands take
+turns. Gall exits if memory runs short. Unload other local models first.
+
+Gall stores conversation prefixes, including the system prompt and tools,
+in `~/.cache/gall`. A new conversation with the same prefix starts in
+about one second.
+
+## Measurements
+
+These results are from one run per measurement on the M2 MacBook Air
+on 21 November 2026. The MacBook Air has no fan. Throughput drops by roughly
+10% after about 2.5 minutes of load. Rates below are in tokens per second
+(t/s).
+
+| Measurement | llama.cpp (`llama/`) | Gall |
 | --- | --- | --- |
-| decode, short context | 15 t/s | 19.5 t/s cold, ~18 warm |
-| decode, 8k deep | 12.4 t/s | 17.6 t/s |
-| decode, 31.5k deep (real prompt) | not measured cleanly | 13.8-14.6 t/s |
-| prefill, 512 tokens | 121 t/s | 108-125 t/s |
-| prefill, 10.5k tokens | 89 t/s (to 8.3k) | 106 t/s |
-| new chat with a stored prefix, first token | | 0.5-1.2 s |
+| Decode, short context | 15 t/s | 19.5 t/s cold, approximately 18 t/s warm |
+| Decode, 8k context | 12.4 t/s | 17.6 t/s |
+| Decode, 31.5k context (real prompt) | No reliable measurement | 13.8–14.6 t/s |
+| Prefill, 512 tokens | 121 t/s | 108–125 t/s |
+| Prefill, 10.5k tokens | 89 t/s (measured to 8.3k) | 106 t/s |
+| Time to first token with a stored prefix | Not measured | 0.5–1.2 s |
 
-against llama.cpp reference dumps, teacher-forced: 0 greedy mismatches over
-64 steps, kl mean 1.05e-4 (`gall check $M ref/short -n 64`). a code planted
-400 tokens into a 31.5k-token prompt is retrieved at 100k context.
+A teacher-forced comparison against llama.cpp reference dumps found no
+greedy mismatches across 64 steps. The mean Kullback–Leibler (KL) divergence
+was 1.05e-4 (`gall check $M ref/short -n 64`).
+
+A retrieval test recovered a
+code placed 400 tokens into a 31.5k-token prompt with a 100k context.
 
 ## Development
 
@@ -70,43 +94,48 @@ cargo build --release
 ./wd target/release/gall check $(gall model) ref/short -n 64
 ```
 
-`./wd` runs a command under the same lock with a memory watchdog. `ref/` holds
-reference dumps made with `tools/refdump` against the llama.cpp build in
-`llama/` (see `tools/README.md`). Other commands (`run`, `pp`, `tok`, `dr`,
-`mvtest`) are listed at the top of `src/main.rs`.
+`./wd` runs a command under the same lock and monitors memory use.
+The `ref/` directory holds reference dumps from `tools/refdump`, which uses
+the llama.cpp build in `llama/`. See [Reference tools](tools/README.md).
+See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
 
-## Layout
+## Repository layout
 
-- `src/gguf.rs`, `gpu.rs`: GGUF mmap, metal host.
-- `src/mv.*`, `grids.metal`: mat-vec kernels for the 12 weight formats.
-- `src/model.rs`, `ops.metal`: single-token decode, KV rings, rollback.
-- `src/pf*`: batched prefill.
-- `src/tok.rs`, `serve.rs`, `snap.rs`, `up.rs`: tokenizer, chat template and
-  server, prefix snapshots, start and stop.
-- `src/dr*`: the dspark drafter (correct, not yet faster; see below).
-- `docs/ENGINE.md`: the original brief. `docs/DRAFT.md`: drafter notes.
-- `tools/`: reference dumps from llama.cpp.
-- `llama/`: the patched llama.cpp build used as reference and its notes
-  (`llama/PLAN.md`); `llama/build` installs it for the llama app.
+- `src/gguf.rs`, `gpu.rs`: GGUF memory mapping and the Metal host.
+- `src/mv.*`, `grids.metal`: Matrix-vector kernels for the 12 weight formats.
+- `src/model.rs`, `ops.metal`: Single-token decode, key-value (KV) cache rings, and rollback.
+- `src/pf*`: Batched prefill.
+- `src/tok.rs`, `serve.rs`, `snap.rs`, `up.rs`: Tokenizer, chat template,
+  server, prefix snapshots, and server lifecycle commands.
+- `src/dr*`: The dspark drafter. See the limitations below.
+- [Engine brief](docs/ENGINE.md) and [drafter notes](docs/DRAFT.md).
+- `tools/`: Tools for reference dumps from llama.cpp.
+- `llama/`: The patched llama.cpp reference build and its
+  [notes](llama/PLAN.md). `llama/build` installs it for the llama app.
 
-## State
+## Implementation status and limitations
 
-- weights are 45 of 51 ms per token. every format costs 7-12 ps per element;
-  two tuning passes on the expert gate-up kernels found nothing more.
-- depth is bound by the KV read (81 GB/s): 56.7 ms at 8k, 67 at 32k, 102 at
-  100k (the last two synthetic).
-- `KV=q8` stores the full-attention caches as int8: half the cache memory at
-  100k, no faster, off by default, its prefill path untested.
-- the drafter runs and its batched verify gives the same text as greedy, but
-  a 4-row verify takes 250 ms against 52 ms per serial token, so the block
-  size stays 0. it needs dequant-once expert kernels.
-- prefill uses half-precision tiles, as llama.cpp does; `HT` in `pfm.metal`
-  switches to float at about 0.8x the speed.
-- not done: grammar and `response_format`, images, concurrent requests,
-  drafting in the server, a 4-bit attention requant (projected 3.7 ms per
-  token, needs the 53GB original and a quality check).
+- Weight processing accounts for 45 of 51 ms per token. Each format takes
+  7–12 ps per element. Two tuning passes on the expert gate-up kernels
+  produced no further improvement.
+- KV cache reads limit performance at longer contexts, at 81 GB/s.
+  Decode takes 56.7 ms at 8k, 67 ms at 32k, and 102 ms at 100k.
+  The 32k and 100k measurements use synthetic inputs.
+- `KV=q8` stores full-attention caches as int8 and halves cache memory at
+  100k context. It does not improve speed and is disabled by default.
+  Its prefill path is untested.
+- The drafter's batched verification produces the same text as greedy
+  decoding. Verification of four rows takes 250 ms, compared
+  with 52 ms per serial token. The block size remains 0.
+  The drafter needs expert kernels that dequantize weights once per batch.
+- Prefill uses half-precision tiles, as llama.cpp does. The `HT` setting in
+  `pfm.metal` selects float precision at approximately 0.8 times the speed.
+- Unsupported features include grammar constraints, `response_format`, image
+  support, concurrent requests, and drafting in the server.
+- A proposed 4-bit attention requantization has a projected cost of
+  3.7 ms per token. It requires the 53 GB original model and a quality check.
 
-## Licence
+## License
 
-MIT. Parts derive from llama.cpp and ggml; see `NOTICE`. The model has its
-own licence.
+Gall uses the MIT license. Parts derive from llama.cpp and ggml.
+See `NOTICE`. The model has a separate license.
