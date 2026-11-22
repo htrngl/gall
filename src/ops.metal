@@ -32,6 +32,30 @@ typedef const device uint *U;
 typedef device float *A;
 typedef const device float *S;
 typedef const device half *SH; // the larger small matrices, f16
+// ZR: the rows of a batched pass (dr.rs) on grid z. row z has its
+// activations p[23] floats after row 0's, its ids 16 after, position + z.
+// a conv input is in the ring before any row reads it (stor, and post
+// run twice: p[21] & 2 only stores)
+#ifdef ZR
+#define ZA a += gp.z * p[23]
+#define ZI id += gp.z * 16
+#define PZ(i) (p[i] + gp.z)
+#define NK (p[6] ? min(p[4] + gp.z, 1024u) : p[4] + gp.z)
+#define SO (p[21] & 2)
+#define ST false
+#define TAU F(24 + gp.z)
+#define KW (p[10] + (p[22] ? PZ(14) % p[22] : PZ(14)) * \
+            (p[21] & 1 ? 1088 : 2048))
+#else
+#define ZA
+#define ZI
+#define PZ(i) p[i]
+#define NK p[4]
+#define SO 0
+#define ST true
+#define TAU F(11)
+#define KW p[10]
+#endif
 
 // sum of v over a threadgroup of T; r is its scratch, one per sum
 static float red(float v, threadgroup float *r, uint sg, uint ln) {
@@ -56,11 +80,11 @@ static float4 conv(float4 x, A st, S w, uint pos, float4 d, bool store) {
 // the residual stream entering a mix, elements 4t..4t+3:
 // h = conv(a[p0]) + a[p1] (p0 = 0: no conv; p1 = 0: no residual).
 // p: 3 conv state, 4 conv w, 5 pos
-static float4 hv(U p, A a, S s, A cs, uint t, bool store) {
+static float4 hv(U p, A a, S s, A cs, uint t, uint pos, bool store) {
   float4 h = 0;
   if (p[1]) h = L(a + p[1], t);
   if (p[0])
-    h += conv(L(a + p[0], t), cs + p[3] + 4 * t, s + p[4] + 16 * t, p[5],
+    h += conv(L(a + p[0], t), cs + p[3] + 4 * t, s + p[4] + 16 * t, pos,
               float4(0), store);
   return h;
 }
@@ -71,9 +95,10 @@ static float4 hv(U p, A a, S s, A cs, uint t, bool store) {
 kernel void dots(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                  A cs [[buffer(4)]], TG) {
   threadgroup float r[NS];
+  ZA;
   uint nb = p[7], b = gp.x;
   float4 x = L(a + p[6] + b * N, t), y = L(s + p[9] + gp.y * N, t);
-  if (b >= nb) x = hv(p, a, s, cs, t, false);
+  if (b >= nb) x = hv(p, a, s, cs, t, PZ(5), false);
   float o = red(dot(x, b > nb ? x : y), r, sg, ln);
   if (!t) a[p[10] + gp.y * 8 + b] = o;
 }
@@ -86,9 +111,10 @@ kernel void dots(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // 13 x, 14.. w[3], 17 scale x
 kernel void elem(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                  A cs [[buffer(4)]], GP) {
+  ZA;
   uint nb = p[7], nq = p[8], t = gp.x * 32 + ln;
   S sc = a + p[10];
-  float4 h = hv(p, a, s, cs, t, true);
+  float4 h = hv(p, a, s, cs, t, PZ(5), ST);
   float is = rsqrt(sc[nb + 1] / N + 1e-6);
   if (p[2]) W(a + p[2], t) = h;
   W(a + p[6] + nb * N, t) = h * is;
@@ -114,6 +140,7 @@ kernel void elem(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 kernel void low(U p [[buffer(0)]], A a [[buffer(1)]],
                 SH s [[buffer(6)]], TG) {
   threadgroup float r[NS], q[NS];
+  ZA;
   float4 v = L(a + p[0] + gp.y * N, t), m = L(a + p[1] + gp.y * N, t);
   SH w = s + p[2] + gp.y * 256 * N + gp.x * 2 * N;
   bool n = gp.x > 63;
@@ -132,6 +159,7 @@ kernel void low(U p [[buffer(0)]], A a [[buffer(1)]],
 // p: 0 v, 1 msg, 2 ctl, 3 g, 4 x, 5.. w
 kernel void ctl(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                 SH sh [[buffer(6)]], GP) {
+  ZA;
   uint e = gp.x * 32 + ln;
   S g = a + p[3] + gp.y * 130;
   SH w = sh + p[2] + gp.y * 256 * N + 128 * N + e * 64;
@@ -151,6 +179,7 @@ kernel void ctl(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 kernel void rows(U p [[buffer(0)]], A a [[buffer(1)]],
                  SH s [[buffer(6)]], TG) {
   threadgroup float r[NS];
+  ZA;
   float4 x = L(a + p[gp.x < 128 ? 0 : 3], t);
   float o = red(dot(gp.x < 128 ? LH(s + p[1] + gp.x * N, t) : x, x), r, sg, ln);
   if (!t) a[p[2] + gp.x] = o;
@@ -167,6 +196,7 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                  device half *kv [[buffer(3)]], A cs [[buffer(4)]],
                  SH sh [[buffer(6)]], TG) {
   threadgroup float r[12 * NS];
+  ZA;
   uint h = gp.x, i = h * 128 + ln * 4, nx = p[16];
   bool dy = p[7] && h < 8;
   float o[12];
@@ -190,12 +220,12 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
   if (!ln) a[p[20] + h] = o[3] * is.x;
   if (!h && !ln) a[p[18]] = is.x;
   float4 x = L(a + p[0] + i, 0) * L(s + p[3] + i, 0) * is.x;
-  x *= F(11) / max(1., (sqrt(simd_sum(dot(x, x))) + 1e-6) / F(12));
-  W(a + p[0] + i, 0) = x;
+  x *= TAU / max(1., (sqrt(simd_sum(dot(x, x))) + 1e-6) / F(12));
+  if (!SO) W(a + p[0] + i, 0) = x;
   float y = ln < 16 ? a[p[2] + h * 16 + ln] * s[p[4] + h * 16 + ln] : 0;
   y *= is.x;
-  y *= F(11) / max(1., (sqrt(simd_sum(y * y)) + 1e-6) / F(13));
-  if (ln < 16) a[p[2] + h * 16 + ln] = y;
+  y *= TAU / max(1., (sqrt(simd_sum(y * y)) + 1e-6) / F(13));
+  if (ln < 16 && !SO) a[p[2] + h * 16 + ln] = y;
   if (h > 7) return;
   for (uint j = 0; j < 2; j++) {
     float4 d = 0;
@@ -203,12 +233,13 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                        o[7 + j * 4]) * is[1 + j];
     uint c = i + j * 1024;
     x = conv(L(a + p[1] + c, 0) * is[1 + j], cs + p[9] + c,
-             s + p[5 + j] + i * 4, p[14], d, true);
+             s + p[5 + j] + i * 4, PZ(14), d, SO || ST);
+    if (SO) continue;
     y = simd_sum(dot(x, x));
     x *= j ? rsqrt(y / 128 + 1e-6) : 1 / max(1., (sqrt(y) + 1e-6) / F(12));
     W(a + p[1] + c, 0) = x;
-    if (!p[21]) {
-      ((device half4 *)(kv + p[10] + c))[0] = half4(x);
+    if (!(p[21] & 1)) {
+      ((device half4 *)(kv + KW + c))[0] = half4(x);
       continue;
     }
     // q8: lanes 8b..8b+7 hold block b of 32
@@ -218,7 +249,7 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
       float mb = simd_max(ln / 8 == b ? mx : 0);
       if (ln / 8 == b) qd = mb;
     }
-    device half *r = kv + p[10] + (j * 8 + h) * 68;
+    device half *r = kv + KW + (j * 8 + h) * 68;
     half hd = half(qd / 127);
     ((device char4 *)r)[ln] =
         char4(clamp(round(x / max(float(hd), 1e-20)), -127., 127.));
@@ -232,8 +263,9 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // key j is position j, or pos - j in the sliding window ring; a cache row
 // (k of kv head r, v at 8 + r) is 128 f16, or with q8 128 int8 and their
 // 4 f16 scales, as q8_0
-static float4 kvl(const device half *kv, U p, uint j, uint r, uint ln) {
-  j = p[6] ? (p[5] - j) % SW : j;
+static float4 kvl(const device half *kv, U p, uint pos, uint j, uint r,
+                  uint ln) {
+  j = p[6] ? (pos - j) % SW : j;
   if (!p[9]) return float4(((const device half4 *)(kv + j * 2048))[r * 32 + ln]);
   kv += j * 1088 + r * 68;
   return float4(((const device char4 *)kv)[ln]) * float(kv[64 + ln / 8]);
@@ -246,6 +278,7 @@ static float4 kvl(const device half *kv, U p, uint j, uint r, uint ln) {
 // 7 rel bias, 8 maxima, 9 q8
 kernel void score(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                   const device half *kv [[buffer(3)]], TG) {
+  ZA;
   uint h = gp.y * 3, g = gp.x * 16 + sg;
   float4 q[3];
   float3 rl = 0, m = -1e30, o;
@@ -253,9 +286,9 @@ kernel void score(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
     q[i] = L(a + p[0] + (h + i) * 128, ln);
     if (ln < 16) rl[i] = a[p[1] + (h + i) * 16 + ln];
   }
-  for (uint j = g * KG, j1 = min(j + KG, p[4]); j < j1; j++) {
-    uint d = p[6] ? j : p[5] - j;
-    float4 k = kvl(kv + p[3], p, j, gp.y, ln);
+  for (uint j = g * KG, j1 = min(j + KG, NK); j < j1; j++) {
+    uint d = p[6] ? j : PZ(5) - j;
+    float4 k = kvl(kv + p[3], p, PZ(5), j, gp.y, ln);
     float b = d < 1024 && ln < 16 ? s[p[7] + d * 16 + ln] : 0;
     for (uint i = 0; i < 3; i++)
       o[i] = simd_sum(dot(k, q[i]) * 0.08838834764 + b * rl[i]);
@@ -269,6 +302,7 @@ kernel void score(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // of p[4] threads per head. p: 0 maxima, 1 groups, 2 sink, 3 out
 kernel void smax(U p [[buffer(0)]], A a [[buffer(1)]], TG) {
   threadgroup float r[32];
+  ZA;
   float m = -1e30;
   for (uint g = t; g < p[1]; g += p[4]) m = max(m, a[p[0] + g * 24 + gp.x]);
   m = simd_max(m);
@@ -287,13 +321,14 @@ kernel void gather(U p [[buffer(0)]], A a [[buffer(1)]],
                    const device half *kv [[buffer(3)]], TG) {
   threadgroup float4 ac[16 * 3 * 32];
   threadgroup float ls[16 * 3];
+  ZA;
   uint h = gp.y * 3;
   float3 m = float3(a[p[0] + h], a[p[0] + h + 1], a[p[0] + h + 2]), l = 0;
   float4 acc[3] = {0, 0, 0};
-  for (uint j = gp.x * C + sg * KV, j1 = min(j + KV, p[4]); j < j1; j++) {
+  for (uint j = gp.x * C + sg * KV, j1 = min(j + KV, NK); j < j1; j++) {
     float3 w = exp(float3(*(const device packed_float3 *)(a + p[2] + j * 24 + h)) - m);
     l += w;
-    float4 v = kvl(kv + p[3], p, j, 8 + gp.y, ln);
+    float4 v = kvl(kv + p[3], p, PZ(5), j, 8 + gp.y, ln);
     for (uint i = 0; i < 3; i++) acc[i] += w[i] * v;
   }
   for (uint i = 0; i < 3; i++) {
@@ -317,6 +352,7 @@ kernel void gather(U p [[buffer(0)]], A a [[buffer(1)]],
 kernel void merge(U p [[buffer(0)]], A a [[buffer(1)]], TG) {
   threadgroup float4 ac[16 * 32];
   threadgroup float ls[16];
+  ZA;
   float l = 0;
   float4 acc = 0;
   for (uint c = sg; c < p[1]; c += p[7]) {
@@ -338,6 +374,7 @@ kernel void merge(U p [[buffer(0)]], A a [[buffer(1)]], TG) {
 // p: 0 logits (then v . v), 1 bias, 2 weights out
 kernel void top8(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                  device uint *id [[buffer(5)]], GP) {
+  ZA; ZI;
   uint t = gp.x;
   float4 pr = 1 / (1 + exp(-L(a + p[0], ln) * rsqrt(a[p[0] + 128] / N + 1e-6))),
          sel = pr + L(s + p[1], ln);
@@ -353,8 +390,9 @@ kernel void top8(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // p: 0 gate_up, 1 out, 2 weights, 3 up scale, 4 down scale, 5 v . v
 kernel void act(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                 const device uint *id [[buffer(5)]],
-                uint i [[thread_position_in_grid]]) {
-  uint e = i / 288, c = i % 288;
+                uint3 gp [[thread_position_in_grid]]) {
+  ZA; ZI;
+  uint i = gp.x, e = i / 288, c = i % 288;
   if (e > 7) return;
   float4 w = L(a + p[2], 0) + L(a + p[2], 1);
   float us = s[p[3] + id[e]] * rsqrt(a[p[5]] / N + 1e-6);
@@ -369,6 +407,7 @@ kernel void act(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // p: 0 bank block (normalized), 1 pass output, 2 queries, 3 messages
 kernel void msg(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                 GP) {
+  ZA;
   S b = a + p[0], v = a + p[1];
   uint e0 = gp.x * 32 + ln;
   float o = 0;
@@ -386,6 +425,7 @@ kernel void msg(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // greedy token, stage 1: (max, index) of each 128 logits, one simdgroup
 // p: 0 logits, 1 count, 2 out
 kernel void amax(U p [[buffer(0)]], A a [[buffer(1)]], GP) {
+  ZA;
   uint i = (gp.x * 32 + ln) * 4, k = ~0u;
   float4 v = L(a + p[0] + i, 0);
   float m = -1e30;
@@ -402,6 +442,7 @@ kernel void best(U p [[buffer(0)]], A a [[buffer(1)]],
                  device uint *id [[buffer(5)]], TG) {
   threadgroup float bv[32];
   threadgroup uint bi[32];
+  ZA; ZI;
   float m = -1e30;
   uint k = ~0u;
   for (uint i = t; i < p[1]; i += 1024) {
@@ -418,3 +459,13 @@ kernel void best(U p [[buffer(0)]], A a [[buffer(1)]],
     if (bv[i] > b || (bv[i] == b && bi[i] < k)) b = bv[i], k = bi[i];
   id[p[2]] = k;
 }
+
+#ifdef ZR
+// the conv input of hv of every row into the ring. grid (18, 1, rows)
+kernel void stor(U p [[buffer(0)]], A a [[buffer(1)]], A cs [[buffer(4)]],
+                 GP) {
+  ZA;
+  uint t = gp.x * 32 + ln;
+  W(cs + p[3] + 4 * t + PZ(5) % CR * CH, 0) = L(a + p[0], t);
+}
+#endif

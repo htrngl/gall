@@ -1,11 +1,13 @@
 // dspark block drafter on the target's hidden states (DRAFT.md, dr.metal).
 //   let d = Dr::open(&m, path, n_ctx);
 //   let next = d.step(&mut m, tok);     // target step + context inject
-//   let (ids, secs) = d.draft(&m, anchor, 7); // tokens after anchor at m.pos
+//   let ds = d.draft(&m, anchor, 7); // (token, probability) after anchor
 //   let next = d.pass(&m, &[anchor, ids..]); d.commit(&mut m, rows, kept);
-//   d.generate(&mut m, next, &mut Spec::new(), |tok| more);  // all of it
-// gall dr MODEL DRAFTER REFDIR [-n 64] [-c 4096]: teacher-forced acceptance
-// gall run MODEL --tokens FILE --draft DRAFTER [--block 2] [-n 64] [-c 4096]
+//   let (done, next) = d.round(&mut m, next, &mut spec);  // all of it
+//   d.generate(&mut m, next, &mut Spec::new(), |tok| more);  // in a loop
+// gall dr MODEL DRAFTER REFDIR [-n 64] [-c 4096] [--ub] [--tv 2,4,8]:
+// teacher-forced acceptance; --tv: ms of a pass by rows
+// gall run MODEL --tokens FILE --draft DRAFTER [--block B] [-n 64] [-c 4096]
 use crate::gguf::{self, Gguf, Tensor};
 use crate::gpu::*;
 use crate::model::{Model, Op};
@@ -22,11 +24,13 @@ const MM: &str = concat!(
     include_str!("mv.metal"),
     include_str!("drm.metal")
 );
-const KINDS: [&str; 14] = [
+const KINDS: [&str; 15] = [
     "tap", "fuse", "norm", "rope", "put", "attn", "silu", "add", "joint", "pl",
-    "pset", "amax", "uni", "dsum",
+    "pset", "amax", "uni", "dsum", "conf",
 ];
-const XT: [u32; 10] = [8, 12, 13, 14, 16, 17, 18, 20, 22, 40]; // drm.metal x_*
+// drm.metal x_*: (type, weight rows per threadgroup at 1 use), as XS there
+const XT: [(u32, usize); 10] = [(8, 4), (12, 2), (13, 2), (14, 2), (16, 8),
+    (17, 4), (18, 8), (20, 4), (22, 8), (40, 8)];
 // target activations, as in model.rs: residual, normed output, its source
 const TA: [usize; 3] = [2 * N, 3 * N, 15 * N];
 // drafter activations, in floats; block regions hold 8 rows
@@ -47,6 +51,7 @@ const WB: usize = LG + 201024; // output hidden_out bias
 const BL: usize = WB + 201024; // base logits, 8 rows
 const NV: usize = 201024;
 const FR: usize = BL + 8 * NV; // 4 target features per verify row
+const CF: usize = FR + 32 * N; // the drafter's probability of each draft
 
 pub struct Dr {
     g: &'static Gguf,
@@ -58,11 +63,16 @@ pub struct Dr {
     c: Buf,
     id: Buf,
     p: Buf, // output hidden_out, 201024 x 256 f16
-    xp: HashMap<(u32, usize), Pipe>, // slab kernels by type and rows
-    ut: Buf, // expert union of a pass; t0: the one dense slab
-    t0: Buf,
+    // slab kernels by type and uses: weight rows per threadgroup, name
+    xp: HashMap<(u32, usize), (Pipe, usize, &'static str)>,
+    ut: Buf, // expert slabs of a pass by use count; ui: their grids
+    ui: Buf,
+    t0: Buf, // the same for a dense matrix: slab 0, used by every row
     o: HashMap<&'static str, usize>, // f32 tensors in s
     co: [usize; 3],                  // cache rows before each layer
+    // positions with context: the last run of inject() in a row. what a
+    // snapshot restored or the model stepped alone is not in it
+    span: std::cell::Cell<(usize, usize)>,
 }
 
 impl Dr {
@@ -83,24 +93,39 @@ impl Dr {
         let sb = m.gpu.buf(4 * s.len());
         slice::<f32>(&sb)[..s.len()].copy_from_slice(&s);
         let mut pipes: HashMap<_, _> = KINDS.map(|k| (k, m.gpu.pipe(SRC, "", k))).into();
-        for k in ["q8_0_8", "q5_k_1", "q5_k_2", "q5_k_3", "q5_k_4", "q5_k_7", "q5_k_8"] {
+        for k in ["q8_0_8", "q5_k_1", "q5_k_2", "q5_k_3", "q5_k_4", "q5_k_5", "q5_k_6",
+            "q5_k_7", "q5_k_8"] {
             pipes.insert(k, m.gpu.pipe(MM, "", &format!("mm_{k}")));
         }
-        let xp = XT.iter().flat_map(|&t| [2, 4, 8].map(move |r| (t, r))).map(|(t, r)| {
-            ((t, r), m.gpu.pipe(MM, "", &format!("x_{}_{r}", name(t))))
+        let xp = XT.iter().flat_map(|&t| (1..9).map(move |c| (t, c))).map(|((t, r), c)| {
+            let r = match c {
+                1 => r,
+                2 => 4,
+                3..=6 if t == 8 => 4,
+                _ => 2,
+            };
+            let n = format!("x_{}_{c}", name(t));
+            ((t, c), (m.gpu.pipe(MM, "", &n), r, &*n.leak()))
         });
+        let t0 = m.gpu.buf(4 * 9 * 65 * 8);
+        for c in 0..8 {
+            let e = &mut slice::<u32>(&t0)[9 * 65 * c..][..9];
+            (0..9).for_each(|i| e[i] = 8 * i.saturating_sub(1) as u32);
+        }
         let d = Dr {
             xp: xp.collect(),
-            ut: m.gpu.buf(4 * 64 * 9),
-            t0: m.gpu.buf(4 * 9),
+            ut: m.gpu.buf(4 * 9 * 65 * 8),
+            ui: m.gpu.buf(4 * 9 * 8),
+            t0,
             mv: Mv::new(&m.gpu, ""),
             pipes,
             s: sb,
-            b: m.gpu.buf(4 * (FR + 32 * N)),
+            b: m.gpu.buf(4 * (CF + 8)),
             p: m.gpu.buf(2 * 256 * NV),
             c: m.gpu.buf(2 * 2048 * (2048 + n_ctx)),
             id: m.gpu.buf(4 * 8),
             co: [0, 1024, 1024 + n_ctx],
+            span: Default::default(),
             g,
             w,
             o,
@@ -127,7 +152,7 @@ impl Dr {
     // rows of y = W x in one pass: nt inputs n_in apart, outputs ys apart
     fn mm<'a>(&'a self, t: &'static Tensor, w: B<'a>, x: usize, y: usize, ys: usize, nt: usize) -> Op<'a> {
         let (k, r) = if t.ty == 8 { ("q8_0_8", 4) } else { (["", "q5_k_1", "q5_k_2",
-            "q5_k_3", "q5_k_4", "", "", "q5_k_7", "q5_k_8"][nt], 2) };
+            "q5_k_3", "q5_k_4", "q5_k_5", "q5_k_6", "q5_k_7", "q5_k_8"][nt], 2) };
         let p = [t.dims[0], t.dims[1], t.row(), nt, ys].map(|v| v as u32);
         (k, 0, Box::new(move |e: &Enc| {
             let b = [w, (&self.b, 4 * x), (&self.b, 4 * y)];
@@ -150,7 +175,7 @@ impl Dr {
         (n, 0, Box::new(move |e: &Enc| {
             let mut b = [&self.b, &self.s, &self.c, &self.id].map(|b| (b, 0)).to_vec();
             b.extend(&x);
-            call(e, &self.pipes[n], &a, &b, g, if n == "amax" { 768 } else { 32 })
+            call(e, &self.pipes[n], &a, &b, g, if g[0] == 1 { 768 } else { 32 })
         }), None)
     }
 
@@ -169,6 +194,8 @@ impl Dr {
 
     // context k, v and f_rnn of the token at pos, from row r's features
     fn inject(&self, pos: usize, r: usize) -> Vec<Op<'_>> {
+        let (lo, hi) = self.span.get();
+        self.span.set((if pos < lo || pos > hi { pos } else { lo }, pos + 1));
         let nw = [0, 1, 2].map(|l| self.o(l, "dflare_norm"));
         let p = [FR + 4 * r * N, CX, self.o["dspark_fuse.weight"], nw[0], nw[1], nw[2],
             self.o["dspark_norm.weight"]];
@@ -184,66 +211,68 @@ impl Dr {
         v
     }
 
-    // the target on toks at m.pos.. (1, 2, 4 or 8 rows): a weight is read
-    // once for all rows, the rest runs row by row between the weights.
-    // taps each row's features. the greedy id after each row; m.pos stays
+    // the target on toks at m.pos.. (1 to 8 rows): a weight is read once
+    // for all rows, an expert slab once for the rows that use it, a small
+    // op is one dispatch for all rows. taps each row's features. the
+    // greedy id after each row; m.pos stays
     pub fn pass(&self, m: &Model, toks: &[u32]) -> Vec<u32> {
         let (t, rs) = (toks.len(), m.rs());
-        let ls: Vec<_> = (0..t).map(|r| m.sched_row(toks[r], m.pos + r, true, r)).collect();
+        // row 0 is kept whatever the others do: its context goes along
+        let (ops, inj) = (m.sched_z(toks, m.pos, true, 0), self.inject(m.pos, 0));
         let mut q: Vec<(&str, Box<dyn Fn(&Enc) + '_>)> = vec![];
         let tap = |r: usize, i: usize, src: usize, vr: usize| -> (&str, Box<dyn Fn(&Enc) + '_>) {
             let p = [src, FR + (4 * r + i) * N, vr].map(|v| v as u32);
             let b = [(&m.a, 4 * r * rs), (&self.b, 0)];
             ("tap", Box::new(move |e: &Enc| call(e, &self.pipes["tap"], &p, &b, [72, 1, 1], 32)))
         };
-        let (mut j, mut gu, mut seen) = (0, 0, vec![0; t]);
-        while j < ls[0].len() {
-            let Some((mode, w, x, y)) = ls[0][j].3.filter(|_| t > 1) else {
-                // small ops up to the next weight, row by row
-                let n = ls[0][j..].iter().position(|o| o.3.is_some() && t > 1);
-                let n = n.unwrap_or(ls[0].len() - j);
-                for (r, l) in ls.iter().enumerate() {
-                    for o in &l[j..j + n] {
-                        q.push((o.0, Box::new(move |e: &Enc| o.2(e))));
-                        let i = [5, 23, 41].iter().position(|&v| v == o.1);
-                        if let Some(i) = i.filter(|_| o.0 == "elem" && seen[r] < o.1) {
-                            seen[r] = o.1;
-                            q.push(tap(r, i, TA[0], 0));
-                        }
-                    }
+        let (mut gu, mut seen) = (0, 0);
+        for o in &ops {
+            let Some((mode, w, x, y)) = o.3.filter(|_| t > 1) else {
+                q.push((o.0, Box::new(move |e: &Enc| o.2(e))));
+                let i = [5, 23, 41].iter().position(|&v| v == o.1);
+                if let Some(i) = i.filter(|_| o.0 == "elem" && seen < o.1) {
+                    seen = o.1;
+                    (0..t).for_each(|r| q.push(tap(r, i, TA[0], 0)));
                 }
-                j += n;
                 continue;
             };
-            let (ni, no, pipe) = (w.dims[0], w.dims[1], &self.xp[&(w.ty, t)]);
+            let (ni, no) = (w.dims[0], w.dims[1]);
             if mode == "up" {
                 gu = y;
                 q.push(("uni", Box::new(move |e: &Enc| {
-                    let b = [(&m.id, 0), (&self.ut, 0)];
-                    call(e, &self.pipes["uni"], &[t as u32], &b, [1, 1, 1], 1)
+                    let b = [(&m.id, 0), (&self.ut, 0), (&self.ui, 0)];
+                    call(e, &self.pipes["uni"], &[t as u32], &b, [1, 1, 1], 64)
                 })));
             }
-            // experts go to the 8 gate_up rows, down's are then summed
-            let (tab, slots, kx, yy) = match mode {
-                "up" => (&self.ut, 8 * t, 0, y),
-                "down" => (&self.ut, 8 * t, ni, gu),
-                _ => (&self.t0, 1, 0, y),
+            // experts go to the 8 gate_up rows, down's are then summed.
+            // a slab used by c rows goes to the kernel of c uses
+            let (c0, kx, yy) = match mode {
+                "up" => (1, 0, y),
+                "down" => (1, ni, gu),
+                _ => (t, 0, y),
             };
             let p = [ni, no, w.row(), rs, rs, kx].map(|v| v as u32);
-            q.push((name(w.ty), Box::new(move |e: &Enc| {
-                let b = [m.gpu.w(w), (&m.a, 4 * x), (&m.a, 4 * yy), (tab, 0)];
-                call(e, pipe, &p, &b, [no / 2, slots, 1], 32)
-            })));
+            for c in c0..=t {
+                let (pipe, r, n) = &self.xp[&(w.ty, c)];
+                q.push((n, Box::new(move |e: &Enc| {
+                    let b = |t| [m.gpu.w(w), (&m.a, 4 * x), (&m.a, 4 * yy), (t, 0)];
+                    if mode == "mv" {
+                        return call(e, pipe, &p, &b(&self.t0), [no / r, 1, 1], 32);
+                    }
+                    let i = 12 * (3 * (c - 1) + r.trailing_zeros() as usize - 1);
+                    calli(e, pipe, &p, &b(&self.ut), (&self.ui, i), 32)
+                })));
+            }
             if mode == "down" {
                 let p = [gu, y, rs].map(|v| v as u32);
                 q.push(("dsum", Box::new(move |e: &Enc| {
                     call(e, &self.pipes["dsum"], &p, &[(&m.a, 0)], [72, t, 1], 32)
                 })));
             }
-            j += 1;
         }
         (0..t).for_each(|r| q.push(tap(r, 3, TA[1], TA[2])));
-        if std::env::var("PROF").is_ok() {
+        inj.iter().for_each(|o| q.push((o.0, Box::new(move |e: &Enc| o.2(e)))));
+        if std::env::var("PROF").is_ok_and(|_| t > 1) {
             // every dispatch in its own command buffer: read as shares
             let mut by = std::collections::BTreeMap::<_, (usize, f64)>::new();
             for o in &q {
@@ -270,13 +299,30 @@ impl Dr {
     }
 
     // keep rows 0..=k of a pass of t rows: position, rollback of the rest,
-    // drafter context
+    // drafter context of the rows after the first
     pub fn commit(&self, m: &mut Model, t: usize, k: usize) {
         let pos = m.pos;
         m.pos += t;
         assert!(m.truncate(pos + k + 1));
-        let ops: Vec<Op> = (0..=k).flat_map(|r| self.inject(pos + r, r)).collect();
-        m.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
+        m.top = pos + t;
+        let ops: Vec<Op> = (1..=k).flat_map(|r| self.inject(pos + r, r)).collect();
+        if k > 0 {
+            m.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
+        }
+    }
+
+    // a prompt: batched prefill with the context of each token, the tail
+    // by step(). greedy next id
+    pub fn feed(&self, m: &mut Model, toks: &[u32]) -> u32 {
+        let rest = m.prefill_tap(toks, 512, Some(&mut |m: &Model, ft: &[f32]| {
+            for (i, f) in ft.chunks(32 * N).enumerate() {
+                slice::<f32>(&self.b)[FR..][..f.len()].copy_from_slice(f);
+                let n = (0..f.len() / (4 * N)).flat_map(|r| self.inject(m.pos + 8 * i + r, r));
+                let ops: Vec<Op> = n.collect();
+                m.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
+            }
+        }));
+        rest.iter().fold(0, |_, &t| self.step(m, t))
     }
 
     // one target token with its context; greedy next id
@@ -286,51 +332,68 @@ impl Dr {
         r
     }
 
-    // greedy decode from `next` until emit returns false. the block (0,
-    // 1, 3 or 7 drafts) is the one with the best expected tokens per
-    // second, from running estimates of acceptance and of the costs
+    // one round of greedy decode from the pending token `next`: the tokens
+    // it put into the model (next first) and the new pending token. with
+    // drafting on: a draft, then a pass over the anchor and the drafts
+    // that st.plan() takes; the drafts after those stay for the next
+    // rounds while they hold. else serial steps, and a draft now and then
+    // to keep score
+    pub fn round(&self, m: &mut Model, mut next: u32, st: &mut Spec) -> (Vec<u32>, u32) {
+        let (t0, on) = (Instant::now(), st.block.map_or(st.on(), |b| b > 0));
+        let ema = |x: &mut f64, t: Instant| *x += 0.1 * (t.elapsed().as_secs_f64() - *x);
+        let mut d = std::mem::take(&mut st.left);
+        if st.at != (m.pos, next) {
+            d.clear();
+        }
+        let nd = st.block.unwrap_or(if on || st.n >= st.due[0] { st.nb() } else { 0 });
+        if d.is_empty() && nd > 0 {
+            d = self.draft(m, next, nd);
+            ema(&mut st.td[nd], t0);
+            st.fresh(&d, on);
+        }
+        let (t1, mut j, mut k) = (Instant::now(), st.plan(&d).0, 0);
+        j *= on as usize;
+        let mut done = vec![next];
+        if j == 0 {
+            next = self.step(m, next);
+        } else {
+            done.extend(d[..j].iter().map(|x| x.0));
+            let r = self.pass(m, &done);
+            k = (0..j).take_while(|&i| st.see(d[i].1, d[i].0 == r[i])).count();
+            self.commit(m, j + 1, k);
+            done.truncate(k + 1);
+            (st.kept[k], next) = (st.kept[k] + 1, r[k]);
+        }
+        ema(&mut st.tv[j + 1], t1);
+        // the draft after the last one verified is scored by the new
+        // pending token; if it holds, so does the rest of the draft
+        if k == j && j < d.len() && st.see(d[j].1, d[j].0 == next) {
+            (st.left, st.at) = (d.split_off(j + 1), (m.pos, next));
+        }
+        st.n += done.len();
+        (done, next)
+    }
+
+    // greedy decode from `next` until emit returns false
     pub fn generate(&self, m: &mut Model, mut next: u32, st: &mut Spec, mut emit: impl FnMut(u32) -> bool) {
         loop {
-            let b = st.pick();
-            let t0 = Instant::now();
-            // without a block, a draft of 3 every 32 tokens keeps score
-            let probe = b == 0 && st.n % 32 == 0;
-            let ds = if b > 0 || probe { self.draft(m, next, b.max(3)).0 } else { vec![] };
-            let t1 = Instant::now();
-            st.td[b] += (b > 0) as u8 as f64 * 0.1 * ((t1 - t0).as_secs_f64() - st.td[b]);
-            if b == 0 {
-                for i in 0..ds.len().max(1) {
-                    let t1 = Instant::now();
-                    if !emit(next) {
-                        return;
-                    }
-                    next = self.step(m, next);
-                    st.tv[1] += 0.1 * (t1.elapsed().as_secs_f64() - st.tv[1]);
-                    st.n += 1;
-                    if i < ds.len() && !st.see(ds[i] == next) {
-                        break;
-                    }
-                }
-                continue;
-            }
-            let toks: Vec<u32> = [next].into_iter().chain(ds.iter().copied()).collect();
-            let r = self.pass(m, &toks);
-            let k = (0..b).take_while(|&i| st.see(ds[i] == r[i])).count();
-            self.commit(m, b + 1, k);
-            st.tv[b + 1] += 0.1 * (t1.elapsed().as_secs_f64() - st.tv[b + 1]);
-            (st.n, st.kept[k], next) = (st.n + k + 1, st.kept[k] + 1, r[k]);
-            if !toks[..=k].iter().all(|&x| emit(x)) {
+            let (done, n) = self.round(m, next, st);
+            next = n;
+            if !done.iter().all(|&x| emit(x)) {
                 return;
             }
         }
     }
 
-    // nb tokens after anchor a at position m.pos, and the gpu seconds
-    pub fn draft(&self, m: &Model, a: u32, nb: usize) -> (Vec<u32>, f64) {
-        let n = m.pos;
+    // nb tokens after anchor a at position m.pos, each with the drafter's
+    // probability of it
+    pub fn draft(&self, m: &Model, a: u32, nb: usize) -> Vec<(u32, f32)> {
+        let (n, (lo, hi)) = (m.pos, self.span.get());
+        let lo = if hi < n { n } else { lo.min(n) };
         slice::<f32>(&self.b)[ST..ST + 256].fill(0.);
         slice::<u32>(&self.id)[0] = a;
         let (emb, out) = (&m.g.t["token_embd.weight"], &m.g.t["output.weight"]);
+        let cap = (m.g.f("inkling2.final_logit_softcapping") as f32).to_bits() as usize;
         let mut v: Vec<Op> = vec![("row", 0, Box::new(move |e: &Enc| {
             self.mv.row(e, emb.ty, m.gpu.w(emb), a as usize, (&self.b, 4 * OO), N)
         }), None)];
@@ -344,7 +407,7 @@ impl Dr {
             v.extend(self.m(l, "attn_v", HN, KK + 1024, 2048, 8));
             v.push(self.k("rope", [24, 8, 1], &[QQ, 3072, self.o(l, "attn_q_norm"), n], vec![]));
             v.push(self.k("rope", [8, 8, 1], &[KK, 2048, self.o(l, "attn_k_norm"), n], vec![]));
-            let (nk, ring) = if l == 1 { (n, 0) } else { (n.min(1024), 1024) };
+            let (nk, ring) = if l == 1 { (n - lo, 0) } else { ((n - lo).min(1024), 1024) };
             let p = [QQ, KK, self.co[l] * 2048, nk, n - nk, ring, AT];
             v.push(self.k("attn", [24, 8, 1], &p, vec![]));
             v.extend(self.m(l, "attn_output", AT, OO, 0, 8));
@@ -366,6 +429,7 @@ impl Dr {
             let p = [ST, JJ, BL + (i - 1) * NV, LG, WB];
             v.push(self.k("pl", [6252, 1, 1], &p, vec![(&self.p, 0)]));
             v.push(self.k("amax", [1, 1, 1], &[LG, 200058, i], vec![]));
+            v.push(self.k("conf", [1, 1, 1], &[LG, 200058, i, CF + i, cap], vec![]));
         }
         if std::env::var("PROF").is_ok() {
             // every dispatch in its own command buffer: read as shares
@@ -376,41 +440,106 @@ impl Dr {
             }
             by.iter().for_each(|(k, (c, t))| eprintln!("{k:8} {c:4} {:7.2} ms", 1e3 * t));
         }
-        let t = m.gpu.run(|e| v.iter().for_each(|o| o.2(e)));
-        (slice::<u32>(&self.id)[1..=nb].to_vec(), t)
+        m.gpu.run(|e| v.iter().for_each(|o| o.2(e)));
+        let (id, p) = (slice::<u32>(&self.id), slice::<f32>(&self.b));
+        (1..=nb).map(|i| (id[i], p[CF + i])).collect()
     }
 }
 
-// running estimates for generate(): acceptance of a draft token, seconds
-// of a pass by rows and of a draft by length (measured here, m2 air)
+// running estimates for round(), seconds as measured here (m2 air)
 pub struct Spec {
-    pub a: f64,
+    pub block: Option<usize>, // a fixed count of drafts per round; 0: none
+    pub q: [f64; 12],         // acceptance of a draft by its probability
+    pub e: [f64; 2],          // tokens and seconds to expect of a draft
+    pub tv: [f64; 9],         // a pass by rows
+    pub td: [f64; 8],         // a draft by length
+    pub kept: [usize; 8],     // passes by drafts kept
+    pub drafts: usize,
     pub n: usize,
-    pub tv: [f64; 9],
-    pub td: [f64; 8],
-    pub kept: [usize; 8],
+    left: Vec<(u32, f32)>, // drafts not yet used, after the pending
+    at: (usize, u32),      // token `at.1` at position `at.0`
+    due: [usize; 2],       // off: the next draft is at n = due[0]; the gap
+    hits: [f64; 2],        // of this draft, and their mean
 }
 
 impl Spec {
     pub fn new() -> Spec {
-        let (mut tv, mut td) = ([0.; 9], [0.; 8]);
-        (tv[1], tv[2], tv[4], tv[8]) = (0.052, 0.27, 0.25, 0.74);
-        (td[1], td[3], td[7]) = (0.015, 0.022, 0.031);
-        Spec { a: 0.6, n: 0, tv, td, kept: [0; 8] }
+        let ms = |v: [f64; 8]| v.map(|x| 1e-3 * x);
+        let tv = [52., 75., 98., 122., 150., 185., 225., 265.];
+        Spec {
+            block: None,
+            q: std::array::from_fn(|i| 0.9 / (1. + (1.75 - i as f64 / 2.).exp())),
+            e: [1., 0.055],
+            tv: std::array::from_fn(|i| 1e-3 * tv[i.max(1) - 1]),
+            td: ms([0., 15., 18., 21., 24., 26., 28., 31.]),
+            kept: [0; 8],
+            drafts: 0,
+            n: 0,
+            left: vec![],
+            at: (0, 0),
+            due: [0; 2],
+            hits: [0., 2.],
+        }
     }
 
-    fn see(&mut self, hit: bool) -> bool {
-        self.a += 0.1 * (hit as u8 as f64 - self.a);
+    // a probability's place in q: half steps of its logit, 0.12 to 0.97
+    fn bin(p: f32) -> usize {
+        (4. + 2. * (p / (1. - p)).ln()).clamp(0., 11.) as usize
+    }
+
+    fn see(&mut self, p: f32, hit: bool) -> bool {
+        let q = &mut self.q[Spec::bin(p)];
+        *q += 0.05 * (hit as u8 as f64 - *q);
+        self.hits[0] += hit as u8 as f64;
         hit
     }
 
-    // tokens per second of a block: 1 + a + a^2 + .. over draft + pass
-    fn pick(&self) -> usize {
-        let r = |b: usize| {
-            (0..=b).map(|i| self.a.powi(i as i32)).sum::<f64>() / (self.td[b] + self.tv[b + 1])
-        };
-        let b = std::env::var("BLOCK").ok().and_then(|v| v.parse().ok());
-        b.unwrap_or([0, 1, 3, 7].into_iter().max_by(|&x, &y| r(x).total_cmp(&r(y))).unwrap())
+    // drafting beats serial decode
+    pub fn on(&self) -> bool {
+        self.e[0] * self.tv[1] > self.e[1]
+    }
+
+    // drafts to ask for: 2 more than held of late
+    fn nb(&self) -> usize {
+        (self.hits[1] + 2.5).clamp(3., 7.) as usize
+    }
+
+    // the drafts to verify, and the tokens to expect of the round: a draft
+    // is taken while its chance to be kept pays for its row at the rate
+    // in hand
+    fn plan(&self, d: &[(u32, f32)]) -> (usize, f64) {
+        let (mut p, mut e) = (1., 1.);
+        let rate = (self.e[0] / self.e[1]).max(1. / self.tv[1]);
+        for (j, x) in d.iter().enumerate() {
+            p *= self.q[Spec::bin(x.1)];
+            let dt = (self.tv[j + 2] - self.tv[j + 1]).max(0.3 * self.tv[1]);
+            if self.block.is_none() && p < rate * dt {
+                return (j, e);
+            }
+            e += p;
+        }
+        (d.len(), e)
+    }
+
+    // a new draft: the tokens and seconds to expect of it over its
+    // rounds, each reached if the drafts before it hold, go into e. off,
+    // the next draft is 8 tokens on if this one would have paid, else 32,
+    // 64, 128
+    fn fresh(&mut self, d: &[(u32, f32)], on: bool) {
+        let (mut i, mut s, mut x) = (0, 1., [0., self.td[d.len()]]);
+        while i == 0 || i < d.len() {
+            let (j, e) = self.plan(&d[i..]);
+            x = [x[0] + s * e, x[1] + s * self.tv[j + 1]];
+            let held = &d[i..d.len().min(i + j + 1)];
+            s *= held.iter().map(|v| self.q[Spec::bin(v.1)]).product::<f64>();
+            i += j + 1;
+        }
+        let w = if on { 0.1 } else { 0.3 };
+        (0..2).for_each(|i| self.e[i] += w * (x[i] - self.e[i]));
+        self.hits = [0., self.hits[1] + 0.2 * (self.hits[0] - self.hits[1])];
+        let gap = if x[0] * self.tv[1] > x[1] { 8 } else { (2 * self.due[1]).clamp(32, 128) };
+        self.due = [self.n + gap, gap];
+        self.drafts += 1;
     }
 }
 
@@ -426,8 +555,31 @@ pub fn main(a: &[String]) {
     let np = all.len();
     all.extend(crate::ids(&format!("{d}/gen.txt")));
     // run[k]: drafts whose first k tokens are the target's; hit: per slot
-    let (mut run, mut hit, mut td, mut tt) = ([0usize; 8], [0usize; 7], 0., 0.);
-    for i in 0..np + n {
+    let (mut run, mut hit, mut td) = ([0usize; 8], [0usize; 7], 0.);
+    let mut cal = [[0usize; 2]; 10]; // by probability: drafts, hits
+    if let Some(i) = a.iter().position(|x| x == "--tv") {
+        // ms of a pass by rows (best, mean of 6), on the reference text
+        all[..np].iter().for_each(|&t| _ = dr.step(&mut m, t));
+        let mut i0 = np;
+        for r in a[i + 1].split(',').map(|v| v.parse::<usize>().unwrap()) {
+            let ts: Vec<f64> = (0..6).map(|_| {
+                let t0 = Instant::now();
+                dr.pass(&m, &all[i0..i0 + r]);
+                dr.commit(&mut m, r, r - 1);
+                i0 += r;
+                1e3 * t0.elapsed().as_secs_f64()
+            }).collect();
+            let b = ts.iter().fold(1e9f64, |a, &b| a.min(b));
+            println!("t({r}) {b:.1} ms best, {:.1} mean", ts.iter().sum::<f64>() / 6.);
+        }
+        return;
+    }
+    // --ub: the prompt by feed() (batched), not step by step
+    let ub = a.iter().any(|x| x == "--ub");
+    if ub {
+        dr.feed(&mut m, &all[..np - 1]);
+    }
+    for i in if ub { np - 1 } else { 0 }..np + n {
         dr.step(&mut m, all[i]);
         if i == np {
             // the step that fed gen[0] is ref step s0000
@@ -440,34 +592,39 @@ pub fn main(a: &[String]) {
         if i + 1 < np {
             continue;
         }
-        tt += m.t;
-        let (ids, t) = dr.draft(&m, all[i + 1], 7);
-        td += t;
-        let ok: Vec<bool> = (0..7).map(|k| ids[k] == all[i + 2 + k]).collect();
-        run[ok.iter().take_while(|&&x| x).count()] += 1;
+        let t0 = Instant::now();
+        let ds = dr.draft(&m, all[i + 1], 7);
+        td += t0.elapsed().as_secs_f64();
+        let ok: Vec<bool> = (0..7).map(|k| ds[k].0 == all[i + 2 + k]).collect();
+        let r = ok.iter().take_while(|&&x| x).count();
+        // a draft counts while those before it hold
+        for k in 0..(r + 1).min(7) {
+            let c = &mut cal[(ds[k].1 * 10.).min(9.) as usize];
+            *c = [c[0] + 1, c[1] + ok[k] as usize];
+        }
+        run[r] += 1;
         (0..7).for_each(|k| hit[k] += ok[k] as usize);
     }
     let c = (n + 1) as f64;
-    println!("target {:.1} ms, draft of 7 {:.1} ms", 1e3 * tt / c, 1e3 * td / c);
+    println!("draft of 7 {:.1} ms", 1e3 * td / c);
     println!("slot hit {:.2?}", hit.map(|h| h as f64 / c));
+    println!("drafts, hits by probability in tenths: {cal:?}");
     for b in 1..8 {
         let e: usize = run.iter().enumerate().map(|(k, r)| r * (1 + k.min(b))).sum();
         println!("block {b}: {:.2} tokens per pass", e as f64 / c);
     }
 }
 
-// greedy decode with drafts; BLOCK=b fixes the block (0: none)
+// greedy decode with drafts; --block B fixes the drafts per round (0: none)
 pub fn run(a: &[String]) {
     let opt = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].as_str());
     let (n, ctx) = (opt("-n").map_or(64, |v| v.parse().unwrap()), opt("-c").map_or(4096, |v| v.parse().unwrap()));
     let mut m = Model::open(&a[0], ctx);
     m.reset();
     let dr = Dr::open(&m, opt("--draft").unwrap(), ctx);
-    let mut next = 0;
-    for t in crate::ids(opt("--tokens").expect("--tokens FILE")) {
-        next = dr.step(&mut m, t);
-    }
+    let next = dr.feed(&mut m, &crate::ids(opt("--tokens").expect("--tokens FILE")));
     let (mut st, mut out, t0) = (Spec::new(), 0, Instant::now());
+    st.block = opt("--block").map(|v| v.parse().unwrap());
     dr.generate(&mut m, next, &mut st, |t| {
         print!("{t} ");
         out += 1;
@@ -476,7 +633,10 @@ pub fn run(a: &[String]) {
     println!();
     let ms = |v: &[f64]| v.iter().map(|x| (1e3 * x).round()).collect::<Vec<_>>();
     eprintln!(
-        "{:.1} t/s, kept {:?}, acceptance {:.2}, pass ms {:?}, draft ms {:?}",
-        out as f64 / t0.elapsed().as_secs_f64(), st.kept, st.a, ms(&st.tv), ms(&st.td)
+        "{:.1} t/s, kept {:?}, {} drafts, on {}, a draft {:.2} tokens {:.0} ms, \
+         pass ms {:?}, draft ms {:?}, acceptance {:.2?}",
+        out as f64 / t0.elapsed().as_secs_f64(), st.kept, st.drafts, st.on(), st.e[0],
+        1e3 * st.e[1],
+        ms(&st.tv[1..]), ms(&st.td[1..]), st.q
     );
 }

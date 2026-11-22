@@ -96,6 +96,7 @@ pub struct Model {
     pub gpu: Gpu,
     mv: Mv,
     pipes: HashMap<&'static str, Pipe>,
+    zp: std::cell::OnceCell<HashMap<&'static str, Pipe>>, // ops.metal ZR
     pub a: Buf,
     s: Buf,
     sh: Buf,
@@ -114,6 +115,7 @@ pub struct Model {
     n_ctx: usize,
     pub q8: bool, // full-attention cache as int8 with f16 scales
     pub pos: usize,
+    pub top: usize, // a batched pass (dr.rs) wrote the conv rings up to here
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
     pf: Option<pf::Pf>,
@@ -256,6 +258,7 @@ impl Model {
         Model {
             mv: Mv::new(&gpu, ""),
             pipes,
+            zp: Default::default(),
             a: gpu.buf(4 * ROWS * (PT + nk * 27 + 24 + nk.div_ceil(256) * 24 * 132)),
             s: sb,
             sh: hb,
@@ -279,6 +282,7 @@ impl Model {
             n_ctx,
             q8,
             pos: 0,
+            top: 0,
             t: 0.,
             ck: None,
             pf: None,
@@ -319,7 +323,9 @@ impl Model {
     // forget all but the first n tokens: a few steps back by the rings,
     // or back to the checkpoint. false: not possible, reset
     pub fn truncate(&mut self, n: usize) -> bool {
-        if n <= self.pos && self.pos - n <= 12 {
+        // rows of a batched pass that were not kept took ring rows too
+        let top = if self.top > self.pos + 8 { self.pos } else { self.top.max(self.pos) };
+        if n <= self.pos && top - n <= 12 {
             self.ck.take_if(|c| c.0 > n);
         } else if let Some((_, cs, w)) = self.ck.as_ref().filter(|c| c.0 == n) {
             slice::<f32>(&self.cs).copy_from_slice(cs);
@@ -346,22 +352,37 @@ impl Model {
 
     // sched() on activation row `row` (and its 16 ids)
     pub fn sched_row(&self, tok: u32, pos: usize, head: bool, row: usize) -> Vec<Op<'_>> {
-        let (ro, io) = (4 * row * self.rs(), 64 * row);
-        assert!(pos < self.n_ctx, "context full");
+        self.sched_z(&[tok], pos, head, row)
+    }
+
+    // sched() of toks at pos.. on the activation rows from `row`: every
+    // small op is one dispatch for all rows (ops.metal ZR), a weight op
+    // is that of the first row, for dr.rs to run on all
+    pub fn sched_z(&self, toks: &[u32], pos: usize, head: bool, row: usize) -> Vec<Op<'_>> {
+        let (ro, io, nz) = (4 * row * self.rs(), 64 * row, toks.len());
+        assert!(pos + nz <= self.n_ctx, "context full");
         let mut ops: Vec<Op> = vec![];
-        let mut vi = 0;
+        let (mut vi, mut tz) = (0, [0u32; 8]); // tz: tau of each row
+        let pz = if nz == 1 { &self.pipes } else {
+            self.zp.get_or_init(|| KINDS.iter().chain(&["stor"]).map(|&k| {
+                (k, self.gpu.pipe(OPS, "#define ZR\n", k))
+            }).collect())
+        };
         // an ops.metal kernel
         macro_rules! k {
             ($n:expr, $g:expr, $th:expr, $($p:expr),*) => {{
-                let mut p = [0u32; 24];
+                let mut p = [0u32; 32];
                 let v = [$($p as u32),*];
                 p[..v.len()].copy_from_slice(&v);
-                let pipe = &self.pipes[$n];
+                p[23] = self.rs() as u32;
+                p[24..].copy_from_slice(&tz);
+                let (pipe, mut g): (_, [usize; 3]) = (&pz[$n], $g);
+                g[2] = nz;
                 ops.push(($n, vi, Box::new(move |e: &Enc| {
                     let b = [&self.a, &self.s, &self.kv, &self.cs, &self.id, &self.sh];
                     let mut b = b.map(|b| (b, 0));
                     (b[0].1, b[4].1) = (ro, io);
-                    call(e, pipe, &p, &b, $g, $th)
+                    call(e, pipe, &p, &b, g, $th)
                 }), None));
             }};
         }
@@ -381,9 +402,20 @@ impl Model {
             }};
         }
         let (emb, t32) = (self.emb, [18, 1, 1]);
-        ops.push(("row", 0, Box::new(move |e: &Enc| {
-            self.mv.row(e, emb.ty, self.gpu.w(emb), tok as usize, (&self.a, ro + 4 * VR), N)
-        }), None));
+        for (z, &tok) in toks.iter().enumerate() {
+            let y = (&self.a, ro + 4 * (z * self.rs() + VR));
+            ops.push(("row", 0, Box::new(move |e: &Enc| {
+                self.mv.row(e, emb.ty, self.gpu.w(emb), tok as usize, y, N)
+            }), None));
+        }
+        // ZR: the conv input of every row, before a mix reads the ring
+        macro_rules! stor {
+            ($x:expr, $st:expr) => {
+                if nz > 1 && $x > 0 {
+                    k!("stor", t32, 32, $x, 0, 0, $st, 0, pos);
+                }
+            };
+        }
         k!("dots", [2, 1, 1], 576, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC);
         k!("elem", t32, 32, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC, 1, VR, H, self.tn,
             0, 0, 1);
@@ -402,6 +434,7 @@ impl Model {
                 fin = [0, PRE, 0, 0, 0];
             }
             let ([f0, f1, f2, f3, f4], [w0, w1, w2]) = (fin, l.nw);
+            stor!(f0, f3);
             k!("dots", [nb + 2, l.nq.max(1) as usize, 1], 576, f0, f1, f2, f3, f4, pos,
                 BK, nb, l.nq, l.aq, SC);
             k!("elem", t32, 32, f0, f1, f2, f3, f4, pos, BK, nb, l.nq, l.aq, SC, nx,
@@ -415,18 +448,30 @@ impl Model {
             mv!("mv", l.v, x(2), K + 1024, N, 1024);
             mv!("mv", l.rel, x(0), R, N, 384);
             mv!("mv", l.gate, x(0), G, N, 3072);
-            let (idx, nk, tau) = if l.swa {
-                (pos % SW, (pos + 1).min(1024), 1.)
+            // (cache row, keys, tau) of the token at p
+            let at = |p: usize| if l.swa {
+                (p % SW, (p + 1).min(1024), 1.)
             } else {
-                let t = ((pos + 1) as f32 / self.hp[2]).max(1.).ln();
-                (pos, pos + 1, 1. + self.hp[3] * t)
+                let t = ((p + 1) as f32 / self.hp[2]).max(1.).ln();
+                (p, p + 1, 1. + self.hp[3] * t)
             };
+            let ((idx, nk, tau), nkm) = (at(pos), at(pos + nz - 1).1);
+            (0..nz).for_each(|z| tz[z] = at(pos + z).2.to_bits());
             let (cs, kv) = (slot * CS, self.kvo[slot]);
             let q8 = self.q8 && !l.swa;
-            k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd, l.vd,
-                cs, kv + idx * Self::row(q8), f32::to_bits(tau), self.hp[0].to_bits(),
-                self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK, q8);
-            let (ng, nc) = (nk.div_ceil(128), nk.div_ceil(256));
+            // ZR: the cache row follows from the ring size, and a first
+            // run only stores the conv inputs
+            let (kw, ring) = match nz {
+                1 => (kv + idx * Self::row(q8), 0),
+                _ => (kv, if l.swa { SW } else { 0 }),
+            };
+            for so in [2, 0].into_iter().skip((nz == 1) as usize) {
+                k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd,
+                    l.vd, cs, kw, f32::to_bits(tau), self.hp[0].to_bits(),
+                    self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK,
+                    q8 as u32 | so, ring);
+            }
+            let (ng, nc) = (nkm.div_ceil(128), nkm.div_ceil(256));
             let nm = self.n_ctx.max(1024) + 256;
             let (mx, gm, pa) = (PT + 24 * nm, PT + 27 * nm, PT + 27 * nm + 24);
             k!("score", [ng, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb, mx, q8);
@@ -438,6 +483,7 @@ impl Model {
             mv!("mv", l.o, O, AO, 3072, N);
             nb += first as usize;
             let (r, st) = (if first { 0 } else { H }, cs + 2048);
+            stor!(AO, st);
             k!("dots", [nb + 2, 1, 1], 576, AO, r, F, st, l.apc, pos, BK, nb, 1, l.fq, SC);
             k!("elem", t32, 32, AO, r, F, st, l.apc, pos, BK, nb, 1, l.fq, SC, 1, VR,
                 XF, l.fnw);
@@ -453,12 +499,14 @@ impl Model {
             mv!("down", l.dn, HH, D, 1152, N);
             fin = [D, F, H, cs + 4352, l.fpc as usize];
             if i == 17 && pass < 2 {
+                stor!(D, fin[3]);
                 k!("elem", t32, 32, D, F, H, fin[3], fin[4], pos, BK, nb, 0, 0, SC);
                 k!("msg", [72, 12, 1], 32, BK + 2 * N, H, self.mq, MSG);
             }
             vi += 1;
         }
         let [f0, f1, _, f3, f4] = fin;
+        stor!(f0, f3);
         if !head {
             // only the conv state of the last ffn
             k!("elem", t32, 32, f0, f1, 0, f3, f4, pos, BK, nb, 0, 0, SC);

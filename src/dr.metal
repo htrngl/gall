@@ -189,19 +189,56 @@ kernel void amax(U p [[buffer(0)]], A b [[buffer(1)]],
   id[p[2]] = k;
 }
 
-// union of the rows' expert ids for drm.metal: slot j of tab is (id, the
-// k of row t or 255). one thread. p: 0 rows
+// the drafter's probability of id[p[2]] among b[p[0]..+p[1]] after the
+// softcap p[4], to b[p[3]]. one group of 768
+kernel void conf(U p [[buffer(0)]], A b [[buffer(1)]], U id [[buffer(4)]],
+                 uint t [[thread_index_in_threadgroup]],
+                 uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float r[24];
+  float c = as_type<float>(p[4]), m = c * tanh(b[p[0] + id[p[2]]] / c), o = 0;
+  for (uint i = t; i < p[1]; i += 768) o += exp(c * tanh(b[p[0] + i] / c) - m);
+  o = simd_sum(o);
+  if (t % 32 == 0) r[sg] = o;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t) return;
+  for (uint i = 1; i < 24; i++) o += r[i];
+  b[p[3]] = 1 / o;
+}
+
+// the rows' expert slabs by use count, for drm.metal: entry j of class c
+// (65 entries of 9 per class) is (id, c uses: row t << 3 | k); the entry
+// after the last has id ~0. ind: the grids of class c for 2, 4, 8 weight
+// rows per threadgroup. one group of 64: thread e is use k = e % 8 of row
+// e / 8, the first use of a slab places it. p: 0 rows
 kernel void uni(U p [[buffer(0)]], U id [[buffer(1)]],
-                device uint *tab [[buffer(2)]]) {
-  uint T = p[0], n = 0;
-  for (uint i = 0; i < 8 * T * (T + 1); i++) tab[i] = i % (T + 1) ? 255 : ~0u;
-  for (uint t = 0; t < T; t++)
-    for (uint k = 0; k < 8; k++) {
-      uint x = id[16 * t + k], j = 0;
-      while (j < n && tab[j * (T + 1)] != x) j++;
-      if (j == n) tab[n++ * (T + 1)] = x;
-      tab[j * (T + 1) + 1 + t] = k;
-    }
+                device uint *tab [[buffer(2)]],
+                device uint *ind [[buffer(3)]],
+                uint e [[thread_index_in_threadgroup]]) {
+  threadgroup uint lc[64], ls[64];
+  uint T = p[0], n = 8 * T, x = id[16 * (e / 8) + e % 8];
+  uint f = e, c = 0, r = 0, m = 0; // first use, uses, uses before e
+  for (uint i = 0; i < n; i++) {
+    bool s = id[16 * (i / 8) + i % 8] == x;
+    c += s, r += s && i < e, f = s ? min(f, i) : f;
+  }
+  lc[e] = e < n && f == e ? c : 0;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // the place of a slab in its class; thread e < T counts class e + 1
+  for (uint i = 0; i < e; i++) m += lc[i] == c;
+  ls[e] = m;
+  for (uint i = m = 0; i < 64; i++) m += lc[i] == e + 1;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (e < n) {
+    device uint *o = tab + (65 * (c - 1) + ls[f]) * 9;
+    if (f == e) o[0] = x;
+    o[1 + r] = e / 8 << 3 | e % 8;
+  }
+  if (e >= T) return;
+  tab[(65 * e + m) * 9] = ~0u;
+  for (uint r = 0; r < 3; r++) {
+    device uint *o = ind + (e * 3 + r) * 3;
+    o[0] = 1152 >> r, o[1] = max(m, 1u), o[2] = 1;
+  }
 }
 
 // d = sum of the 8 expert outputs at g, per row. grid (72, rows)
