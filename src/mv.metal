@@ -157,6 +157,36 @@ NIB(nvfp4) {
     return d*NDOT(k_fp4, q);
 }
 
+// rq5, rq6 (rq.rs): an iq4_nl block of low nibbles, then 1 or 2 high
+// bits per element, a byte or two for the 8 elements of a NIB
+static inline uint xo_rq5(uint e) { return xo_iq4_nl(e); }
+NIB(rq5) {
+    W c = b + (e/4)*22;
+    uint4 q = uint4(*(Q)(c + 2 + 4*(e%4))), h = uint4(c[18 + e%4]);
+    uint4 lo = (q & 15) | (((h >> uint4(0, 1, 2, 3)) & 1) << 4);
+    uint4 hi = (q >> 4) | (((h >> uint4(4, 5, 6, 7)) & 1) << 4);
+    return F16(c)*(dot(float4(lo) - 16, xa) + dot(float4(hi) - 16, xb));
+}
+
+static inline uint xo_rq6(uint e) { return xo_iq4_nl(e); }
+NIB(rq6) {
+    W c = b + (e/4)*26;
+    uint4 q = uint4(*(Q)(c + 2 + 4*(e%4))), h = uint4(((H)(c + 18))[e%4]);
+    uint4 lo = (q & 15) | (((h >> uint4(0, 2, 4, 6)) & 3) << 4);
+    uint4 hi = (q >> 4) | (((h >> uint4(8, 10, 12, 14)) & 3) << 4);
+    return F16(c)*(dot(float4(lo) - 32, xa) + dot(float4(hi) - 32, xb));
+}
+
+// a unit of 8 from two NIBs, for the row kernels
+#define UNIB(F) UNIT(F) { \
+    uint k = 2*(e%4); \
+    float4 z = 0; \
+    return k < 4 ? n_##F(b, e - e%4 + k, xa, z) + n_##F(b, e - e%4 + k + 1, xb, z) \
+                 : n_##F(b, e - e%4 + k - 4, z, xa) + n_##F(b, e - e%4 + k - 3, z, xb); \
+}
+UNIB(rq5)
+UNIB(rq6)
+
 #define ACCN(F, NH, R, w0, x) \
     for (uint k = 0; 32*k + l < U; k++) { \
         device const packed_float4 *xp = \
@@ -235,6 +265,8 @@ KERNELS(iq2_s, R(8))
 KERNELS(iq3_xxs, R(8))
 KERNELS_(iq4_nl, R(4), ACC16)
 KERNELS_(nvfp4, R(8), ACC8)
+KERNELS_(rq5, R(4), ACC16)
+KERNELS_(rq6, R(4), ACC16)
 
 // device bandwidth ceiling: every thread sums a contiguous run of words
 kernel void bw(constant P &p, device const uint4 *w [[buffer(1)]],

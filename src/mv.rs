@@ -22,7 +22,7 @@ pub const SRC: &str = concat!(
 struct P(u32, u32, u32, u32); // n_in, n_out, row bytes, experts
 
 // (type, name, rows per threadgroup as in mv.metal)
-const TY: [(u32, &str, usize); 12] = [
+const TY: [(u32, &str, usize); 14] = [
     (0, "f32", 2),
     (30, "bf16", 2),
     (8, "q8_0", 4),
@@ -35,6 +35,8 @@ const TY: [(u32, &str, usize); 12] = [
     (18, "iq3_xxs", 8),
     (20, "iq4_nl", 4),
     (40, "nvfp4", 8),
+    (105, "rq5", 4),
+    (106, "rq6", 4),
 ];
 
 pub fn name(ty: u32) -> &'static str {
@@ -183,6 +185,13 @@ pub fn deq(ty: u32, row: &[u8], n: usize) -> Vec<f32> {
                     };
                     let q = u(4 + 8 * s + e % 8) >> (4 * (e % 16 / 8)) & 15;
                     FP4[q] as f32 * d * 0.5
+                }
+                105 | 106 => {
+                    let (hb, c) = (ty as usize - 104, e % 16);
+                    let hi = (0..hb).fold(0, |a, i| a | u(18 + hb * (c / 4) + i) << (8 * i));
+                    let q = u(2 + c) >> (4 * (e / 16)) & 15
+                        | (hi >> (hb * (c % 4 + e / 16 * 4)) & ((1 << hb) - 1)) << 4;
+                    h(0) * (q as f32 - (8 << hb) as f32)
                 }
                 16 => {
                     let (ib, l) = (k / 4, k % 4);

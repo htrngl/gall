@@ -117,6 +117,7 @@ pub struct Model {
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
     pf: Option<pf::Pf>,
+    rq: crate::rq::Rq,
 }
 
 // f32 to f16, round to nearest; tiny values to 0
@@ -282,6 +283,7 @@ impl Model {
             t: 0.,
             ck: None,
             pf: None,
+            rq: crate::rq::Rq::open(g, &gpu, &crate::up::cache()),
             g,
             gpu,
         }
@@ -369,13 +371,14 @@ impl Model {
         macro_rules! mv {
             ($n:expr, $t:expr, $x:expr, $y:expr, $ni:expr, $no:expr) => {{
                 let (t, x, y): (T, usize, usize) = ($t, $x, $y);
-                ops.push((crate::mv::name(t.ty), vi, Box::new(move |e: &Enc| {
-                    let (w, id) = (self.gpu.w(t), (&self.id, io));
+                let (ty, w) = self.rq.w(&self.gpu, t);
+                ops.push((crate::mv::name(ty), vi, Box::new(move |e: &Enc| {
+                    let id = (&self.id, io);
                     let (x, y) = ((&self.a, ro + 4 * x), (&self.a, ro + 4 * y));
                     match $n {
                         "up" => self.mv.experts_up(e, t.ty, w, id, x, y, $ni, $no),
                         "down" => self.mv.experts_down(e, t.ty, w, id, x, y, $ni, $no),
-                        _ => self.mv.dense(e, t.ty, w, x, y, $ni, $no),
+                        _ => self.mv.dense(e, ty, w, x, y, $ni, $no),
                     }
                 }), Some(($n, t, x, y))));
             }};

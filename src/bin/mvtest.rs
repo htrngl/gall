@@ -6,6 +6,8 @@ mod gguf;
 mod gpu;
 #[path = "../mv.rs"]
 mod mv;
+#[path = "../rq.rs"]
+mod rq;
 use gpu::*;
 use std::collections::BTreeMap;
 
@@ -118,21 +120,22 @@ fn main() {
         );
     }
 
-    // synth: attention as a 4-bit plain format. the nvfp4 unit as a dense
-    // mat-vec over slabs of nvfp4 bytes, against q8_0 on the real tensors;
-    // n = q8_0 dispatches per token (layers 6-17 run 3 times)
+    // synth: attention in every candidate format. each unit as a dense
+    // mat-vec over slabs of expert bytes (timing only), against q8_0 on
+    // the real tensors; n = q8_0 dispatches per token (layers 6-17 run 3x)
     if filt == "synth" {
         let nv: Vec<_> = g.t.values().filter(|t| t.ty == 40).collect();
-        let mut tot = [0f64; 3];
+        const TY: [u32; 8] = [8, 40, 20, 12, 13, 14, 105, 106];
+        let mut tot = [0f64; 8];
         for (n_in, n_out) in [(2304, 3072), (2304, 1024), (2304, 384), (3072, 2304)] {
             let q8: Vec<_> = g.t.values().filter(|t| t.ty == 8 && t.dims == [n_in, n_out]).collect();
             let n: usize = q8.iter().map(|t| {
                 let l: usize = t.name.split('.').nth(1).unwrap().parse().unwrap();
                 if (6..18).contains(&l) { 3 } else { 1 }
             }).sum();
-            let slab = n_out * n_in / 64 * 36;
-            let reps = 2000;
+            let reps = 1000;
             let time = |ty: u32| {
+                let slab = n_out * n_in / gguf::blk(ty).0 * gguf::blk(ty).1;
                 let run = || gpu.run(|e| for i in 0..reps {
                     let w = if ty == 8 { gpu.w(q8[i % q8.len()]) } else {
                         let t = nv[i % nv.len()];
@@ -143,12 +146,55 @@ fn main() {
                 }) / reps as f64 * 1e3;
                 run().min(run())
             };
-            let (a, b) = (time(8), time(40));
-            let (a, b) = (a.min(time(8)), b.min(time(40)));
-            println!("{n_in}x{n_out}: q8_0 {a:.4} ms, 4-bit {b:.4} ms, {n} per token: {:.2} -> {:.2} ms", a * n as f64, b * n as f64);
-            tot = [tot[0] + a * n as f64, tot[1] + b * n as f64, tot[2] + n as f64];
+            let a = TY.map(time);
+            let b = TY.map(time);
+            print!("{n_in}x{n_out} x{n}:");
+            for i in 0..8 {
+                let v = a[i].min(b[i]);
+                tot[i] += v * n as f64;
+                print!(" {} {v:.4}", mv::name(TY[i]));
+            }
+            println!(" ms");
         }
-        println!("q8_0 attention, {} dispatches per token: {:.2} -> {:.2} ms, {:.2} saved", tot[2], tot[0], tot[1], tot[0] - tot[1]);
+        for i in 0..8 {
+            println!("{:8} {:6.2} ms per token, {:5.2} saved", mv::name(TY[i]), tot[i], tot[0] - tot[i]);
+        }
+        return;
+    }
+
+    // rq [name]: every q8_0 attention tensor and the head, requantized
+    // (rq.rs). per bit width: relative error, worst error of the mat-vec
+    // and row kernels against the scalar reference, ms of one mat-vec
+    if filt == "rq" {
+        let f = std::env::args().nth(2).unwrap_or_default();
+        let mut ts: Vec<_> = g.t.values().filter(|t| t.name.contains(&f)).collect();
+        ts.retain(|t| t.ty == 8 || t.name == "output.weight");
+        ts.sort_by_key(|t| t.off);
+        for t in ts {
+            let (n_in, n_out) = (t.dims[0], t.dims[1]);
+            print!("{:26}", t.name);
+            for bits in 4..7 {
+                let (ty, rb) = (rq::ty(bits), rq::size(bits, n_in, 1));
+                let w = gpu.buf(n_out * rb);
+                let wb = &mut slice::<u8>(&w)[..n_out * rb];
+                let e = rq::quant(t.ty, g.data(t), n_in, bits, wb);
+                let run = |_| gpu.run(|e| m.dense(e, ty, (&w, 0), (&x, 0), (&y, 0), n_in, n_out));
+                let ms = 1e3 * (0..8).map(run).fold(1f64, f64::min);
+                let (mut err, mut nrm) = (0f32, 0f32);
+                for r in (0..n_out).step_by(n_out / 40) {
+                    let d = mv::deq(ty, &wb[r * rb..], n_in);
+                    let v = d.iter().zip(&*xs).map(|(a, b)| (a * b) as f64).sum::<f64>();
+                    err = err.max((v as f32 - ys[r]).abs());
+                    nrm = nrm.max(v.abs() as f32);
+                }
+                gpu.run(|e| m.row(e, ty, (&w, 0), 7, (&y, 0), n_in));
+                let d = mv::deq(ty, &wb[7 * rb..], n_in);
+                let re = d.iter().zip(&*ys).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                let fail = if err / nrm > 1e-4 || re > 1e-6 { " FAIL" } else { "" };
+                print!(" {bits}: {:.4} {:.0e}{fail} {ms:.3} ms", (e[0] / e[1]).sqrt(), err / nrm);
+            }
+            println!();
+        }
         return;
     }
 

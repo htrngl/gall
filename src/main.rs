@@ -10,6 +10,7 @@ mod gguf;
 mod gpu;
 mod model;
 mod mv;
+mod rq;
 mod serve;
 mod tok;
 mod up;
