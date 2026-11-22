@@ -108,6 +108,17 @@ impl Gpu {
         p
     }
 
+    // encode with f and commit; the next command buffer runs after it
+    pub fn go(&self, f: impl FnOnce(&Enc)) {
+        autoreleasepool(|_| {
+            let cb = self.q.commandBuffer().unwrap();
+            let e = cb.computeCommandEncoder().unwrap();
+            f(&e);
+            e.endEncoding();
+            cb.commit();
+        })
+    }
+
     // encode with f, commit, wait. returns gpu seconds.
     pub fn run(&self, f: impl FnOnce(&Enc)) -> f64 {
         autoreleasepool(|_| {

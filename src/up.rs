@@ -1,4 +1,4 @@
-// gall up [ctx] | down | log | model | test: the server as a background
+// gall up [ctx] [serve flags] | down | log | model | test: the server as a background
 // process (port 9940; log and pid in ~/.cache/gall), the model path, and a
 // greedy self-test against 64 reference tokens from llama.cpp
 use std::os::{fd::IntoRawFd, unix::process::CommandExt};
@@ -8,6 +8,7 @@ use std::{env, fs, net::TcpStream, path::PathBuf, thread, time::Duration};
 
 const REPO: &str = "unsloth/Inkling-2-Mini-GGUF";
 const FILE: &str = "Inkling-2-Mini-UD-IQ3_XXS.gguf";
+pub const MMPROJ: &str = "mmproj-F16.gguf"; // the vision encoder
 
 pub fn cache() -> PathBuf {
     let d = PathBuf::from(env::var("HOME").unwrap()).join(".cache/gall");
@@ -26,10 +27,14 @@ pub fn model() -> String {
     let hit = fs::read_dir(hub).ok().into_iter().flatten()
         .flatten().map(|d| d.path().join(FILE)).find(|p| p.exists());
     let p = hit.unwrap_or(cache().join(FILE));
-    if !p.exists() {
-        eprintln!("gall: fetching {FILE} (11.7GB) to {}", p.display());
+    for (f, gb) in [(FILE, 11.7), (MMPROJ, 0.6)] {
+        let p = p.with_file_name(f);
+        if p.exists() {
+            continue;
+        }
+        eprintln!("gall: fetching {f} ({gb}GB) to {}", p.display());
         let part = p.with_extension("part");
-        let url = format!("https://huggingface.co/{REPO}/resolve/main/{FILE}");
+        let url = format!("https://huggingface.co/{REPO}/resolve/main/{f}");
         let c = Command::new("curl").args(["-fL", "-C", "-", "-o"])
             .arg(&part).arg(url).status();
         if !c.is_ok_and(|s| s.success()) {
@@ -75,8 +80,11 @@ pub fn lock(on: bool) {
     if !on {
         op(libc::LOCK_UN);
     } else if op(libc::LOCK_EX | libc::LOCK_NB) {
+        // /tmp/gall.want asks ./wd runs to let the server go first
         eprintln!("gall: /tmp/gall.lock is held, waiting");
+        fs::write("/tmp/gall.want", std::process::id().to_string()).ok();
         op(libc::LOCK_EX);
+        fs::remove_file("/tmp/gall.want").ok();
     }
 }
 
@@ -97,7 +105,7 @@ pub fn main(a: &[String]) {
             let (m, f) = (model(), fs::File::create(&log).unwrap());
             let ctx = a.get(1).map_or("102400", |s| s);
             let mut c = Command::new(env::current_exe().unwrap())
-                .args(["serve", &m, "--ctx", ctx])
+                .args(["serve", &m, "--ctx", ctx]).args(a.iter().skip(2))
                 .stdin(Stdio::null()).stdout(f.try_clone().unwrap())
                 .stderr(f).process_group(0).spawn().unwrap();
             fs::write(pid, c.id().to_string()).unwrap();

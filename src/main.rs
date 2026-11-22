@@ -3,8 +3,9 @@
 // gall pp MODEL TOKENS [-n all] [-ub 512] [-c 4096] [--cmp] [--ref REFDIR]
 // gall mmb
 // gall tok MODEL FILE
+// gall vis MMPROJ IMAGE [REF.f32]
 // gall serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
-// gall up [CTX] | down | log | model | test (see up.rs)
+// gall up [CTX] [SERVE FLAGS] | down | log | model | test (see up.rs)
 mod dr;
 mod gguf;
 mod gpu;
@@ -13,6 +14,7 @@ mod mv;
 mod serve;
 mod tok;
 mod up;
+mod vis;
 use std::{collections::BTreeMap, fs, time::Instant};
 
 fn ids(p: &str) -> Vec<u32> {
@@ -63,6 +65,7 @@ fn main() {
         "run" if a.iter().any(|x| x == "--draft") => return dr::run(&a[2..]),
         "mmb" => return model::pf::bench(),
         "tok" => return tok::main(&a[2..]),
+        "vis" => return vis::main(&a[2..]),
         "serve" => return serve::main(&a[2..]),
         _ => {}
     }
@@ -146,8 +149,18 @@ fn main() {
                 ops.iter().for_each(|o| *by.entry(o.0).or_default() += 1);
                 eprintln!("{} dispatches, {:.1} ms", ops.len(), 1e3 * all);
                 by.extend([("small", 0), ("weights", 0)]);
+                // then the kind alone: ms, us per dispatch
                 for (k, c) in by {
-                    eprintln!("{k:8} {c:5} {:7.2} ms", 1e3 * (run("") - run(k)));
+                    let f = |_| m.gpu.run(|e| {
+                        ops.iter().filter(|o| o.0 == k).for_each(|o| o.2(e))
+                    });
+                    let t = c.min(1) as f64 * (0..8).map(f).fold(1., f64::min);
+                    eprintln!(
+                        "{k:8} {c:5} {:7.2} ms, alone {:6.2} ms {:6.1} us",
+                        1e3 * (run("") - run(k)),
+                        1e3 * t,
+                        1e6 * t / c.max(1) as f64
+                    );
                 }
             }
         }

@@ -10,7 +10,7 @@
 // gall run MODEL --tokens FILE --draft DRAFTER [--block B] [-n 64] [-c 4096]
 use crate::gguf::{self, Gguf, Tensor};
 use crate::gpu::*;
-use crate::model::{Model, Op};
+use crate::model::{Model, Op, FT};
 use objc2_metal::*;
 use std::time::Instant;
 use crate::mv::{name, Mv};
@@ -31,8 +31,8 @@ const KINDS: [&str; 16] = [
 // drm.metal x_*: (type, weight rows per threadgroup at 1 use), as XS there
 const XT: [(u32, usize); 10] = [(8, 4), (12, 2), (13, 2), (14, 2), (16, 8),
     (17, 4), (18, 8), (20, 4), (22, 8), (40, 8)];
-// target activations, as in model.rs: residual, normed output, its source
-const TA: [usize; 3] = [2 * N, 3 * N, 15 * N];
+// target activations, as in model.rs: the normed output and its source
+const TA: [usize; 2] = [3 * N, 15 * N];
 // drafter activations, in floats; block regions hold 8 rows
 const CX: usize = 0; // 3 layer contexts, f_rnn
 const KC: usize = 4 * N; // context k, v per layer
@@ -77,7 +77,8 @@ pub struct Dr {
 }
 
 impl Dr {
-    pub fn open(m: &Model, path: &str, n_ctx: usize) -> Dr {
+    pub fn open(m: &mut Model, path: &str, n_ctx: usize) -> Dr {
+        m.taps();
         let g: &'static Gguf = Box::leak(Box::new(gguf::open(path)));
         let mut w = Gpu::new();
         w.map(g);
@@ -227,15 +228,10 @@ impl Dr {
             let b = [(&m.a, 4 * r * rs), (&self.b, 0)];
             ("tap", Box::new(move |e: &Enc| call(e, &self.pipes["tap"], &p, &b, [72, 1, 1], 32)))
         };
-        let (mut gu, mut seen) = (0, 0);
+        let mut gu = 0;
         for o in &ops {
             let Some((mode, w, x, y)) = o.3.filter(|_| t > 1) else {
                 q.push((o.0, Box::new(move |e: &Enc| o.2(e))));
-                let i = [5, 23, 41].iter().position(|&v| v == o.1);
-                if let Some(i) = i.filter(|_| o.0 == "elem" && seen < o.1) {
-                    seen = o.1;
-                    (0..t).for_each(|r| q.push(tap(r, i, TA[0], 0)));
-                }
                 continue;
             };
             let (ni, no) = (w.dims[0], w.dims[1]);
@@ -272,7 +268,10 @@ impl Dr {
                 })));
             }
         }
-        (0..t).for_each(|r| q.push(tap(r, 3, TA[1], TA[2])));
+        for r in 0..t {
+            (0..3).for_each(|i| q.push(tap(r, i, FT + i * N, 0)));
+            q.push(tap(r, 3, TA[0], TA[1]));
+        }
         inj.iter().for_each(|o| q.push((o.0, Box::new(move |e: &Enc| o.2(e)))));
         if std::env::var("PROF").is_ok_and(|_| t > 1) {
             // every dispatch in its own command buffer: read as shares
@@ -324,13 +323,27 @@ impl Dr {
                 m.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
             }
         }));
-        rest.iter().fold(0, |_, &t| self.step(m, t))
+        // the tail may hold image rows: the general path
+        rest.iter().fold(0, |_, &t| {
+            let r = self.pass(m, &[t])[0];
+            self.commit(m, 1, 0);
+            r
+        })
     }
 
     // one target token with its context; greedy next id
     pub fn step(&self, m: &mut Model, tok: u32) -> u32 {
-        let r = self.pass(m, &[tok])[0];
-        self.commit(m, 1, 0);
+        let r = m.step(tok);
+        // the next token's command buffer comes after this one
+        let ops = self.inject(m.pos - 1, 0);
+        m.gpu.go(|e| {
+            let p = |i: usize| if i < 3 { [FT + i * N, 0] } else { TA };
+            for i in 0..4 {
+                let p = [p(i)[0], FR + i * N, p(i)[1]].map(|v| v as u32);
+                call(e, &self.pipes["tap"], &p, &[(&m.a, 0), (&self.b, 0)], [72, 1, 1], 32);
+            }
+            ops.iter().for_each(|o| o.2(e))
+        });
         r
     }
 
@@ -554,7 +567,7 @@ pub fn main(a: &[String]) {
     let (n, d) = (opt("-n", 64), &a[2]);
     let mut m = Model::open(&a[0], opt("-c", 4096));
     m.reset();
-    let dr = Dr::open(&m, &a[1], opt("-c", 4096));
+    let dr = Dr::open(&mut m, &a[1], opt("-c", 4096));
     let mut all = crate::ids(&format!("{d}/tokens.txt"));
     let np = all.len();
     all.extend(crate::ids(&format!("{d}/gen.txt")));
@@ -626,7 +639,7 @@ pub fn run(a: &[String]) {
     let mut m = Model::open(&a[0], ctx);
     m.reset();
     let t0 = Instant::now();
-    let dr = Dr::open(&m, opt("--draft").unwrap(), ctx);
+    let dr = Dr::open(&mut m, opt("--draft").unwrap(), ctx);
     eprintln!("drafter: open {:.2} s", t0.elapsed().as_secs_f64());
     let next = dr.feed(&mut m, &crate::ids(opt("--tokens").expect("--tokens FILE")));
     let (mut st, mut out, t0) = (Spec::new(), 0, Instant::now());
