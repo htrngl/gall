@@ -861,7 +861,7 @@ impl Lm for Dummy {
     }
 }
 
-// the engine as an Lm; a checkpoint after each feed (the prompt). the
+// the engine as an Lm; a checkpoint at each feed (the prompt). the
 // vision encoder, and the ids of the images seen by a hash of their url
 struct Ink(crate::model::Model, Vec<f32>, crate::model::snap::Snaps,
     Option<Vis>, HashMap<u64, Range<u32>>);
@@ -881,9 +881,15 @@ impl Lm for Ink {
     fn truncate(&mut self, n: usize) -> bool {
         self.0.truncate(n)
     }
+    // the checkpoint is before the last token: the same prompt again
+    // (regenerate) goes back to it
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
-        self.0.feed(toks);
+        let (l, h) = toks.split_last().unwrap();
+        if !h.is_empty() {
+            self.0.feed(h);
+        }
         self.0.save();
+        self.0.step(*l);
         self.1 = self.0.logits();
         &self.1
     }

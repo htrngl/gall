@@ -38,6 +38,7 @@ extern "C" {
                    a: *const f32, lda: i32, b: *const f32, ldb: i32, be: f32,
                    c: *mut f32, ldc: i32);
     fn erff(x: f32) -> f32;
+    fn vvexpf(y: *mut f32, x: *const f32, n: &i32);
 }
 
 const A: usize = 40; // pixels per output token side: patch 20, merge 2
@@ -177,12 +178,16 @@ impl Vis {
         let mut x = self.ln(&x, "v.pre_ln");
         // rope: dims 0..32 of a head turn with the column, 32..64 with the
         // row; the cls token is at (0, 0), patches count from 1
+        let sc = |p: usize| (0..16).map(move |j| {
+            (p as f32 * 1e4f32.powf(-(j as f32) / 16.)).sin_cos()
+        });
+        let sc: Vec<_> = (0..gw * gh).flat_map(|q| {
+            sc(q % gw + 1).chain(sc(q / gw + 1))
+        }).collect();
         let rope = |v: &mut [f32]| {
-            for (q, r) in v.chunks_mut(E).enumerate().skip(1) {
-                let pos = [(q - 1) % gw + 1, (q - 1) / gw + 1];
+            for (r, sc) in v.chunks_mut(E).skip(1).zip(sc.chunks(32)) {
                 for (j, c) in r.chunks_mut(2).enumerate() {
-                    let th = pos[j / 16 % 2] as f32 * 1e4f32.powf(-(j as f32 % 16.) / 16.);
-                    let (s, k) = th.sin_cos();
+                    let (s, k) = sc[j % 32];
                     (c[0], c[1]) = (c[0] * k - c[1] * s, c[0] * s + c[1] * k);
                 }
             }
@@ -208,7 +213,8 @@ impl Vis {
                 mm(n, n, 64, 0.125, &q[hd..], E, &k[hd..], E, true, &mut s, n);
                 for r in s.chunks_mut(n) {
                     let m = r.iter().fold(f32::MIN, |a, &b| a.max(b));
-                    r.iter_mut().for_each(|x| *x = (*x - m).exp());
+                    r.iter_mut().for_each(|x| *x -= m);
+                    unsafe { vvexpf(r.as_mut_ptr(), r.as_ptr(), &(n as i32)) };
                     let t = r.iter().sum::<f32>();
                     r.iter_mut().for_each(|x| *x /= t);
                 }
