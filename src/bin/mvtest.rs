@@ -1,5 +1,7 @@
 // mvtest [filter]: every weight kernel against the scalar reference,
 // with its read rate. env: M (gguf), DEFS (extra #defines, ';' = newline).
+// mvtest synth | rq [name]: attention in other formats (timing), and the
+// requantized tensors of rq.rs (error, kernels).
 #[path = "../gguf.rs"]
 mod gguf;
 #[path = "../gpu.rs"]

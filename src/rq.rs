@@ -55,9 +55,10 @@ fn block(x: &[f32], t: &[f32]) -> (f32, [u8; 32], f32) {
         let f = [1., -1.][c / 8] * (0.5375 + 0.075 * (c % 8) as f32);
         let mut s = f * max / -t[0];
         for _ in 0..2 {
-            let (mut q, mut xt, mut tt) = ([0u8; 32], 0f32, 0f32);
-            for m in t.windows(2).map(|w| (w[0] + w[1]) / 2. * s) {
-                (0..32).for_each(|i| q[i] += ((x[i] > m) == (s > 0.)) as u8);
+            let (mut q, mut v, mut xt, mut tt) = ([0u8; 32], [0f32; 32], 0f32, 0f32);
+            (0..32).for_each(|i| v[i] = x[i] / s);
+            for m in t.windows(2).map(|w| (w[0] + w[1]) / 2.) {
+                (0..32).for_each(|i| q[i] += (v[i] > m) as u8);
             }
             for i in 0..32 {
                 let v = t[q[i] as usize];
@@ -117,7 +118,7 @@ pub fn quant(ty: u32, src: &[u8], n_in: usize, bits: usize, out: &mut [u8]) -> [
 impl Rq {
     pub fn open(g: &'static Gguf, gpu: &Gpu, dir: &Path) -> Rq {
         let spec = std::env::var("RQ").unwrap_or_default();
-        let (mut at, mut jobs, mut n) = (HashMap::new(), vec![], 0);
+        let (mut at, mut parts, mut n) = (HashMap::new(), vec![], 0);
         for part in spec.split(',').filter(|p| !p.is_empty()) {
             let mut f = part.split(':');
             let bits = f.next().unwrap().parse().ok().filter(|b| (4..7).contains(b));
@@ -125,6 +126,7 @@ impl Rq {
             let kinds = f.next().unwrap_or("qkvogr");
             let r = f.next().and_then(|r| r.split_once('-')).unwrap_or(("0", "23"));
             let [lo, hi] = [r.0, r.1].map(|v| v.parse::<usize>().expect("RQ: layers"));
+            let (mut jobs, n0) = (vec![], n);
             for (c, i) in kinds.chars().flat_map(|c| (lo..=hi).map(move |i| (c, i))) {
                 let k = ["q", "k", "v", "output", "gate", "rel", "h"];
                 let k = k.iter().find(|k| k.starts_with(c)).expect("RQ: kind");
@@ -132,27 +134,32 @@ impl Rq {
                 let t = &g.t[if c == 'h' { "output.weight" } else { name.as_str() }];
                 if (t.ty == 8 || c == 'h') && !at.contains_key(t.name) {
                     at.insert(t.name, (ty(bits), n));
-                    jobs.push((t, bits, n));
+                    jobs.push((t, n - n0));
                     n += size(bits, t.dims[0], t.dims[1]);
                 }
             }
+            parts.push((part, bits, jobs, n0..n));
         }
-        if jobs.is_empty() {
+        if n == 0 {
             return Rq::default();
         }
         let buf = gpu.buf(n);
-        let out = &mut slice::<u8>(&buf)[..n];
-        // the file is named by the spec and a sample of the weights
-        let mut h = DefaultHasher::new();
-        (1, g.map.len(), &spec).hash(&mut h);
-        jobs.iter().for_each(|j| g.data(j.0)[..64].hash(&mut h));
-        let p = dir.join(format!("{:016x}.rq", h.finish()));
-        let read = |mut f: fs::File| {
-            f.metadata().unwrap().len() == n as u64 && f.read_exact(out).is_ok()
-        };
-        if !fs::File::open(&p).is_ok_and(read) {
+        for (part, bits, jobs, r) in parts {
+            // a file per group, named by its tensors
+            let out = &mut slice::<u8>(&buf)[r];
+            let mut h = DefaultHasher::new();
+            (1, bits, g.map.len()).hash(&mut h);
+            jobs.iter().for_each(|j| (j.0.off, &g.data(j.0)[..64]).hash(&mut h));
+            let p = dir.join(format!("{:016x}.rq", h.finish()));
+            let n = out.len();
+            let read = |mut f: fs::File| {
+                f.metadata().unwrap().len() == n as u64 && f.read_exact(out).is_ok()
+            };
+            if fs::File::open(&p).is_ok_and(read) {
+                continue;
+            }
             let (t0, mut e) = (Instant::now(), 0.);
-            for &(t, bits, o) in &jobs {
+            for &(t, o) in &jobs {
                 let o = &mut out[o..][..size(bits, t.dims[0], t.dims[1])];
                 let r = quant(t.ty, g.data(t), t.dims[0], bits, o);
                 e += r[0] / r[1] / jobs.len() as f64;
@@ -160,7 +167,7 @@ impl Rq {
             let tmp = p.with_extension(std::process::id().to_string());
             fs::write(&tmp, &*out).and_then(|_| fs::rename(&tmp, &p)).expect("rq: cache");
             eprintln!(
-                "gall: RQ={spec}: {} tensors, {} MB, relative error {:.4}, {:.1} s",
+                "gall: RQ={part}: {} tensors, {} MB, relative error {:.4}, {:.1} s",
                 jobs.len(),
                 n >> 20,
                 e.sqrt(),

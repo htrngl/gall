@@ -79,6 +79,7 @@ reference dumps made with `tools/refdump` against the llama.cpp build in
 
 - `src/gguf.rs`, `gpu.rs`: GGUF mmap, metal host.
 - `src/mv.*`, `grids.metal`: mat-vec kernels for the 12 weight formats.
+- `src/rq.rs`: attention weights requantized at load (`RQ`, see below).
 - `src/model.rs`, `ops.metal`: single-token decode, KV rings, rollback.
 - `src/pf*`: batched prefill.
 - `src/tok.rs`, `serve.rs`, `snap.rs`, `up.rs`: tokenizer, chat template and
@@ -102,9 +103,26 @@ reference dumps made with `tools/refdump` against the llama.cpp build in
   size stays 0. it needs dequant-once expert kernels.
 - prefill uses half-precision tiles, as llama.cpp does; `HT` in `pfm.metal`
   switches to float at about 0.8x the speed.
+- `RQ=5` requantizes the 100 q8_0 attention projections (234 dispatches
+  per token) from their q8_0 values to 5 bits in a buffer of 293 MB: 4.8 s
+  the first time, then read from `~/.cache/gall/*.rq` with no measurable
+  load time. the attention read goes from 12.9 to 8.8 ms and a token from
+  50.8 to 47.2 ms; `RQ=6` gives 48.7 ms and `RQ=4` 46.0 ms. `RQ=5,5:h` also
+  moves the q5_k output head to 5 bits (303 MB more; 5.36 to 3.35 ms):
+  45.5-46.2 ms per token. prefill and the drafter read the file's tensors.
+- `RQ` is off by default because it changes the weights (relative error
+  4.5% at 5 bits, 2.3% at 6, 7.7% at 4). on `ref/short` the kl mean goes
+  from 1.05e-4 to 3.2e-3 at 5 bits, 2.8e-3 at 6 and 1.3e-2 at 4, with 0,
+  0 and 1 greedy mismatches of 64 (3.8e-3 and 1 with the head); on
+  `ref/2k` from 1.1e-3 to 2.4e-3, 1.4e-3 and 2.8e-3, with 2, 1 and 2
+  mismatches. one tensor of 0.9M weights at 6 bits (`RQ=6:r:0-0`) already
+  gives 1.4e-3 and 1 mismatch on `ref/short`. on 500 tokens of each of two
+  texts, teacher-forced, the nll does not move (-0.001 +- 0.004 at 4 bits)
+  and the kl to the engine without `RQ` is 1.6-1.8e-3, 2.8-2.9e-3 and
+  4.5-4.7e-3 at 6, 5 and 4 bits (2.9e-4 for the one tensor). no choice of
+  projection kinds or layers did better than a lower bit width.
 - not done: grammar and `response_format`, images, concurrent requests,
-  drafting in the server, a 4-bit attention requant (projected 3.7 ms per
-  token, needs the 53GB original and a quality check).
+  drafting in the server.
 
 ## Licence
 
