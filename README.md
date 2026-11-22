@@ -87,10 +87,10 @@ on 21 November 2026. The MacBook Air has no fan. Throughput drops by roughly
 
 | Measurement | llama.cpp (`llama/`) | Gall |
 | --- | --- | --- |
-| Decode, short context | 15 t/s | 19.5 t/s cold, approximately 18 t/s warm |
+| Decode, short context | 15 t/s | 20.5 t/s cold |
 | Decode, 8k context | 12.4 t/s | 17.6 t/s |
 | Decode, 31.5k context (real prompt) | No reliable measurement | 13.8–14.6 t/s |
-| Prefill, 512 tokens | 121 t/s | 108–125 t/s |
+| Prefill, 512 tokens | 121 t/s | 130 t/s |
 | Prefill, 10.5k tokens | 89 t/s (measured to 8.3k) | 106 t/s |
 | Time to first token with a stored prefix | Not measured | 0.5–1.2 s |
 
@@ -130,9 +130,14 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
 
 ## Implementation status and limitations
 
-- Weight processing accounts for 45 of 51 ms per token. Each format takes
-  7–12 ps per element. Two tuning passes on the expert gate-up kernels
-  produced no further improvement.
+- Weight processing accounts for 44.2 of 48.2 ms per token, and small
+  kernels for 4.9 ms, in 1,071 dispatches. A token is one command buffer,
+  encoded while the previous token runs. Wall time is 0.4 ms above GPU time.
+- The expert kernels take 23 ms per token and are bound by arithmetic, not
+  by memory reads. An iq3_xxs gate-up visit takes 0.30 ms, of which the
+  loads take 0.20 ms. Three tuning passes produced no further improvement.
+- The k-quant kernels unpack 4 bytes as one word. The q5_k head reads at
+  73 GB/s (4.4 ms), and q6_k at 87 GB/s.
 - KV cache reads limit performance at longer contexts, at 81 GB/s.
   Decode takes 56.7 ms at 8k, 67 ms at 32k, and 102 ms at 100k.
   The 32k and 100k measurements use synthetic inputs.
