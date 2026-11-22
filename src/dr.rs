@@ -625,10 +625,12 @@ pub fn run(a: &[String]) {
     let (n, ctx) = (opt("-n").map_or(64, |v| v.parse().unwrap()), opt("-c").map_or(4096, |v| v.parse().unwrap()));
     let mut m = Model::open(&a[0], ctx);
     m.reset();
+    let t0 = Instant::now();
     let dr = Dr::open(&m, opt("--draft").unwrap(), ctx);
+    eprintln!("drafter: open {:.2} s", t0.elapsed().as_secs_f64());
     let next = dr.feed(&mut m, &crate::ids(opt("--tokens").expect("--tokens FILE")));
     let (mut st, mut out, t0) = (Spec::new(), 0, Instant::now());
-    st.block = opt("--block").map(|v| v.parse().unwrap());
+    st.block = opt("--block").map(|v| v.parse::<usize>().unwrap().min(7));
     dr.generate(&mut m, next, &mut st, |t| {
         print!("{t} ");
         out += 1;
