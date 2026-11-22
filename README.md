@@ -140,8 +140,8 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
   `pfm.metal` selects float precision at approximately 0.8 times the speed.
 - The vision encoder runs on the GPU. A 640 x 488 image (208 tokens) takes
   0.8 s and a 960 x 1280 image (768 tokens) takes 4.2 s. Its output is within 2.9e-3 (relative) of llama.cpp's
-  (`gall vis`, `tools/imgref.cpp`). The server does not store a prefix
-  snapshot for a prompt that contains an image.
+  (`gall vis`, `tools/imgref.cpp`). The rows of the 32 newest images are
+  kept in `~/.cache/gall/img`.
 - Unsupported features include grammar constraints, `response_format`,
   concurrent requests, and drafting in the server.
 - A proposed 4-bit attention requantization has a projected cost of

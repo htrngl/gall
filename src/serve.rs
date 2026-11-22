@@ -11,7 +11,7 @@
 // <|content_text|> or NAME<|content_invoke_tool_json|>, each closed by
 // <|end_message|>. a new prompt that extends the last one is fed from
 // where they part.
-use crate::{tok::Tok, vis::Vis};
+use crate::{model::Model, tok::Tok, vis::Vis};
 use std::{collections::HashMap, ops::Range};
 use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -868,9 +868,9 @@ impl Lm for Dummy {
 }
 
 // the engine as an Lm; a checkpoint at each feed (the prompt). the
-// vision encoder, and the ids of the images seen by a hash of their url
+// vision encoder, and the row count of each image held, by its url's hash
 struct Ink(crate::model::Model, Vec<f32>, crate::model::snap::Snaps,
-    Option<Vis>, HashMap<u64, Range<u32>>);
+    Option<Vis>, HashMap<u64, usize>);
 
 impl Lm for Ink {
     fn reset(&mut self) {
@@ -907,27 +907,49 @@ impl Lm for Ink {
         let mut h = std::hash::DefaultHasher::new();
         std::hash::Hash::hash(url, &mut h);
         let key = std::hash::Hasher::finish(&h);
-        if let Some(r) = self.4.get(&key) {
-            return Ok(r.clone());
+        if let Some(&n) = self.4.get(&key) {
+            return Ok(Model::ids(key as u32, n));
         }
-        let b = match url.split_once(";base64,") {
-            Some((_, b)) if url.starts_with("data:") => b64(b),
-            _ if url.starts_with("http") => {
-                let c = std::process::Command::new("curl")
-                    .args(["-sfL", "--max-time", "30", "--", url]).output();
-                c.map(|o| o.stdout).unwrap_or_default()
+        // rows are kept on disk too (the 32 newest), for after an unload
+        let dir = crate::up::cache().join("img");
+        let f = dir.join(format!("{key:016x}.{}", v.max));
+        let e = crate::f32s(f.to_str().unwrap());
+        let e = if !e.is_empty() { e } else {
+            let b = match url.split_once(";base64,") {
+                Some((_, b)) if url.starts_with("data:") => b64(b),
+                _ if url.starts_with("http") => {
+                    let c = std::process::Command::new("curl")
+                        .args(["-sfL", "--max-time", "30", "--", url]).output();
+                    c.map(|o| o.stdout).unwrap_or_default()
+                }
+                _ => vec![],
+            };
+            let (w, h, rgb) = crate::vis::decode(&b, v.max)
+                .ok_or("the image could not be read")?;
+            let e = v.embed(w, h, &rgb);
+            let b: Vec<u8> = e.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::create_dir_all(&dir).ok();
+            std::fs::write(&f, b).ok();
+            let age = |p: &std::path::PathBuf| p.metadata().and_then(|m| m.modified()).ok();
+            let mut old: Vec<_> = std::fs::read_dir(&dir).into_iter().flatten()
+                .flatten().map(|d| d.path()).collect();
+            old.sort_by_key(|p| std::cmp::Reverse(age(p)));
+            old.iter().skip(32).for_each(|p| { std::fs::remove_file(p).ok(); });
+            e
+        };
+        // two images with one 19-bit key: forget what was built on the first
+        let (id, m) = (|k: u64| k as u32 & 0x7ffff, &mut self.0);
+        let twin = self.4.keys().any(|&k| id(k) == id(key));
+        if twin || !m.image(key as u32, &e) {
+            (m.ni, self.4) = (0, HashMap::new());
+            m.ib.clear();
+            if twin {
+                m.reset();
             }
-            _ => vec![],
-        };
-        let (w, h, rgb) = crate::vis::decode(&b, v.max)
-            .ok_or("the image could not be read")?;
-        let Some(r) = self.0.image(&v.embed(w, h, &rgb)) else {
-            (self.0.ni, self.4) = (0, HashMap::new());
-            self.0.reset();
             return Err("the image store was full; send the request again".into());
-        };
-        self.4.insert(key, r.clone());
-        Ok(r)
+        }
+        self.4.insert(key, e.len() / 2304);
+        Ok(Model::ids(key as u32, e.len() / 2304))
     }
     fn park(&mut self, toks: &[u32]) {
         let t = Instant::now();

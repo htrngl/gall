@@ -89,7 +89,9 @@ struct L {
 // (kind, visit, encode, a weight op's (mode, tensor, x, y) in floats)
 pub type Op<'a> =
     (&'static str, usize, Box<dyn Fn(&Enc) + 'a>, Option<(&'static str, T, usize, usize)>);
-pub const IMG: u32 = 1 << 24; // token ids from here are image rows
+// an image row's token id: IMG, a 19-bit key of the image, the row
+// (12 bits). the same image has the same ids in every process
+pub const IMG: u32 = 1 << 31;
 const IMR: usize = 8192; // image rows kept
 pub const ROWS: usize = 8; // activation rows, for dr.rs's batched verify
 
@@ -108,6 +110,7 @@ pub struct Model {
     emb: T,
     im: Buf, // image embeddings, f32 rows
     pub ni: usize,
+    pub ib: HashMap<u32, usize>, // first row of an image by its key
     out: T,
     tn: u32,
     oq: u32,
@@ -270,6 +273,7 @@ impl Model {
             emb: &g.t["token_embd.weight"],
             im: gpu.buf(4 * N * IMR),
             ni: 0,
+            ib: HashMap::new(),
             out: &g.t["output.weight"],
             tn,
             oq,
@@ -301,17 +305,30 @@ impl Model {
     // a token's embedding: a row of the table, or an image row past IMG
     pub fn embd(&self, e: &Enc, tok: u32, y: B) {
         match tok.checked_sub(IMG) {
-            Some(i) => self.mv.row(e, 0, (&self.im, 0), i as usize, y, N),
+            Some(i) => {
+                let i = self.ib[&(i >> 12)] + (i & 0xfff) as usize;
+                self.mv.row(e, 0, (&self.im, 0), i, y, N)
+            }
             None => self.mv.row(e, self.emb.ty, self.gpu.w(self.emb), tok as usize, y, N),
         }
     }
 
-    // keep image rows; their token ids, or None when the store is full
-    pub fn image(&mut self, e: &[f32]) -> Option<std::ops::Range<u32>> {
+    // the token ids of an image's n rows
+    pub fn ids(key: u32, n: usize) -> std::ops::Range<u32> {
+        let a = IMG | (key & 0x7ffff) << 12;
+        a..a + n as u32
+    }
+
+    // keep the rows of image key; false when the store is full
+    pub fn image(&mut self, key: u32, e: &[f32]) -> bool {
         let (a, b) = (self.ni, self.ni + e.len() / N);
-        slice::<f32>(&self.im).get_mut(a * N..b * N)?.copy_from_slice(e);
+        let Some(r) = slice::<f32>(&self.im).get_mut(a * N..b * N) else {
+            return false;
+        };
+        r.copy_from_slice(e);
+        self.ib.insert(key & 0x7ffff, a);
         self.ni = b;
-        Some(IMG + a as u32..IMG + b as u32)
+        true
     }
 
     pub fn reset(&mut self) {
