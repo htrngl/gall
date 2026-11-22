@@ -38,12 +38,14 @@ func leaf(_ alpha: Double) -> NSImage {
         g.setAlpha(alpha) // dims the whole, with no darker crossings
         g.beginTransparencyLayer(auxiliaryInfo: nil)
         let t = NSAffineTransform()
-        t.translateX(by: 8.2, yBy: 9.8) // centred once turned
+        t.translateX(by: 9, yBy: 9)
+        t.scale(by: 1.3)
+        t.translateX(by: -0.8, yBy: 0.8) // centred once turned
         t.rotate(byDegrees: 45)
         t.translateX(by: -9, yBy: -9)
         t.concat()
         let b = path(outline + " M 9 16.6 L 9 4")
-        (b.lineWidth, b.lineCapStyle, b.lineJoinStyle) = (0.85, .round, .round)
+        (b.lineWidth, b.lineCapStyle, b.lineJoinStyle) = (0.7, .round, .round)
         NSColor.black.set()
         b.stroke()
         g.endTransparencyLayer()
