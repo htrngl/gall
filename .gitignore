@@ -4,6 +4,5 @@ scratch/
 llama/src-mix/
 llama/src-b12568/
 *.log
-env
 .claude/
 mac/.build/

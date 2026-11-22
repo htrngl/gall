@@ -70,7 +70,8 @@ impl Lazy {
     fn get(&mut self) -> &mut dyn Lm {
         &mut **self.0.get_or_insert_with(|| {
             let t = Instant::now();
-            let m = (self.1)();
+            let m = objc2::rc::autoreleasepool(|_| (self.1)());
+            UP.store(true, Relaxed);
             eprintln!("gall: loaded in {:.2} s", t.elapsed().as_secs_f64());
             m
         })
@@ -98,8 +99,9 @@ impl Lm for Lazy {
     }
     fn park(&mut self, toks: &[u32]) {
         if let Some(mut m) = self.0.take() {
-            m.park(toks);
-            drop(m);
+            // drop m in the pool
+            objc2::rc::autoreleasepool(move |_| m.park(toks));
+            crate::alloc::trim();
             crate::up::lock(false);
             eprintln!("gall: unloaded");
         }
@@ -778,8 +780,10 @@ fn request(c: &TcpStream) -> Option<(String, String, Vec<u8>, String)> {
             break;
         } else if let Some(v) = h.strip_prefix("content-length:") {
             n = v.trim().parse().ok()?;
-        } else if let Some(v) = h.strip_prefix("authorization:") {
-            auth = v.trim().into();
+        } else if h.starts_with("authorization:") {
+            // the scheme is case-insensitive, the key is not
+            let (s, k) = l.trim()[14..].trim().split_once(' ').unwrap_or_default();
+            auth = format!("{} {}", s.to_ascii_lowercase(), k.trim());
         } else if h.starts_with("expect:") {
             (&*c).write_all(b"HTTP/1.1 100 Continue\r\n\r\n").ok()?;
         }
@@ -1067,7 +1071,7 @@ enum Q {
     Park(Option<TcpStream>, bool),
 }
 // loaded, a chat running, a park queued, the timings of the last chat
-static UP: AtomicBool = AtomicBool::new(true);
+static UP: AtomicBool = AtomicBool::new(false);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static PEND: AtomicBool = AtomicBool::new(false);
 static LAST: Mutex<J> = Mutex::new(J::Null);
@@ -1297,7 +1301,7 @@ pub fn main(a: &[String]) {
             Box::new(Ink(m, vec![], s, v, HashMap::new(), d))
         })
     };
-    let lm = Box::new(Lazy(Some(load()), load));
+    let lm = Box::new(Lazy(None, load));
     let kv = |k: &str, d: f64| {
         let k = format!("general.sampling.{k}");
         if g.kv.contains_key(k.as_str()) { g.f(&k) } else { d }
@@ -1322,8 +1326,9 @@ pub fn main(a: &[String]) {
         effort: opt("--effort", "none").into(),
         name: opt("--alias", "inkling-2-mini"),
         auth: a.iter().position(|x| x == "--api-key-file").map(|_| {
-            let k = std::fs::read_to_string(opt("--api-key-file", ""));
-            format!("bearer {}", k.unwrap().trim().to_ascii_lowercase())
+            let k = std::fs::read_to_string(opt("--api-key-file", "")).unwrap();
+            assert!(!k.trim().is_empty(), "gall: the key file is empty");
+            format!("bearer {}", k.trim())
         }),
         sp,
         t,
@@ -1348,7 +1353,7 @@ pub fn main(a: &[String]) {
         match r.unwrap_or(Q::Park(None, false)) {
             Q::Chat(r, mut c) => {
                 BUSY.store(true, Relaxed);
-                if let Err(e) = s.chat(&r, &mut c) {
+                if let Err(e) = objc2::rc::autoreleasepool(|_| s.chat(&r, &mut c)) {
                     eprintln!("gall: {e}");
                 }
                 BUSY.store(false, Relaxed);

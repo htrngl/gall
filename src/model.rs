@@ -384,7 +384,7 @@ impl Model {
     // checkpoint the state at pos, for truncate()
     pub fn save(&mut self) {
         let kv = slice::<u16>(&self.kv);
-        let mut w = vec![];
+        let mut w = Vec::with_capacity(self.swa(self.pos).count() * 2048);
         self.swa(self.pos).for_each(|r| w.extend_from_slice(&kv[r]));
         self.ck = Some((self.pos, slice::<f32>(&self.cs).to_vec(), w));
     }

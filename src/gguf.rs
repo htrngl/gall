@@ -104,9 +104,11 @@ impl Cur {
 pub fn open(path: &str) -> Gguf {
     let map = unsafe {
         let c = std::ffi::CString::new(path).unwrap();
-        let fd = libc::open(c.as_ptr(), libc::O_RDONLY);
+        let fd = libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
         assert!(fd >= 0, "gguf: cannot open {path}");
-        let n = libc::lseek(fd, 0, libc::SEEK_END) as usize;
+        let n = libc::lseek(fd, 0, libc::SEEK_END);
+        assert!(n > 0, "gguf: {path} is empty");
+        let n = n as usize;
         let p = libc::mmap(
             std::ptr::null_mut(),
             n,
@@ -115,6 +117,7 @@ pub fn open(path: &str) -> Gguf {
             fd,
             0,
         );
+        libc::close(fd); // the mapping outlives the descriptor
         assert!(p != libc::MAP_FAILED, "gguf: mmap failed");
         std::slice::from_raw_parts(p as *const u8, n)
     };

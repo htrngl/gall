@@ -40,13 +40,16 @@ struct Menu: View {
 
     var body: some View {
         Text(m.status)
-        if let g = m.mem { Text(String(format: "Memory %.1f GB", g)) }
+        if let g = m.mem {
+            Text(g < 1 ? String(format: "Memory %.0f MB", g * 1000)
+                       : String(format: "Memory %.1f GB", g))
+        }
         if let l = m.last { Text(l) }
         Divider()
         Button("Copy endpoint") { copy(endpoint + "/v1") }
         if m.net {
             Button("Copy key") {
-                copy((try? String(contentsOf: key))?
+                copy((try? String(contentsOf: key, encoding: .utf8))?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
             }
         }
@@ -58,7 +61,7 @@ struct Menu: View {
         }
         SwiftUI.Menu("Settings") {
             // seconds idle; instant is 1 s after the answer, 0 is never
-            Picker("Unload after", selection: pick("unload", 900)) {
+            Picker("Unload after", selection: pick("unload", 1)) {
                 Text("Instant").tag(1)
                 Text("1 min").tag(60)
                 Text("5 min").tag(300)

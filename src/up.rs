@@ -55,15 +55,13 @@ fn sys(k: &str) -> i32 {
     v
 }
 
-// one model fits on the gpu: open the machine lock (./wd holds it already
-// when WDL is set), park at memory pressure (warn) that lasts 30 s (a load
-// raises it for a moment), and leave before memory runs out
+// one model fits on the gpu: open the machine lock, park at memory
+// pressure (warn) that lasts 30 s (a load raises it for a moment), and
+// leave before memory runs out
 static FD: AtomicI32 = AtomicI32::new(-1);
 pub fn guard(park: impl Fn() + Send + 'static) {
-    if env::var("WDL").is_err() {
-        let f = fs::File::create("/tmp/gall.lock").unwrap();
-        FD.store(f.into_raw_fd(), Relaxed);
-    }
+    let f = fs::File::create("/tmp/gall.lock").unwrap();
+    FD.store(f.into_raw_fd(), Relaxed);
     thread::spawn(move || (0..).fold(0, |n, _| {
         let l = sys("kern.memorystatus_vm_pressure_level");
         if l >= 4 || sys("kern.memorystatus_level") < 6 {
@@ -84,11 +82,8 @@ pub fn lock(on: bool) {
     if !on {
         op(libc::LOCK_UN);
     } else if op(libc::LOCK_EX | libc::LOCK_NB) {
-        // /tmp/gall.want asks ./wd runs to let the server go first
         eprintln!("gall: /tmp/gall.lock is held, waiting");
-        fs::write("/tmp/gall.want", std::process::id().to_string()).ok();
         op(libc::LOCK_EX);
-        fs::remove_file("/tmp/gall.want").ok();
     }
 }
 

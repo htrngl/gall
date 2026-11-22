@@ -79,7 +79,7 @@ pub fn decode(b: &[u8], max: usize) -> Option<(usize, usize, Vec<u8>)> {
 }
 
 pub struct Vis {
-    g: Gguf,
+    g: &'static Gguf,
     gpu: Gpu,
     k: [Pipe; 6],
     mm: Pipe,
@@ -102,8 +102,11 @@ fn mm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
 
 impl Vis {
     pub fn open(path: &str) -> Vis {
-        let (g, mut gpu) = (open(path), Gpu::new());
-        gpu.map(&g);
+        // one mapping across unloads, as the model and the drafter keep
+        static G: std::sync::OnceLock<Gguf> = std::sync::OnceLock::new();
+        let g = G.get_or_init(|| open(path));
+        let mut gpu = Gpu::new();
+        gpu.map(g);
         let max = std::env::var("GALL_IMAGE_TOKENS").ok();
         let d = format!("#define VS {VS}\n");
         let k = ["vln", "vqkv", "vsc", "vres", "vgelu", "vwv"];

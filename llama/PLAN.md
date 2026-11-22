@@ -1,4 +1,10 @@
-# inkling-metal
+# Patched llama.cpp: experiment history
+
+These are historical lab notes for the patched llama.cpp reference build,
+including local paths, superseded settings and individual experiments.
+For Gall’s current behavior, see the [README](../README.md) and
+[engine notes](../docs/ENGINE.md). Run this directory’s build script as
+`llama/build` from the repository root.
 
 local inference of thinkingmachines' inkling-2-mini (26.2B MoE, 3.4B active,
 middle 12 of 24 layers looped 3x, hybrid local/global attention) on an m2

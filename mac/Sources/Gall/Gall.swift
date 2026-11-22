@@ -41,15 +41,20 @@ let bin: URL? = {
 func gall(_ a: [String]) async -> (Int32, String) {
     guard let bin else { return (-1, "The gall binary is missing.") }
     return await withCheckedContinuation { k in
-        let (p, o) = (Process(), Pipe())
-        (p.executableURL, p.arguments) = (bin, a)
-        (p.standardOutput, p.standardError) = (o, o)
-        p.terminationHandler = { p in
-            let d = o.fileHandleForReading.readDataToEndOfFile()
-            k.resume(returning: (p.terminationStatus, String(decoding: d,
-                                                             as: UTF8.self)))
+        // read as it runs: curl fills the pipe during a download
+        DispatchQueue.global().async {
+            let (p, o) = (Process(), Pipe())
+            (p.executableURL, p.arguments) = (bin, a)
+            (p.standardOutput, p.standardError) = (o, o)
+            do { try p.run() } catch {
+                return k.resume(returning: (-1, "\(error)"))
+            }
+            try? o.fileHandleForWriting.close()
+            let d = o.fileHandleForReading.readDataToEndOfFile().suffix(65536)
+            p.waitUntilExit()
+            k.resume(returning: (p.terminationStatus,
+                                 String(decoding: d, as: UTF8.self)))
         }
-        do { try p.run() } catch { k.resume(returning: (-1, "\(error)")) }
     }
 }
 
@@ -66,9 +71,10 @@ func got() -> Double {
         .reduce(0) { $0 + Double($1) }
 }
 
-// physical footprint of the server, in GB, as activity monitor shows it
+// physical footprint of the server in GB (1e9 B), as activity monitor has it
 func footprint() -> Double? {
-    let s = try? String(contentsOf: cache.appendingPathComponent("serve.pid"))
+    let s = try? String(contentsOf: cache.appendingPathComponent("serve.pid"),
+                        encoding: .utf8)
     guard let p = Int32(s?.trimmingCharacters(in: .whitespacesAndNewlines)
                         ?? "") else { return nil }
     var ri = rusage_info_v4()
@@ -77,7 +83,7 @@ func footprint() -> Double? {
             proc_pid_rusage(p, RUSAGE_INFO_V4, $0)
         }
     }
-    return r == 0 ? Double(ri.ri_phys_footprint) / Double(1 << 30) : nil
+    return r == 0 ? Double(ri.ri_phys_footprint) / 1e9 : nil
 }
 
 func alert(_ s: String) {
@@ -94,7 +100,7 @@ func alert(_ s: String) {
     var fetching = false
     let d = UserDefaults.standard
 
-    var idle: Int { d.object(forKey: "unload") as? Int ?? 900 } // seconds
+    var idle: Int { d.object(forKey: "unload") as? Int ?? 1 } // seconds
     var ctx: Int { d.object(forKey: "ctx") as? Int ?? 102400 }
     var net: Bool { d.bool(forKey: "net") }
 
@@ -118,20 +124,24 @@ func alert(_ s: String) {
             NSApp.setActivationPolicy(.accessory)
             await start()
             while true {
-                let p = "Downloading \(Int(got() / 12.7e7))%"
-                if fetching, p != phase { phase = p }
+                if fetching {
+                    let p = "Downloading \(min(100, Int(got() / 12.7e7)))%"
+                    if p != phase { phase = p }
+                }
                 await poll()
                 await sleep(1)
             }
         }
     }
 
+    let session = URLSession(configuration: .ephemeral)
+
     func health() async -> Health? {
         let u = URL(string: endpoint + "/health")!
         let r = URLRequest(url: u, timeoutInterval: 2)
         let dec = JSONDecoder()
         dec.keyDecodingStrategy = .convertFromSnakeCase
-        guard let (b, _) = try? await URLSession.shared.data(for: r)
+        guard let (b, _) = try? await session.data(for: r)
         else { return nil }
         return try? dec.decode(Health.self, from: b)
     }
@@ -140,7 +150,10 @@ func alert(_ s: String) {
     // closes a submenu under the pointer
     func poll() async {
         let n = await health()
-        let g = n == nil ? nil : footprint().map { ($0 * 10).rounded() / 10 }
+        let g = n == nil ? nil : footprint().map {
+            let k = $0 < 1 ? 1000.0 : 10.0 // MB below 1 GB
+            return ($0 * k).rounded() / k
+        }
         if n != h { h = n }
         if g != mem { mem = g }
     }
@@ -149,6 +162,7 @@ func alert(_ s: String) {
     // when a server answers already
     func start() async {
         if await health() != nil { return await poll() }
+        try? fm.createDirectory(at: cache, withIntermediateDirectories: true)
         if !d.bool(forKey: "installed") {
             let ram = ProcessInfo.processInfo.physicalMemory >> 30
             let free = (try? cache.resourceValues(forKeys:
@@ -211,11 +225,11 @@ func alert(_ s: String) {
         Task {
             var r = URLRequest(url: URL(string: endpoint + "/park")!)
             r.httpMethod = "POST"
-            if net, let k = try? String(contentsOf: key) {
+            if net, let k = try? String(contentsOf: key, encoding: .utf8) {
                 let k = k.trimmingCharacters(in: .whitespacesAndNewlines)
                 r.setValue("Bearer " + k, forHTTPHeaderField: "Authorization")
             }
-            _ = try? await URLSession.shared.data(for: r)
+            _ = try? await session.data(for: r)
             await poll()
         }
     }

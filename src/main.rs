@@ -10,6 +10,7 @@
 // gall vis MMPROJ IMAGE [REF.f32]
 // gall serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
 // gall up [CTX] [SERVE FLAGS] | down | log | model | test (see up.rs)
+mod alloc;
 mod dr;
 mod gguf;
 mod gpu;
@@ -81,6 +82,11 @@ fn main() {
         }
         a = ["gall", "check", &up::model(), d.to_str().unwrap()]
             .map(String::from).into();
+    }
+    // the other commands use the gpu: hold the lock until the exit
+    if !["up", "down", "log", "model", "tok", "serve"].contains(&&*a[1]) {
+        up::guard(|| ());
+        up::lock(true);
     }
     match a[1].as_str() {
         "up" | "down" | "log" | "model" => return up::main(&a[1..]),
