@@ -139,7 +139,9 @@ pub fn visits() -> Vec<(usize, usize, usize)> {
 
 impl Model {
     pub fn open(path: &str, n_ctx: usize) -> Model {
-        let g: &'static Gguf = Box::leak(Box::new(gguf::open(path)));
+        // one map per process, kept across unloads (one model per process)
+        static G: std::sync::OnceLock<Gguf> = std::sync::OnceLock::new();
+        let g: &'static Gguf = G.get_or_init(|| gguf::open(path));
         let mut gpu = Gpu::new();
         gpu.map(g);
         // small tensors, as f32 in one buffer; offset 0 is 128 ones

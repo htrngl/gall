@@ -32,6 +32,11 @@ gall down
   `/health`. Point any OpenAI-compatible client at it.
 - `gall serve <gguf> --api-key-file F` asks every request but `/health` for
   the key in `F` (`authorization: Bearer KEY`).
+- `gall serve <gguf> --idle-unload N` frees the model's memory after `N`
+  seconds without a request. It first stores the conversation as a prefix
+  snapshot. The next chat request loads the model again (0.06 s with the
+  file in the page cache) and continues from the snapshot. `/health` shows
+  `"loaded"`. The lock stays held while the model is unloaded.
 - Only one model fits on the GPU. `gall` takes a lock (`/tmp/gall.lock`) and
   refuses to start beside another instance; it exits if memory runs short.
   Unload other local models first.

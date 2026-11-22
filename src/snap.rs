@@ -81,7 +81,7 @@ impl Snaps {
     }
 
     // write the state of m, which holds toks
-    fn write(&mut self, m: &Model, toks: &[u32]) -> std::io::Result<()> {
+    pub fn write(&mut self, m: &Model, toks: &[u32]) -> std::io::Result<()> {
         let mut h = DefaultHasher::new();
         (&self.tag, toks).hash(&mut h);
         let p = self.dir.join(format!("{:016x}.snap", h.finish()));
@@ -124,18 +124,20 @@ impl Snaps {
         Some(())
     }
 
-    // m holds p[..k]. restore the longest stored prefix of p past k, then
-    // feed up to and store: the longest prefix p shares with a stored
+    // m holds p[..k]. restore the longest stored prefix of p past k (or a
+    // file that parts from p in its last 12 tokens, truncated), then feed
+    // up to and store: the longest prefix p shares with a stored
     // snapshot, and p[..sys] (the system region). returns the new k and
     // the length restored. p[k..] is never empty
     pub fn prime(&mut self, m: &mut Model, p: &[u32], mut k: usize, sys: usize) -> (usize, usize) {
         let c: Vec<_> = self.ix.iter().map(|e| common(&e.1, p)).collect();
-        let pre = |i: &usize| c[*i] == self.ix[*i].1.len() && c[*i] < p.len();
+        let n = |i: usize| self.ix[i].1.len();
+        let pre = |i: &usize| c[*i] + 12 >= n(*i) && c[*i] < p.len();
         let best = (0..c.len()).filter(pre).max_by_key(|&i| c[i]);
         let mut got = 0;
         if let Some(i) = best.filter(|&i| c[i] > k) {
             let t = std::time::Instant::now();
-            if self.read(m, i).is_some() {
+            if self.read(m, i).is_some() && m.truncate(c[i]) {
                 (k, got) = (c[i], c[i]);
                 eprintln!("gall: snap {k} read in {:.2} s", t.elapsed().as_secs_f64());
             } else {

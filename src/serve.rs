@@ -1,9 +1,11 @@
 // openai-compatible chat server over one model, one request at a time.
 //   gall serve <gguf> [--port 9940] [--ctx 102400] [--effort none]
 //             [--alias inkling-2-mini] [--api-key-file F]
-//             [--dummy [answer]]
+//             [--idle-unload SECONDS] [--dummy [answer]]
 // POST /v1/chat/completions (stream or not), GET /v1/models, GET /health.
-// with a key, all but /health need "authorization: bearer KEY".
+// with a key, all but /health need "authorization: bearer KEY". after
+// --idle-unload seconds idle the model goes to disk (a snapshot of the last
+// conversation) and out of memory, until the next chat request.
 // the chat template of the gguf is written out in prompt(); the model
 // answers in blocks, <|message_model|> then <|content_thinking|>,
 // <|content_text|> or NAME<|content_invoke_tool_json|>, each closed by
@@ -13,6 +15,7 @@ use crate::tok::Tok;
 use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub trait Lm {
@@ -35,6 +38,56 @@ pub trait Lm {
     // system region p[..sys]; the new k and the length restored
     fn prime(&mut self, _p: &[u32], k: usize, _sys: usize) -> (usize, usize) {
         (k, 0)
+    }
+    // store toks, which it holds (or nothing, if empty), and free memory
+    fn park(&mut self, _toks: &[u32]) {}
+    fn loaded(&self) -> bool {
+        true
+    }
+}
+
+// an Lm that load() makes again on first use after park()
+type Load = Box<dyn Fn() -> Box<dyn Lm>>;
+struct Lazy(Option<Box<dyn Lm>>, Load);
+
+impl Lazy {
+    fn get(&mut self) -> &mut dyn Lm {
+        &mut **self.0.get_or_insert_with(|| {
+            let t = Instant::now();
+            let m = (self.1)();
+            eprintln!("gall: loaded in {:.2} s", t.elapsed().as_secs_f64());
+            m
+        })
+    }
+}
+
+impl Lm for Lazy {
+    fn reset(&mut self) {
+        self.get().reset()
+    }
+    fn step(&mut self, t: u32) -> &[f32] {
+        self.get().step(t)
+    }
+    fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |m| m.len())
+    }
+    fn truncate(&mut self, n: usize) -> bool {
+        self.get().truncate(n)
+    }
+    fn feed(&mut self, toks: &[u32]) -> &[f32] {
+        self.get().feed(toks)
+    }
+    fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
+        self.get().prime(p, k, sys)
+    }
+    fn park(&mut self, toks: &[u32]) {
+        if let Some(mut m) = self.0.take() {
+            m.park(toks);
+            eprintln!("gall: unloaded");
+        }
+    }
+    fn loaded(&self) -> bool {
+        self.0.is_some()
     }
 }
 
@@ -700,7 +753,8 @@ impl Srv {
         let p = p.trim_start_matches("/v1");
         match (m.as_str(), p) {
             ("OPTIONS", _) => head(&mut c, 204, "text/plain", ""),
-            ("GET", "/health") => reply(&mut c, 200, &obj!["status" => "ok"]),
+            ("GET", "/health") => reply(&mut c, 200, &obj!["status" => "ok",
+                "loaded" => self.lm.loaded()]),
             _ if self.auth.as_ref().is_some_and(|k| *k != a) => {
                 reply(&mut c, 401, &err("invalid api key"))
             }
@@ -769,6 +823,16 @@ impl Lm for Ink {
     fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
         self.2.prime(&mut self.0, p, k, sys)
     }
+    fn park(&mut self, toks: &[u32]) {
+        let t = Instant::now();
+        if toks.len() < 512 {
+            return;
+        } else if let Err(e) = self.2.write(&self.0, toks) {
+            return eprintln!("gall: snap {}: {e}", toks.len());
+        }
+        let s = t.elapsed().as_secs_f64();
+        eprintln!("gall: snap {} written in {s:.2} s", toks.len());
+    }
 }
 
 pub fn main(a: &[String]) {
@@ -787,15 +851,19 @@ pub fn main(a: &[String]) {
     let ctx: usize = opt("--ctx", "102400").parse().unwrap();
     let say = "<|message_model|><|content_text|>hello from gall\
                <|end_message|><|content_model_end_sampling|>";
-    let lm: Box<dyn Lm> = if a.iter().any(|x| x == "--dummy") {
-        let say = tok.enc(&opt("--dummy", say), true);
-        Box::new(Dummy(say, 0, vec![0.0; tok.txt.len()], 0))
+    let load: Load = if a.iter().any(|x| x == "--dummy") {
+        let (say, n) = (tok.enc(&opt("--dummy", say), true), tok.txt.len());
+        Box::new(move || Box::new(Dummy(say.clone(), 0, vec![0.0; n], 0)))
     } else {
         crate::up::guard();
-        let m = crate::model::Model::open(&a[0], ctx);
-        let s = crate::model::snap::Snaps::new(&a[0], &m);
-        Box::new(Ink(m, vec![], s))
+        let p = a[0].clone();
+        Box::new(move || {
+            let m = crate::model::Model::open(&p, ctx);
+            let s = crate::model::snap::Snaps::new(&p, &m);
+            Box::new(Ink(m, vec![], s))
+        })
     };
+    let lm = Box::new(Lazy(Some(load()), load));
     let kv = |k: &str, d: f64| {
         let k = format!("general.sampling.{k}");
         if g.kv.contains_key(k.as_str()) { g.f(&k) } else { d }
@@ -826,8 +894,16 @@ pub fn main(a: &[String]) {
         t,
     };
     eprintln!("gall: http://127.0.0.1:{port}/v1, context {ctx}");
-    for c in l.incoming().flatten() {
-        if let Err(e) = s.conn(c) {
+    let idle: i32 = opt("--idle-unload", "0").parse().unwrap();
+    let mut pf = libc::pollfd { fd: l.as_raw_fd(), events: libc::POLLIN,
+        revents: 0 };
+    loop {
+        let t = if idle > 0 && s.lm.loaded() { idle * 1000 } else { -1 };
+        if unsafe { libc::poll(&mut pf, 1, t) } == 0 {
+            let n = if s.lm.len() == s.fed.len() { s.fed.len() } else { 0 };
+            s.lm.park(&s.fed[..n]);
+            s.fed.clear();
+        } else if let Err(e) = l.accept().and_then(|c| s.conn(c.0)) {
             eprintln!("gall: {e}");
         }
     }
