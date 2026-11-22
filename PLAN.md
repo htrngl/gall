@@ -59,7 +59,7 @@ app ↔ cli, no new commands:
 ## work packages
 
 each package owns its files. no two packages edit one file. a, b and c
-start at once. d needs the gpu and runs alone (see gpu rule). e is last.
+start at once. d is last.
 
 ### a. engine: park, health, signal, pressure, host (rust)
 
@@ -74,7 +74,7 @@ files: `src/serve.rs`, `src/up.rs`.
    when loaded). the thread needs the queue's `Sender`; pass it in.
 5. `--host`, with the key check.
 6. update the header comment of `serve.rs` and the server flags table in
-   `README.md` (the flags table only; e owns the rest of the readme).
+   `README.md` (the flags table only; d owns the rest of the readme).
 
 check: `gall serve $M --dummy` for the http parts (no gpu). then one gpu
 run under the lock: a chat over 512 tokens, `curl -X POST /park`, `/health`
@@ -131,35 +131,19 @@ check: `mac/build && open target/Gall.app` on a clean user account
 (`~/.cache/gall` absent) reaches `ready`; `spctl -a -vv target/Gall.app`
 passes when signed.
 
-### d. client and comparison measurements (gpu, serial)
-
-files: `docs/CLIENTS.md`, plus the measurements table rows in `README.md`
-(handed to e as text).
-
-1. clients: for each of zed, continue, open webui, raycast and openclaw,
-   set the base url, send three turns, and read the
-   `prompt N (K cached, snap S)` lines in `gall log`. record whether the
-   prefix holds across turns, and what breaks it (a timestamp in the
-   system prompt, rewritten history). the app's `copy endpoint` help links
-   to this file.
-2. the headline: a 20k-token conversation; wait past the unload; one more
-   message; time to first token. gall (`--idle-unload 60`), ollama
-   (`keep_alive` 60 s) and lm studio (auto-unload 60 s), same gguf, same
-   mac, one at a time. record the versions and the date.
-
-### e. readme and agent notes (last)
+### d. readme and agent notes (last)
 
 files: `README.md`, `AGENTS.md` (new, short), `PLAN.md` (delete when done).
 
 - an "app" section above "install and run": download, open, copy endpoint.
   keep the cli section as it is.
-- the server flags rows from a, the table from d.
+- the server flags rows from a.
 - `AGENTS.md`: the gpu rule, the file ownership above, `mac/build`.
 
 ## gpu rule
 
-one model fits on the gpu. any step that loads the model (a's gpu check,
-c's last check, all of d) takes `/tmp/gall.lock` through `./wd` or runs
+one model fits on the gpu. any step that loads the model (a's gpu check and
+c's last check) takes `/tmp/gall.lock` through `./wd` or runs
 `gall` (which takes it). agents for a, b and c use `--dummy` until their
 last check. two agents never load the model at once.
 
@@ -167,4 +151,5 @@ last check. two agents never load the model at once.
 
 imessage and a separate `gall` user (the earlier design), sparkle updates,
 a homebrew cask, a snapshot store capped by size instead of `KEEP = 8`
-files, battery and low power mode rules, an anthropic-compatible endpoint.
+files, battery and low power mode rules, an anthropic-compatible endpoint,
+client checks and comparisons with ollama and lm studio.
