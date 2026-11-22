@@ -4,9 +4,11 @@
 //   let e = v.embed(w, h, &rgb);                      // (w/40)(h/40) x 2304
 // the encoder is inkling2v (llama.cpp tools/mtmd/models/inkling2v.cpp): a
 // vit of 20-pixel patches with a cls token, bilinear position embeddings
-// and 2d rope, then 2x2 patches merged through a 2-layer projector. it runs
-// on the cpu through Accelerate's sgemm; weights are read from the map.
+// and 2d rope, then 2x2 patches merged through a 2-layer projector. the
+// layers run on the gpu: weights from the map by prefill's mm_f16, the
+// rest in vis.metal.
 use crate::gguf::{open, Gguf};
+use crate::gpu::{call, slice, Buf, Enc, Gpu, Pipe};
 use std::ffi::c_void;
 
 type P = *const c_void;
@@ -37,8 +39,6 @@ extern "C" {
     fn cblas_sgemm(o: i32, ta: i32, tb: i32, m: i32, n: i32, k: i32, al: f32,
                    a: *const f32, lda: i32, b: *const f32, ldb: i32, be: f32,
                    c: *mut f32, ldc: i32);
-    fn erff(x: f32) -> f32;
-    fn vvexpf(y: *mut f32, x: *const f32, n: &i32);
 }
 
 const A: usize = 40; // pixels per output token side: patch 20, merge 2
@@ -80,23 +80,47 @@ pub fn decode(b: &[u8], max: usize) -> Option<(usize, usize, Vec<u8>)> {
 
 pub struct Vis {
     g: Gguf,
+    gpu: Gpu,
+    k: [Pipe; 5],
+    mm: Pipe,
+    s: Buf,         // per layer: ln1 w b, ln2 w b, ls1, ls2, biases
     pub max: usize, // tokens per image
 }
 
-// y (m x n) = a (m x k, row stride la) b^T (n x k, row stride lb), scaled
-fn mm(m: usize, n: usize, k: usize, s: f32, a: &[f32], la: usize, b: &[f32],
-      lb: usize, tb: bool, y: &mut [f32], ly: usize) {
+const VS: usize = 14 * 1024; // floats per position
+const SL: usize = 15 * 1024; // small floats per layer
+
+// y (m x n) = a (m x k, row stride la) b^T (n x k, row stride lb)
+fn mm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], y: &mut [f32]) {
     let i = |v: usize| v as i32;
     unsafe {
-        cblas_sgemm(101, 111, 111 + tb as i32, i(m), i(n), i(k), s, a.as_ptr(),
-                    i(la), b.as_ptr(), i(lb), 0., y.as_mut_ptr(), i(ly))
+        cblas_sgemm(101, 111, 112, i(m), i(n), i(k), 1., a.as_ptr(), i(k),
+                    b.as_ptr(), i(k), 0., y.as_mut_ptr(), i(n))
     }
 }
 
 impl Vis {
     pub fn open(path: &str) -> Vis {
+        let (g, mut gpu) = (open(path), Gpu::new());
+        gpu.map(&g);
         let max = std::env::var("GALL_IMAGE_TOKENS").ok();
-        Vis { g: open(path), max: max.map_or(1024, |v| v.parse().unwrap()) }
+        let d = format!("#define VS {VS}\n");
+        let k = ["vln", "vqkv", "vatt", "vres", "vgelu"];
+        let k = k.map(|k| gpu.pipe(include_str!("vis.metal"), &d, k));
+        let (mm, s) = (gpu.pipe(crate::model::pf::MM, "", "mm_f16"),
+            gpu.buf(4 * SL * g.u("clip.vision.block_count")));
+        let mut v = Vis { g, gpu, k, mm, s, max: max.map_or(1024, |v| v.parse().unwrap()) };
+        let names = ["ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias",
+            "ls1.weight", "ls2.weight", "attn_q.bias", "attn_k.bias",
+            "attn_v.bias", "attn_out.bias", "ffn_down.bias", "ffn_up.bias"];
+        for (l, r) in slice::<f32>(&v.s.clone()).chunks_mut(SL).enumerate() {
+            for (i, n) in names.iter().enumerate() {
+                let t = v.t(&format!("v.blk.{l}.{n}"));
+                r[i * 1024..][..t.len()].copy_from_slice(&t);
+            }
+        }
+        v.max = v.max.max(1);
+        v
     }
 
     // a tensor as f32 (f16 or f32 in the file)
@@ -121,7 +145,7 @@ impl Vis {
         let (o, i) = (d[d.len() - 1], d[..d.len() - 1].iter().product());
         let (w, m) = (self.t(&format!("{name}.weight")), x.len() / i);
         let mut y = vec![0f32; m * o];
-        mm(m, o, i, 1., x, i, &w, i, true, &mut y, o);
+        mm(m, o, i, x, &w, &mut y);
         if self.g.t.contains_key(format!("{name}.bias").as_str()) {
             let b = self.t(&format!("{name}.bias"));
             y.chunks_mut(o).for_each(|r| r.iter_mut().zip(&b).for_each(|(y, b)| *y += b));
@@ -175,67 +199,76 @@ impl Vis {
         let cls = self.t("v.class_embd");
         let cp = self.t("v.class_position_embd.weight");
         x[..E].iter_mut().zip(cls.iter().zip(&cp)).for_each(|(x, (a, b))| *x = a + b);
-        let mut x = self.ln(&x, "v.pre_ln");
+        let x = self.ln(&x, "v.pre_ln");
+        // the layers on the gpu. tiles of 32 positions, then of 32 tokens
+        let (np, nt) = (n.div_ceil(8) * 8, gw * gh / 4);
+        let tiles = |n: usize| (0..n.div_ceil(32)).flat_map(move |i| {
+            [0, 32 * i as u32, (n.div_ceil(8) * 8 - 32 * i).min(32) as u32]
+        });
+        let tl: Vec<u32> = tiles(n).chain(tiles(nt)).collect();
+        let (g, t0) = (&self.gpu, n.div_ceil(32));
+        let (a, tb, rb) = (g.buf(4 * VS * (np + 8)), g.buf(4 * tl.len()),
+            g.buf(8 * 32 * n));
+        slice::<u32>(&tb).copy_from_slice(&tl);
+        let av = slice::<f32>(&a);
+        for (i, r) in x.chunks(E).enumerate() {
+            av[i * VS..][..E].copy_from_slice(r);
+        }
         // rope: dims 0..32 of a head turn with the column, 32..64 with the
         // row; the cls token is at (0, 0), patches count from 1
         let sc = |p: usize| (0..16).map(move |j| {
-            (p as f32 * 1e4f32.powf(-(j as f32) / 16.)).sin_cos()
+            let (s, c) = (p as f32 * 1e4f32.powf(-(j as f32) / 16.)).sin_cos();
+            [s, c]
         });
-        let sc: Vec<_> = (0..gw * gh).flat_map(|q| {
-            sc(q % gw + 1).chain(sc(q / gw + 1))
-        }).collect();
-        let rope = |v: &mut [f32]| {
-            for (r, sc) in v.chunks_mut(E).skip(1).zip(sc.chunks(32)) {
-                for (j, c) in r.chunks_mut(2).enumerate() {
-                    let (s, k) = sc[j % 32];
-                    (c[0], c[1]) = (c[0] * k - c[1] * s, c[0] * s + c[1] * k);
-                }
-            }
+        let sc = (0..gw * gh).flat_map(|q| sc(q % gw + 1).chain(sc(q / gw + 1)));
+        let rv = slice::<[f32; 2]>(&rb);
+        rv[..32].fill([0., 1.]);
+        rv[32..].iter_mut().zip(sc).for_each(|(r, s)| *r = s);
+        // y = W x for tiles (t0, nt): fields at x and y
+        let mm = |e: &Enc, w: &str, x: usize, y: usize, tl: (usize, usize)| {
+            let w = &self.g.t[w];
+            let (ni, no) = (w.dims[0], w.dims[1]);
+            let p = [ni, no, 2 * ni, 0, x, VS, y, VS].map(|v| v as u32);
+            let b = [g.w(w), (&a, 0), (&a, 0), (&tb, 0), (&tb, 12 * tl.0)];
+            call(e, &self.mm, &p, &b, [no / 64, tl.1, 1], 128)
         };
-        let gelu = |v: &mut [f32]| {
-            let f = |x: &mut f32| *x *= 0.5 + 0.5 * unsafe { erff(*x * 0.5f32.sqrt()) };
-            v.iter_mut().for_each(f)
+        let k = |e: &Enc, k: usize, gr: [usize; 2], p: [usize; 5]| {
+            let b = [(&a, 0), (&self.s, 0), (&rb, 0)];
+            let gr = [gr[0].div_ceil(32), gr[1], 1];
+            call(e, &self.k[k], &p.map(|v| v as u32), &b, gr, 32)
         };
-        let mut s = vec![0f32; n * n];
-        for l in 0..self.g.u("clip.vision.block_count") {
-            let b = |s: &str| format!("v.blk.{l}.{s}");
-            let add = |x: &mut [f32], y: &[f32], ls: &str| {
-                let ls = self.t(&b(ls));
-                let f = |(i, (x, y)): (usize, (&mut f32, &f32))| *x += y * ls[i % E];
-                x.iter_mut().zip(y).enumerate().for_each(f)
-            };
-            let y = self.ln(&x, &b("ln1"));
-            let (mut q, mut k) = (self.lin(&y, &b("attn_q")), self.lin(&y, &b("attn_k")));
-            let (v, mut o) = (self.lin(&y, &b("attn_v")), vec![0f32; n * E]);
-            rope(&mut q);
-            rope(&mut k);
-            for hd in (0..E).step_by(64) {
-                mm(n, n, 64, 0.125, &q[hd..], E, &k[hd..], E, true, &mut s, n);
-                for r in s.chunks_mut(n) {
-                    let m = r.iter().fold(f32::MIN, |a, &b| a.max(b));
-                    r.iter_mut().for_each(|x| *x -= m);
-                    unsafe { vvexpf(r.as_mut_ptr(), r.as_ptr(), &(n as i32)) };
-                    let t = r.iter().sum::<f32>();
-                    r.iter_mut().for_each(|x| *x /= t);
-                }
-                mm(n, 64, n, 1., &s, n, &v[hd..], E, false, &mut o[hd..], E);
-            }
-            add(&mut x, &self.lin(&o, &b("attn_out")), "ls1.weight");
-            let mut y = self.lin(&self.ln(&x, &b("ln2")), &b("ffn_up"));
-            gelu(&mut y);
-            add(&mut x, &self.lin(&y, &b("ffn_down")), "ls2.weight");
-        }
+        // fields of a position: x, y, q k v, o, two of 4096
+        let [y, q, o, f, f2] = [E, 2 * E, 5 * E, 6 * E, 10 * E];
+        let all = (0, t0);
+        g.run(|e| for l in 0..self.g.u("clip.vision.block_count") {
+            let (w, s) = (|s: &str| format!("v.blk.{l}.{s}.weight"), l * SL);
+            k(e, 0, [n, 1], [n, 0, y, s, s + E]);
+            mm(e, &w("attn_q"), y, q, all);
+            mm(e, &w("attn_k"), y, q + E, all);
+            mm(e, &w("attn_v"), y, q + 2 * E, all);
+            k(e, 1, [n, 16], [n, q, 0, 0, s + 6 * E]);
+            k(e, 2, [n, 16], [n, q, y, 0, 0]);
+            mm(e, &w("attn_out"), y, o, all);
+            k(e, 3, [n, 1], [n, 0, o, s + 4 * E, s + 9 * E]);
+            k(e, 0, [n, 1], [n, 0, y, s + 2 * E, s + 3 * E]);
+            mm(e, &w("ffn_up"), y, f, all);
+            k(e, 4, [n, 64], [n, f, 0, 1, s + 11 * E]);
+            mm(e, &w("ffn_down"), f, o, all);
+            k(e, 3, [n, 1], [n, 0, o, s + 5 * E, s + 10 * E]);
+        });
         // 2x2 patches side by side (row-major inside the square), projector
-        let (tw, th) = (gw / 2, gh / 2);
-        let mut m = Vec::with_capacity(tw * th * 4 * E);
-        for i in 0..tw * th * 4 {
+        let (tw, x) = (gw / 2, av[..n * VS].to_vec());
+        for i in 0..nt * 4 {
             let (t, dy, dx) = (i / 4, i / 2 % 2, i % 2);
             let q = 1 + (t / tw * 2 + dy) * gw + t % tw * 2 + dx;
-            m.extend_from_slice(&x[q * E..][..E]);
+            av[t * VS + f + i % 4 * E..][..E].copy_from_slice(&x[q * VS..][..E]);
         }
-        let mut y = self.lin(&m, "mm.1");
-        gelu(&mut y);
-        self.lin(&y, "mm.2")
+        g.run(|e| {
+            mm(e, "mm.1.weight", f, f2, (t0, nt.div_ceil(32)));
+            k(e, 4, [nt, 64], [nt, f2, 0, 0, 0]);
+            mm(e, "mm.2.weight", f2, f, (t0, nt.div_ceil(32)));
+        });
+        (0..nt).flat_map(|t| av[t * VS + f..][..2304].iter().copied()).collect()
     }
 }
 

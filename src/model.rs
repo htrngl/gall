@@ -148,8 +148,8 @@ impl Model {
         let g: &'static Gguf = G.get_or_init(|| gguf::open(path));
         let mut gpu = Gpu::new();
         gpu.map(g);
-        // small tensors, as f32 in one buffer; offset 0 is 128 ones
-        let mut s = vec![1f32; 128];
+        // small tensors, as f32 in one buffer; offset 0 is N ones
+        let mut s = vec![1f32; N];
         let mut sm = |n: String| -> u32 {
             let Some(t) = g.t.get(n.as_str()) else { return 0 };
             let (o, d) = (s.len() as u32, g.data(t));
@@ -407,8 +407,10 @@ impl Model {
             self.embd(e, tok, (&self.a, ro + 4 * VR))
         }), None));
         k!("dots", [2, 1, 1], 576, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC);
-        k!("elem", t32, 32, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC, 1, VR, H, self.tn,
-            0, 0, 1);
+        // an image row is the stream as it is: no norm (ones, no scale)
+        let (tn, sc) = if tok < IMG { (self.tn, 1) } else { (0, 0) };
+        k!("elem", t32, 32, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC, 1, VR, H, tn,
+            0, 0, sc);
         let (mut nb, mut fin) = (0, [0, H, 0, 0, 0]); // pending ffn conv
         for (i, slot, pass) in visits() {
             let l = &self.l[i];

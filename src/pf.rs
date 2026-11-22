@@ -10,7 +10,7 @@ use crate::gpu::*;
 use crate::mv::name;
 use std::collections::HashMap;
 
-const MM: &str = concat!(
+pub const MM: &str = concat!(
     "#include <metal_stdlib>\n",
     include_str!("grids.metal"),
     include_str!("mv.metal"),
@@ -238,6 +238,12 @@ impl Model {
                     }
                     k!(e, "prep", g1, 32, H, BK, 0, 0, 0, H, 1, 0, 0, 0, self.tn, 0,
                         0, VT);
+                    // an image row is the stream as it is: no norm
+                    for (i, &x) in toks.iter().enumerate() {
+                        if x >= super::IMG {
+                            self.embd(e, x, (&pf.a, 4 * (i * STR + H)));
+                        }
+                    }
                 } else {
                     tail(e, v - 1, np, ne);
                 }

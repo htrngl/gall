@@ -114,7 +114,7 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
 - `src/pf*`: Batched prefill.
 - `src/tok.rs`, `serve.rs`, `snap.rs`, `up.rs`: Tokenizer, chat template,
   server, prefix snapshots, and server lifecycle commands.
-- `src/vis.rs`: Image decoding (ImageIO) and the vision encoder (Accelerate).
+- `src/vis.*`: Image decoding (ImageIO) and the vision encoder.
 - `src/dr*`: The dspark drafter. See the limitations below.
 - [Engine brief](docs/ENGINE.md) and [drafter notes](docs/DRAFT.md).
 - `tools/`: Tools for reference dumps from llama.cpp.
@@ -138,8 +138,9 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
   The drafter needs expert kernels that dequantize weights once per batch.
 - Prefill uses half-precision tiles, as llama.cpp does. The `HT` setting in
   `pfm.metal` selects float precision at approximately 0.8 times the speed.
-- The vision encoder runs on the CPU. A 640 x 488 image (208 tokens) takes
-  3.3 s. Its output is within 2.1e-3 (relative) of llama.cpp's
+- The vision encoder runs on the GPU. A 640 x 488 image (208 tokens) takes
+  1.2 s; a 960 x 1280 image (768 tokens) takes 12.6 s, most of it in
+  attention. Its output is within 2.9e-3 (relative) of llama.cpp's
   (`gall vis`, `tools/imgref.cpp`). The server does not store a prefix
   snapshot for a prompt that contains an image.
 - Unsupported features include grammar constraints, `response_format`,

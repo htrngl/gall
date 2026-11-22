@@ -369,10 +369,10 @@ fn b64(s: &str) -> Vec<u8> {
     o
 }
 
-// the prompt, the length of its system region, the image urls in order
-// (each stands as IMAGE in the text)
-const IMAGE: &str = "<|unused_200054|>";
-fn prompt(r: &J, eff: &J) -> Result<(String, usize, Vec<String>), String> {
+// the prompt, the length of its system region, and the images: where
+// in the prompt each one's rows go, and its url
+type Prompt = (String, usize, Vec<(usize, String)>);
+fn prompt(r: &J, eff: &J) -> Result<Prompt, String> {
     let mut urls = vec![];
     let (mut o, mut sys) = (String::new(), None);
     let tools = r["tools"].a();
@@ -421,19 +421,23 @@ fn prompt(r: &J, eff: &J) -> Result<(String, usize, Vec<String>), String> {
         if !rc.is_empty() {
             o += &format!("{h}<|content_thinking|>{rc}{END}");
         }
-        let mut part = |k: &str, t: &str| o += &format!("{h}<|content_{k}|>{t}{END}");
+        macro_rules! part {
+            ($k:expr, $t:expr) => {
+                o += &format!("{h}<|content_{}|>{}{END}", $k, $t)
+            };
+        }
         match &m["content"] {
             J::Str(c) => {
                 if !c.is_empty() || calls.is_empty() && rc.is_empty() {
-                    part("text", c)
+                    part!("text", c)
                 }
             }
             c => {
                 for p in c.a() {
                     match (p, p["type"].s()) {
-                        (J::Str(s), _) => part("text", s),
+                        (J::Str(s), _) => part!("text", s),
                         (_, None | Some("text" | "input_text")) => {
-                            part("text", p["text"].s().unwrap_or(""))
+                            part!("text", p["text"].s().unwrap_or(""))
                         }
                         (_, Some("image" | "input_image" | "image_url")) => {
                             if !["user", "tool"].contains(&role) {
@@ -443,8 +447,9 @@ fn prompt(r: &J, eff: &J) -> Result<(String, usize, Vec<String>), String> {
                             let u = [&p["image_url"]["url"], &p["image_url"],
                                 &p["url"], &p["image"]];
                             let u = u.iter().find_map(|u| u.s());
-                            urls.push(u.ok_or("image part without a url")?.into());
-                            part("image", IMAGE);
+                            let u = u.ok_or("image part without a url")?;
+                            part!("image", "");
+                            urls.push((o.len() - END.len(), u.into()));
                         }
                         (_, Some(t)) => {
                             return Err(format!(
@@ -627,31 +632,32 @@ struct Srv {
 
 impl Srv {
     fn chat(&mut self, r: &J, w: &mut TcpStream) -> io::Result<()> {
-        let p = match prompt(r, &self.effort) {
-            Ok((p, n, u)) => (self.tok.enc(&p, true), self.tok.enc(&p[..n], true), u),
+        let (o, n, urls) = match prompt(r, &self.effort) {
+            Ok(p) => p,
             Err(e) => return reply(w, 400, &err(&e)),
         };
-        let (mut p, sys, urls) = p;
-        let sys = if p.starts_with(&sys) { sys.len() } else { 0 };
-        // each IMAGE token becomes the ids of its image's rows; a full
-        // image store empties itself and the second try starts it again
-        let ph = self.tok.id(IMAGE);
-        if !urls.is_empty() || p.contains(&ph) {
-            let t = Instant::now();
-            type R = Result<Vec<Range<u32>>, String>;
-            let mut get = || urls.iter().map(|u| self.lm.image(u)).collect::<R>();
-            let ids = get().or_else(|_| get());
-            let ids = match ids {
-                Ok(i) if i.len() == p.iter().filter(|&&t| t == ph).count() => i,
-                Ok(_) => return reply(w, 400, &err("stray image token")),
-                Err(e) => return reply(w, 400, &err(&e)),
-            };
-            let mut ids = ids.into_iter();
-            let f = |t| if t == ph { ids.next().unwrap() } else { t..t + 1 };
-            p = p.into_iter().flat_map(f).collect();
+        // the rows of each image, as token ids, go in at its place; a
+        // full image store empties itself and the second try starts again
+        type R = Result<Vec<Range<u32>>, String>;
+        let t = Instant::now();
+        let mut get = || urls.iter().map(|u| self.lm.image(&u.1)).collect::<R>();
+        let ids = match get().or_else(|_| get()) {
+            Ok(i) => i,
+            Err(e) => return reply(w, 400, &err(&e)),
+        };
+        if !urls.is_empty() {
             eprintln!("gall: {} images in {:.2} s", urls.len(),
                 t.elapsed().as_secs_f64());
         }
+        let (enc, mut p, mut at) = (|s: &str| self.tok.enc(s, true), vec![], 0);
+        for ((to, _), ids) in urls.iter().zip(ids) {
+            p.extend(enc(&o[at..*to]));
+            p.extend(ids);
+            at = *to;
+        }
+        p.extend(enc(&o[at..]));
+        let sys = enc(&o[..n]);
+        let sys = if p.starts_with(&sys) { sys.len() } else { 0 };
         if p.is_empty() || p.len() >= self.ctx {
             let e = format!("{} prompt tokens, context {}", p.len(), self.ctx);
             return reply(w, 400, &err(&e));
