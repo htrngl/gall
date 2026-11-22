@@ -83,7 +83,7 @@ reference dumps made with `tools/refdump` against the llama.cpp build in
 - `src/pf*`: batched prefill.
 - `src/tok.rs`, `serve.rs`, `snap.rs`, `up.rs`: tokenizer, chat template and
   server, prefix snapshots, start and stop.
-- `src/dr*`: the dspark drafter (correct, not yet faster; see below).
+- `src/dr*`: the dspark drafter and its batched verify (see below).
 - `docs/ENGINE.md`: the original brief. `docs/DRAFT.md`: drafter notes.
 - `tools/`: reference dumps from llama.cpp.
 - `llama/`: the patched llama.cpp build used as reference and its notes
@@ -97,9 +97,11 @@ reference dumps made with `tools/refdump` against the llama.cpp build in
   100k (the last two synthetic).
 - `KV=q8` stores the full-attention caches as int8: half the cache memory at
   100k, no faster, off by default, its prefill path untested.
-- the drafter runs and its batched verify gives the same text as greedy, but
-  a 4-row verify takes 250 ms against 52 ms per serial token, so the block
-  size stays 0. it needs dequant-once expert kernels.
+- the drafter (`gall run --draft`) gives the same text as greedy: a verify
+  of 2 / 4 rows takes 73 / 123 ms against 51 per serial token, and drafts
+  are verified only where the drafter is sure. measured on 128 tokens:
+  prose 19.5 -> 19.1 t/s (it stays off), math 19.4 -> 22.6, code 19.4 ->
+  23.7. not in the server yet.
 - prefill uses half-precision tiles, as llama.cpp does; `HT` in `pfm.metal`
   switches to float at about 0.8x the speed.
 - not done: grammar and `response_format`, images, concurrent requests,
