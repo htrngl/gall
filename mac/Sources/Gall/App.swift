@@ -57,10 +57,13 @@ struct Menu: View {
                                  arguments: ["-a", "Console", l])
         }
         SwiftUI.Menu("Settings") {
-            Picker("Unload after", selection: pick("idle", 15)) {
-                Text("5 min").tag(5)
-                Text("15 min").tag(15)
-                Text("60 min").tag(60)
+            // seconds idle; instant is 1 s after the answer, 0 is never
+            Picker("Unload after", selection: pick("unload", 900)) {
+                Text("Instant").tag(1)
+                Text("1 min").tag(60)
+                Text("5 min").tag(300)
+                Text("15 min").tag(900)
+                Text("60 min").tag(3600)
                 Text("Never").tag(0)
             }
             Picker("Context", selection: pick("ctx", 102400)) {

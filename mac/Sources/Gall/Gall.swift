@@ -94,7 +94,7 @@ func alert(_ s: String) {
     var open = false, fetching = false
     let d = UserDefaults.standard
 
-    var idle: Int { d.object(forKey: "idle") as? Int ?? 15 } // minutes
+    var idle: Int { d.object(forKey: "unload") as? Int ?? 900 } // seconds
     var ctx: Int { d.object(forKey: "ctx") as? Int ?? 102400 }
     var net: Bool { d.bool(forKey: "net") }
 
@@ -185,7 +185,7 @@ func alert(_ s: String) {
 
     func up() async {
         phase = "Starting"
-        var a = ["up", String(ctx), "--idle-unload", String(idle * 60)]
+        var a = ["up", String(ctx), "--idle-unload", String(idle)]
         if net {
             if !fm.fileExists(atPath: key.path) {
                 let k = (0..<32).map { _ in

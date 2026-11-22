@@ -38,7 +38,8 @@ ggml or MLX.
 The menu shows the server state, its memory use, and the cache use and
 speed of the last answer. `unload now` releases the model's memory and
 keeps the conversation. The settings submenu sets the idle time before an
-unload (15 minutes by default), the context length, start at login, and
+unload (instant, 1 to 60 minutes, or never; 15 minutes by default), the
+context length, start at login, and
 access from other devices on the network. Network access makes a key in
 `~/.cache/gall/key`; `copy key` copies it. Quit stops the server.
 
