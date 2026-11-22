@@ -149,8 +149,9 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
   0.8 s and a 960 x 1280 image (768 tokens) takes 4.2 s. Its output is within 2.9e-3 (relative) of llama.cpp's
   (`gall vis`, `tools/imgref.cpp`). The rows of the 32 newest images are
   kept in `~/.cache/gall/img`.
-- Unsupported features include GBNF grammars, concurrent requests, and
-  drafting in the server.
+- The server runs one chat at a time; other chats wait in a queue, and
+  `/health` and `/v1/models` answer meanwhile.
+- Unsupported features include GBNF grammars and drafting in the server.
 - A proposed 4-bit attention requantization has a projected cost of
   3.7 ms per token. It requires the 53 GB original model and a quality check.
 

@@ -1,4 +1,4 @@
-// openai-compatible chat server over one model, one request at a time.
+// openai-compatible chat server over one model: chats queue, one at a time.
 //   gall serve <gguf> [--port 9940] [--ctx 102400] [--effort none]
 //             [--alias inkling-2-mini] [--api-key-file F]
 //             [--idle-unload SECONDS] [--dummy [answer]]
@@ -16,7 +16,8 @@ use std::{collections::HashMap, ops::Range};
 use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::mpsc::{channel, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub trait Lm {
@@ -979,30 +980,33 @@ impl Srv {
             "created" => now.as_secs() as usize, "model" => name.as_str(),
             "choices" => vec![c], "usage" => usage, "timings" => timings])
     }
+}
 
-    fn conn(&mut self, mut c: TcpStream) -> io::Result<()> {
-        c.set_nodelay(true)?;
-        c.set_read_timeout(Some(Duration::from_secs(30)))?;
-        let Some((m, p, body, a)) = request(&c) else { return Ok(()) };
-        let p = p.trim_start_matches("/v1");
-        match (m.as_str(), p) {
-            ("OPTIONS", _) => head(&mut c, 204, "text/plain", ""),
-            ("GET", "/health") => reply(&mut c, 200, &obj!["status" => "ok",
-                "loaded" => self.lm.loaded()]),
-            _ if self.auth.as_ref().is_some_and(|k| *k != a) => {
-                reply(&mut c, 401, &err("invalid api key"))
-            }
-            ("GET", "/models") => {
-                let m = obj!["id" => self.name.as_str(), "object" => "model",
-                    "owned_by" => "gall"];
-                reply(&mut c, 200, &obj!["object" => "list", "data" => vec![m]])
-            }
-            ("POST", "/chat/completions") => match J::parse(&body) {
-                Some(r) => self.chat(&r, &mut c),
-                None => reply(&mut c, 400, &err("the body is not json")),
-            },
-            _ => reply(&mut c, 404, &err("not found")),
+// a connection, on its own thread: answers all but a chat, which waits its
+// turn on the queue q for the one model
+type Chat = (J, TcpStream);
+fn conn(mut c: TcpStream, name: &str, auth: &Option<String>, up: &AtomicBool,
+        q: &Sender<Chat>) -> io::Result<()> {
+    c.set_nodelay(true)?;
+    c.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let Some((m, p, body, a)) = request(&c) else { return Ok(()) };
+    let p = p.trim_start_matches("/v1");
+    match (m.as_str(), p) {
+        ("OPTIONS", _) => head(&mut c, 204, "text/plain", ""),
+        ("GET", "/health") => reply(&mut c, 200, &obj!["status" => "ok",
+            "loaded" => up.load(Relaxed)]),
+        _ if auth.as_ref().is_some_and(|k| *k != a) => {
+            reply(&mut c, 401, &err("invalid api key"))
         }
+        ("GET", "/models") => {
+            let m = obj!["id" => name, "object" => "model", "owned_by" => "gall"];
+            reply(&mut c, 200, &obj!["object" => "list", "data" => vec![m]])
+        }
+        ("POST", "/chat/completions") => match J::parse(&body) {
+            Some(r) => Ok(q.send((r, c)).unwrap()),
+            None => reply(&mut c, 400, &err("the body is not json")),
+        },
+        _ => reply(&mut c, 404, &err("not found")),
     }
 }
 
@@ -1193,17 +1197,28 @@ pub fn main(a: &[String]) {
         t,
     };
     eprintln!("gall: http://127.0.0.1:{port}/v1, context {ctx}");
-    let idle: i32 = opt("--idle-unload", "0").parse().unwrap();
-    let mut pf = libc::pollfd { fd: l.as_raw_fd(), events: libc::POLLIN,
-        revents: 0 };
+    let idle: u64 = opt("--idle-unload", "0").parse().unwrap();
+    let (tx, rx) = channel();
+    let up: &AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
+    let (name, auth) = (s.name.clone(), s.auth.clone());
+    std::thread::spawn(move || for c in l.incoming().flatten() {
+        let (name, auth, tx) = (name.clone(), auth.clone(), tx.clone());
+        std::thread::spawn(move || conn(c, &name, &auth, up, &tx));
+    });
     loop {
-        let t = if idle > 0 && s.lm.loaded() { idle * 1000 } else { -1 };
-        if unsafe { libc::poll(&mut pf, 1, t) } == 0 {
+        up.store(s.lm.loaded(), Relaxed);
+        let r = match idle > 0 && s.lm.loaded() {
+            true => rx.recv_timeout(Duration::from_secs(idle)).ok(),
+            _ => rx.recv().ok(),
+        };
+        if let Some((r, mut c)) = r {
+            if let Err(e) = s.chat(&r, &mut c) {
+                eprintln!("gall: {e}");
+            }
+        } else {
             let n = if s.lm.len() == s.fed.len() { s.fed.len() } else { 0 };
             s.lm.park(&s.fed[..n]);
             s.fed.clear();
-        } else if let Err(e) = l.accept().and_then(|c| s.conn(c.0)) {
-            eprintln!("gall: {e}");
         }
     }
 }
