@@ -202,7 +202,7 @@ build of the new kernels (which gave 82 / 149 / 316 at 2 / 4 / 8 rows).
 
 ## when to draft
 
-`Dr::round` and `Spec`. the drafter gives a probability for each draft
+`Dr::next` and `Spec`. the drafter gives a probability for each draft
 (`conf`: softmax of its logits after the softcap), and that predicts
 acceptance. teacher-forced on ref/short, 121 drafts of 7, each draft
 counted while those before it hold:
@@ -272,18 +272,91 @@ per command buffer.
   chunks of 256 keys with one chain: draft of 7 43 ms. with 16 simdgroups
   of 16 keys per chunk and a merge: 31.5 ms, 30.3 shallow.
 
+## in the server
+
+`gall serve` opens the drafter when `dspark-Inkling-2-Mini-Q8_0.gguf` lies
+beside the model (`gall up` fetches it; `--no-draft` leaves it out).
+behind `Lm::step` is `Dr::next(m, st, tok)`: it feeds one token and names
+the activation row whose logits follow it.
+
+- a pass leaves `m.pos` after its first token; the rows verified ahead lie
+  past it. a later `next(tok)` takes the next row only if tok is that
+  row's draft (its context is injected then and `m.pos` moves), else the
+  rows are dropped and a new pass starts at tok. so the server samples
+  the model's own logits at every step, with any sampler, and a draft is
+  kept only while the sample equals it. stop strings, tool calls,
+  max_tokens and a hang-up need nothing: the model never holds more than
+  was asked for.
+- `Spec.q` then learns the acceptance under the sampler in use, so the
+  gate and the switch hold there as well.
+- under `response_format` drafting is off for the request.
+- `truncate`, `reset`, `prime` and `feed` drop the rows ahead;
+  `Model::top` says how far a pass wrote the conv rings, `truncate`
+  counts from it, and a snapshot stores it (tag `gall snap 2`).
+- what `prime` restores or feeds (the system region from 512 tokens) has
+  no drafter context: `Dr::forget`.
+- the model keeps the three residual features itself (`keep`, 3
+  dispatches a token), so a serial step with a drafter is `Model::step`
+  with its pre-encoded token, and the context goes out in a command
+  buffer that nobody waits for.
+- from 4096 tokens the int8 score, gather and fix kernels take the rows on
+  grid z as the f16 ones do; a pass claims the int8 copy of its first row
+  only, later rows are packed again when they are kept.
+
+measured 2026-11-22 on the build merged with main 2bba3ed, machine cool.
+
+- `gall check ref/short -n 64`, back to back with main's binary: 48.2
+  against 48.1 gpu ms/token, 0 greedy mismatches, kl mean 1.05e-4.
+- a pass by rows 1..8: 49.5, 70.3, 95.7, 117.0, 149.9, 181.4, 235.1,
+  243.9 ms.
+- `gall run`, 128 tokens (code 96), plain against `--draft`, text equal:
+  prose 20.5, 20.2 t/s; math 20.4, 21.6; code 20.7, 23.3.
+- a 5406-token prompt (the head of `src/serve.rs`), 48 tokens, text equal:
+  plain 19.0, a fixed block of 3 21.6, gated 20.6 t/s.
+- one timing sample with a kernel compile in it (the first pass of 3
+  rows, 280 ms) had closed that block for the run: the row kernels now
+  compile at `Dr::open` and a sample counts for at most 1.5 times its
+  mean.
+- a side server on port 9941, 120 tokens a request, `--no-draft` then
+  drafting in one `./wd` run. the whole message is equal in every pair,
+  under sampling with the same seed too. t/s is the server's
+  `predicted_per_second`:
+
+| request | temp 0, off | temp 0, on | default sampling, off | on |
+| --- | ---: | ---: | ---: | ---: |
+| prose (how a transformer predicts) | 20.5 | 20.7 | 20.2 | 20.5 |
+| math (induction proof) | 20.4 | 23.4 | 20.0 | 21.8 |
+| code (rust key-value store) | 20.4 | 21.4 | 20.2 | 20.4 |
+
+- rows ahead kept of rows verified, on: temp 0 8 of 10, 47 of 51, 51 of
+  67; sampling 13 of 15, 47 of 53, 33 of 48. with 200 tokens: temp 0 math
+  20.3 -> 21.9, code 20.3 -> 20.9; sampling math 19.6 -> 21.0, code 19.7
+  -> 20.0.
+- the answers are the model's thinking text, which reads as prose, so the
+  gains are below those of `gall run` on raw math and code.
+- two turns with prefix reuse, the same prompt again (checkpoint), an
+  830-token system prompt (snapshot written and read), an idle unload and
+  an image request give the same messages with and without the drafter.
+- that test found `Model::feed` stepping an image row that ends the
+  prompt through the token table (the image as the last content part):
+  the row now takes the general path.
+
 ## left
 
-- `serve.rs --draft`: `Dr::feed` for the prompt, `Dr::round` per step,
-  greedy only (sampling needs the target's sample at each row).
+- sampling: drafts are the drafter's argmax; a draft sampled from the
+  drafter with the matching accept rule would keep more at high
+  temperature.
 - the draft is 15-31 ms per round and half of it is the output head for
   the drafter's rows (q5_k, 5.4 ms for one row); math makes a draft per
   3.6 tokens. a coarser copy of the head for drafting would cut it.
 - small ops at 4 rows are 13.4 ms against 5 serial: `ctl`, `low`, `post`,
   `rows`, `msg` do work per row that could be shared or made wider.
 - 7 and 8 rows (255, 266 ms): the kernels for 7 and 8 uses.
-- snapshots do not store the drafter's context; after a restore it starts
-  from the tokens fed since.
+- snapshots do not store the drafter's context, and `prime` feeds the
+  system region without it; after either the drafter starts from the
+  tokens fed since.
+- at the 4096-token line a pass uses f16 for all its rows where serial
+  steps would switch to the int8 copy mid-pass.
 - the drafter's context cache is 4KB per token (428MB at 102400), and its
   full-attention layer reads all of it per draft.
 - `KV=q8` with a batched pass is untested.

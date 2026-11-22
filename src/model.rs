@@ -676,7 +676,15 @@ impl Model {
             drop(ops);
             self.pos += c.len();
         }
-        self.step(*l)
+        if *l < IMG {
+            return self.step(*l);
+        }
+        // step() reads the token table: an image row goes the long way
+        let ops = self.sched(*l, self.pos, true);
+        self.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
+        drop(ops);
+        self.pos += 1;
+        self.next()
     }
 
     // the experts of the last visit
