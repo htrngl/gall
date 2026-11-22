@@ -517,7 +517,52 @@ fn probs(c: &[(f32, u32)], t: f32) -> Vec<f32> {
     p.iter().map(|x| x / z).collect()
 }
 
+// the token at u of the softmax of l at temperature t, as sample() finds
+// it with no filter, to the bit, without most of its 200k exps: a term
+// under half an ulp of a float32 sum or of u leaves it as it is, so it is
+// not computed. such a term has (x - m) / t < ln(sum) - 17.4 (e^-17.4 <
+// 2^-25); `under` is that bound on x, with room for its own rounding
+fn pick(l: &[f32], t: f32, mut u: f32) -> u32 {
+    let m = l.iter().fold(f32::MIN, |m, &x| m.max(x));
+    let under = |s: f32| m + (s.ln() - 17.5) * t - 1e-3;
+    let (mut e, mut z, mut z0, mut cut) = (vec![-1f32; l.len()], 0f32, 0f32, f32::MIN);
+    for (i, &x) in l.iter().enumerate() {
+        if x >= cut {
+            e[i] = ((x - m) / t).exp();
+            z += e[i];
+            if z >= 2. * z0 {
+                (z0, cut) = (z, under(z));
+            }
+        }
+    }
+    let (mut u0, mut cut) = (u / 2., under(u / 2.));
+    for (i, &x) in l.iter().enumerate() {
+        if e[i] < 0. && x < cut {
+            continue;
+        }
+        u -= if e[i] < 0. { ((x - m) / t).exp() } else { e[i] } / z;
+        if u < 0. {
+            return i as u32;
+        } else if u < u0 {
+            (u0, cut) = (u / 2., under(u / 2.));
+        }
+    }
+    l.len() as u32 - 1
+}
+
 fn sample(l: &[f32], p: &Sp, rng: &mut u64) -> u32 {
+    let draw = |rng: &mut u64| {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+        (*rng >> 40) as f32 / (1u64 << 24) as f32
+    };
+    if p.top_k as usize == 0 && p.temp <= 0.0 {
+        // the first maximum
+        return (0..l.len()).fold(0, |m, i| if l[i] > l[m] { i } else { m }) as u32;
+    } else if p.top_k as usize == 0 && p.top_p >= 1.0 && p.min_p <= 0.0 {
+        return pick(l, p.temp as f32, draw(rng));
+    }
     let mut c: Vec<(f32, u32)> = l.iter().copied().zip(0..).collect();
     let k = p.top_k as usize;
     if k > 0 && k < c.len() {
@@ -553,10 +598,7 @@ fn sample(l: &[f32], p: &Sp, rng: &mut u64) -> u32 {
         let m = c.iter().fold(f32::MIN, |m, x| m.max(x.0));
         c.retain(|x| x.0 >= m + p.min_p.ln() as f32);
     }
-    *rng ^= *rng << 13;
-    *rng ^= *rng >> 7;
-    *rng ^= *rng << 17;
-    let mut u = (*rng >> 40) as f32 / (1u64 << 24) as f32;
+    let mut u = draw(rng);
     let pr = probs(&c, p.temp as f32);
     let i = pr.iter().position(|&x| {
         u -= x;

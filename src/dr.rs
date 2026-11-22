@@ -82,7 +82,9 @@ impl Dr {
     pub fn open(m: &mut Model, path: &str, n_ctx: usize) -> Dr {
         m.taps();
         drop(m.sched_z(&[0; 2], 0, true, 0)); // compiles the row kernels now
-        let g: &'static Gguf = Box::leak(Box::new(gguf::open(path)));
+        // one map per process, kept across unloads, as the model's is
+        static G: std::sync::OnceLock<Gguf> = std::sync::OnceLock::new();
+        let g: &'static Gguf = G.get_or_init(|| gguf::open(path));
         let mut w = Gpu::new();
         w.map(g);
         let (mut s, mut o) = (vec![0f32], HashMap::new());
@@ -136,7 +138,20 @@ impl Dr {
             w,
             o,
         };
-        // P and wb: the head applied to hidden_out's columns and bias
+        // P and wb: the head applied to hidden_out's columns and bias. 0.6 s
+        // of head passes, so they are kept in a file by the two models
+        let md = std::fs::metadata(path).unwrap();
+        let at = md.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap();
+        let f = format!("p-{}-{}-{}.dr", m.g.map.len(), md.len(), at.as_secs());
+        let f = crate::up::cache().join(f);
+        let wb = || &mut slice::<u8>(&d.b)[4 * WB..][..4 * NV];
+        let read = |mut r: std::fs::File| {
+            use std::io::Read;
+            r.read_exact(wb()).and_then(|_| r.read_exact(slice::<u8>(&d.p))).is_ok()
+        };
+        if md.len() > 0 && std::fs::File::open(&f).is_ok_and(read) {
+            return d;
+        }
         let (b, out) = (slice::<f32>(&d.b), &m.g.t["output.weight"]);
         let ho = d.g.data(&d.g.t["dspark_hidden_out.weight"]);
         let hb = d.o["dspark_hidden_out.bias"];
@@ -151,6 +166,14 @@ impl Dr {
                 d.mm(out, m.gpu.w(out), HN, BL, NV, 8).2(e);
                 d.k("pset", [6252, 1, 1], &[BL, k], vec![(&d.p, 0)]).2(e);
             });
+        }
+        let tmp = f.with_extension("tmp");
+        let put = |mut w: std::fs::File| {
+            use std::io::Write;
+            w.write_all(wb()).and_then(|_| w.write_all(slice::<u8>(&d.p))).is_ok()
+        };
+        if std::fs::File::create(&tmp).is_ok_and(put) {
+            std::fs::rename(tmp, f).ok();
         }
         d
     }

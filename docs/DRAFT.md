@@ -341,6 +341,18 @@ measured 2026-11-22 on the build merged with main 2bba3ed, machine cool.
   prompt through the token table (the image as the last content part):
   the row now takes the general path.
 
+- a reload after an idle unload took 0.71-0.75 s with the drafter against
+  0.06-0.08 without: `Dr::open` ran 33 head passes for `P` each time. `P`
+  and `wb` are now a file in `~/.cache/gall` (104 MB, named by the sizes
+  of the two models and the drafter's date) read into the gpu buffers,
+  and the drafter's map is kept as the model's is: 0.07-0.10 s. footprint
+  while unloaded, `--ctx 102400`: 224 MB without the drafter, 231 before,
+  229-231 after.
+- `sample()` at the default settings (temp 1, no filter) built 200k pairs
+  and exps: 0.80-1.58 ms of host time a token. `pick()` skips the terms
+  that cannot move a float32 sum or the draw: 0.21-0.37 ms, and the
+  messages of 6 requests of 80 tokens (seeds 7 and 9) are the same.
+
 ## left
 
 - sampling: drafts are the drafter's argmax; a draft sampled from the
