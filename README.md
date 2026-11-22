@@ -22,6 +22,31 @@ ggml or MLX.
 - Rust (`cargo`) and `curl`.
 - 13 GB of disk space for the model files.
 
+## App
+
+`Gall.app` is a menu bar app for the same server. It needs no terminal.
+
+1. Download `Gall.dmg` from the
+   [releases page](https://github.com/ltrgoddard/gall/releases).
+2. Drag `Gall.app` to the Applications folder, then open it.
+3. On first use, the app checks for 24 GB of memory and 14 GB of free disk
+   space. Then it downloads the model files (12.7 GB). The menu shows the
+   progress.
+4. When the menu shows `ready`, select `copy endpoint` and paste the URL
+   (`http://127.0.0.1:9940/v1`) into an OpenAI-compatible client.
+
+The menu shows the server state, its memory use, and the cache use and
+speed of the last answer. `unload now` releases the model's memory and
+keeps the conversation. The settings submenu sets the idle time before an
+unload (15 minutes by default), the context length, start at login, and
+access from other devices on the network. Network access makes a key in
+`~/.cache/gall/key`; `copy key` copies it. Quit stops the server.
+
+To build the app from source, run `mac/build`. It makes `target/Gall.app`
+and signs it ad hoc. Set `GALL_SIGN` to a signing identity to sign it with
+that identity. Also set `GALL_NOTARY` to a `notarytool` keychain profile
+name to make a notarized `target/Gall.dmg`.
+
 ## Install and run
 
 ```sh
@@ -60,7 +85,10 @@ that base URL. The server supports these endpoints:
 - `/v1/chat/completions`, with streaming, tools, reasoning, images, and
   JSON `response_format`.
 - `/v1/models`.
-- `/health`.
+- `/health`, with `loaded`, `busy` (a chat runs), and `last` (the
+  `timings` of the last chat, or `null`). It needs no key.
+- `POST /park`, which saves the conversation and unloads the model after
+  the current chat.
 
 The server runs one chat at a time. Other chats wait in a queue, and
 `/health` and `/v1/models` answer during a chat.
@@ -80,12 +108,13 @@ system line with the schema to the prompt. GBNF grammars are not supported.
 
 | Flag | Result |
 | --- | --- |
+| `--host ADDR` | Listens on address `ADDR` (default `127.0.0.1`). An address other than loopback requires `--api-key-file`. |
 | `--port N` | Listens on port `N` (default 9940). |
 | `--ctx N` | Sets the context length in tokens (default 102,400). |
 | `--alias NAME` | Sets the model name that the API reports. |
 | `--effort LEVEL` | Sets the reasoning effort for requests that give none (default `none`). |
 | `--api-key-file F` | Requires `Authorization: Bearer KEY` with the key in `F`, on every request except `/health`. |
-| `--idle-unload N` | Releases the model's memory after `N` seconds without a request. |
+| `--idle-unload N` | Releases the model's memory after `N` seconds without a request. `POST /park`, memory pressure and `SIGTERM` also release it. |
 | `--no-draft` | Disables the drafter. |
 
 ### Memory and prefix cache
@@ -94,13 +123,16 @@ With `--idle-unload N`, the server saves the conversation as a prefix
 snapshot and unloads the model after `N` seconds without a request. The
 next chat request reloads the model and continues from that snapshot. The
 measured reload time is 0.08 seconds when the files are in the page cache.
-The `/health` response includes a `"loaded"` field.
+The `/health` response includes a `"loaded"` field. `POST /park`, a
+`SIGTERM` (from `gall down`, a quit, or a logout), and a memory pressure
+warning from macOS also save the conversation and unload the model.
 
 Only one model fits in the tested machine's GPU memory. Gall holds
 `/tmp/gall.lock` while a model is loaded and releases the lock when it
 unloads the model. A second server or `./wd` waits for this lock.
 The `--idle-unload` option lets the server and measurement commands take
-turns. Gall exits if memory runs short. Unload other local models first.
+turns. Gall exits if memory becomes critically short. Unload other local
+models first.
 
 Gall stores conversation prefixes, including the system prompt and tools,
 in `~/.cache/gall`. A new conversation with the same prefix starts in
@@ -221,6 +253,8 @@ The header of `src/main.rs` lists the other commands, including `run`,
 - `src/vis.*`: Image decoding (ImageIO) and the vision encoder.
 - `src/dr*`: The dspark drafter and its batched verification.
 - [Engine brief](docs/ENGINE.md) and [drafter notes](docs/DRAFT.md).
+- `mac/`: The menu bar app (Swift) and `mac/build`, which makes
+  `target/Gall.app`.
 - `tools/`: Tools for reference dumps from llama.cpp.
 - `llama/`: The patched llama.cpp reference build and its
   [notes](llama/PLAN.md). `llama/build` installs it for the llama app.

@@ -1,0 +1,234 @@
+// the state of the server and the commands that change it: polls /health,
+// reads the footprint of the server pid, runs the bundled gall binary
+import AppKit
+
+let fm = FileManager.default
+let cache = fm.homeDirectoryForCurrentUser.appendingPathComponent(".cache/gall")
+let key = cache.appendingPathComponent("key")
+let endpoint = "http://127.0.0.1:9940"
+
+struct Health: Decodable {
+    var loaded: Bool
+    var busy: Bool?
+    var last: Last?
+    struct Last: Decodable {
+        var cacheN, promptN: Int?
+        var predictedPerSecond: Double?
+    }
+}
+
+// Contents/MacOS/gall, else a development build or gall on PATH; never the
+// app itself (Gall and gall are one file on a case-insensitive volume)
+let bin: URL? = {
+    let me = Bundle.main.executableURL!.resolvingSymlinksInPath()
+    let ino = { (u: URL) in
+        (try? fm.attributesOfItem(atPath: u.path))?[.systemFileNumber] as? Int
+    }
+    let up = { (u: URL, n: Int) in
+        (0..<n).reduce(u) { u, _ in u.deletingLastPathComponent() }
+    }
+    let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
+    let c = [up(me, 1), up(me, 5).appendingPathComponent("target/release"),
+             URL(fileURLWithPath: fm.currentDirectoryPath + "/target/release")]
+        + path.split(separator: ":").map { URL(fileURLWithPath: String($0)) }
+    return c.map { $0.appendingPathComponent("gall") }.first {
+        fm.isExecutableFile(atPath: $0.path) && ino($0) != ino(me)
+    }
+}()
+
+// exit status and output of gall with these arguments
+@discardableResult
+func gall(_ a: [String]) async -> (Int32, String) {
+    guard let bin else { return (-1, "The gall binary is missing.") }
+    return await withCheckedContinuation { k in
+        let (p, o) = (Process(), Pipe())
+        (p.executableURL, p.arguments) = (bin, a)
+        (p.standardOutput, p.standardError) = (o, o)
+        p.terminationHandler = { p in
+            let d = o.fileHandleForReading.readDataToEndOfFile()
+            k.resume(returning: (p.terminationStatus, String(decoding: d,
+                                                             as: UTF8.self)))
+        }
+        do { try p.run() } catch { k.resume(returning: (-1, "\(error)")) }
+    }
+}
+
+func sleep(_ s: Double) async {
+    try? await Task.sleep(nanoseconds: UInt64(s * 1e9))
+}
+
+// bytes in ~/.cache/gall of the model files, finished or partial
+func got() -> Double {
+    let f = (try? fm.contentsOfDirectory(at: cache,
+        includingPropertiesForKeys: [.fileSizeKey])) ?? []
+    return f.filter { ["gguf", "part"].contains($0.pathExtension) }
+        .compactMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize }
+        .reduce(0) { $0 + Double($1) }
+}
+
+// physical footprint of the server, in GB, as activity monitor shows it
+func footprint() -> Double? {
+    let s = try? String(contentsOf: cache.appendingPathComponent("serve.pid"))
+    guard let p = Int32(s?.trimmingCharacters(in: .whitespacesAndNewlines)
+                        ?? "") else { return nil }
+    var ri = rusage_info_v4()
+    let r = withUnsafeMutablePointer(to: &ri) {
+        $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+            proc_pid_rusage(p, RUSAGE_INFO_V4, $0)
+        }
+    }
+    return r == 0 ? Double(ri.ri_phys_footprint) / Double(1 << 30) : nil
+}
+
+func alert(_ s: String) {
+    NSApp.activate(ignoringOtherApps: true)
+    let a = NSAlert()
+    a.messageText = s
+    a.runModal()
+}
+
+@MainActor final class Gall: ObservableObject {
+    @Published var h: Health?
+    @Published var phase = "" // overrides the status while not empty
+    @Published var mem: Double?
+    var open = false, fetching = false
+    let d = UserDefaults.standard
+
+    var idle: Int { d.object(forKey: "idle") as? Int ?? 15 } // minutes
+    var ctx: Int { d.object(forKey: "ctx") as? Int ?? 102400 }
+    var net: Bool { d.bool(forKey: "net") }
+
+    var status: String {
+        guard phase.isEmpty else { return phase }
+        guard let h else { return "Stopped" }
+        return h.busy == true ? "Answering" : h.loaded ? "Ready" : "Unloaded"
+    }
+
+    var last: String? {
+        guard let t = h?.last, let c = t.cacheN, let p = t.promptN
+        else { return nil }
+        let r = String(format: "%.1f", t.predictedPerSecond ?? 0)
+        return "Last: \(c.formatted()) of \((c + p).formatted()) tokens "
+            + "cached, \(r) t/s"
+    }
+
+    init() {
+        let n = NotificationCenter.default
+        n.addObserver(forName: NSMenu.didBeginTrackingNotification,
+                      object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.open = true }
+        }
+        n.addObserver(forName: NSMenu.didEndTrackingNotification,
+                      object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.open = false }
+        }
+        Task {
+            NSApp.setActivationPolicy(.accessory)
+            await start()
+            for t in 0... {
+                if fetching {
+                    phase = "Downloading \(Int(got() / 12.7e7))%"
+                }
+                if open || t % 10 == 0 { await poll() }
+                await sleep(1)
+            }
+        }
+    }
+
+    func health() async -> Health? {
+        let u = URL(string: endpoint + "/health")!
+        let r = URLRequest(url: u, timeoutInterval: 2)
+        let dec = JSONDecoder()
+        dec.keyDecodingStrategy = .convertFromSnakeCase
+        guard let (b, _) = try? await URLSession.shared.data(for: r)
+        else { return nil }
+        return try? dec.decode(Health.self, from: b)
+    }
+
+    func poll() async {
+        h = await health()
+        mem = h == nil ? nil : footprint()
+    }
+
+    // the first run checks the mac and fetches the model; up is a no-op
+    // when a server answers already
+    func start() async {
+        if await health() != nil { return await poll() }
+        if !d.bool(forKey: "installed") {
+            let ram = ProcessInfo.processInfo.physicalMemory >> 30
+            let free = (try? cache.resourceValues(forKeys:
+                [.volumeAvailableCapacityForImportantUsageKey]))?
+                .volumeAvailableCapacityForImportantUsage ?? 0
+            let need = (14e9 - got()) / 1e9
+            let why = ram < 24 ? "Gall needs 24 GB of memory. This Mac has "
+                + "\(ram) GB." : Double(free) / 1e9 < need ? "Gall needs "
+                + String(format: "%.1f", need) + " GB free on the home "
+                + "volume for the model." : nil
+            if let why {
+                phase = "Not installed"
+                return alert(why)
+            }
+        }
+        fetching = true
+        let (s, o) = await gall(["model"])
+        fetching = false
+        guard s == 0 else {
+            phase = "Download failed"
+            return alert(o)
+        }
+        d.set(true, forKey: "installed")
+        await up()
+    }
+
+    func up() async {
+        phase = "Starting"
+        var a = ["up", String(ctx), "--idle-unload", String(idle * 60)]
+        if net {
+            if !fm.fileExists(atPath: key.path) {
+                let k = (0..<32).map { _ in
+                    String(format: "%02x", UInt8.random(in: 0...255))
+                }.joined()
+                fm.createFile(atPath: key.path, contents: Data(k.utf8),
+                              attributes: [.posixPermissions: 0o600])
+            }
+            a += ["--host", "0.0.0.0", "--api-key-file", key.path]
+        }
+        let (s, o) = await gall(a)
+        phase = s == 0 ? "" : "Failed to start"
+        if s != 0 { alert(o) }
+        await poll()
+    }
+
+    // down parks the conversation; wait for the port to close, then up
+    func restart() {
+        Task {
+            phase = "Restarting"
+            await gall(["down"])
+            for _ in 0..<600 {
+                guard await health() != nil else { break }
+                await sleep(0.2)
+            }
+            await up()
+        }
+    }
+
+    func park() {
+        Task {
+            var r = URLRequest(url: URL(string: endpoint + "/park")!)
+            r.httpMethod = "POST"
+            if net, let k = try? String(contentsOf: key) {
+                let k = k.trimmingCharacters(in: .whitespacesAndNewlines)
+                r.setValue("Bearer " + k, forHTTPHeaderField: "Authorization")
+            }
+            _ = try? await URLSession.shared.data(for: r)
+            await poll()
+        }
+    }
+
+    func quit() {
+        Task {
+            await gall(["down"])
+            NSApp.terminate(nil)
+        }
+    }
+}

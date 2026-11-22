@@ -56,19 +56,21 @@ fn sys(k: &str) -> i32 {
 }
 
 // one model fits on the gpu: open the machine lock (./wd holds it already
-// when WDL is set), and leave before memory runs out
+// when WDL is set), park at memory pressure (warn), and leave before memory
+// runs out
 static FD: AtomicI32 = AtomicI32::new(-1);
-pub fn guard() {
+pub fn guard(park: impl Fn() + Send + 'static) {
     if env::var("WDL").is_err() {
         let f = fs::File::create("/tmp/gall.lock").unwrap();
         FD.store(f.into_raw_fd(), Relaxed);
     }
-    thread::spawn(|| loop {
-        if sys("kern.memorystatus_vm_pressure_level") >= 4
-            || sys("kern.memorystatus_level") < 6
-        {
+    thread::spawn(move || loop {
+        let l = sys("kern.memorystatus_vm_pressure_level");
+        if l >= 4 || sys("kern.memorystatus_level") < 6 {
             eprintln!("gall: memory is short, leaving");
             exit(1)
+        } else if l >= 2 {
+            park()
         }
         thread::sleep(Duration::from_secs(1));
     });
@@ -95,9 +97,14 @@ pub fn main(a: &[String]) {
     match a[0].as_str() {
         "model" => println!("{}", model()),
         "log" => panic!("{}", Command::new("tail").arg("-f").arg(log).exec()),
+        // the server parks, then exits: wait for it, so an up can follow
         "down" => {
             if let Ok(p) = fs::read_to_string(&pid) {
-                unsafe { libc::kill(p.parse().unwrap(), libc::SIGTERM) };
+                let p = p.parse().unwrap();
+                unsafe { libc::kill(p, libc::SIGTERM) };
+                while unsafe { libc::kill(p, 0) } == 0 {
+                    thread::sleep(Duration::from_millis(100));
+                }
                 fs::remove_file(pid).ok();
             }
         }

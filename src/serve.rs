@@ -1,13 +1,17 @@
 // openai-compatible chat server over one model: chats queue, one at a time.
-//   gall serve <gguf> [--port 9940] [--ctx 102400] [--effort none]
-//             [--alias inkling-2-mini] [--api-key-file F]
+//   gall serve <gguf> [--port 9940] [--host 127.0.0.1] [--ctx 102400]
+//             [--effort none] [--alias inkling-2-mini] [--api-key-file F]
 //             [--idle-unload SECONDS] [--no-draft] [--dummy [answer]]
-// POST /v1/chat/completions (stream or not), GET /v1/models, GET /health.
-// with a key, all but /health need "authorization: bearer KEY". after
-// --idle-unload seconds idle the model goes to disk (a snapshot of the last
-// conversation) and out of memory, until the next chat request. with the
-// dspark drafter beside the model, tokens are verified ahead in batches
-// where that pays (dr.rs); the logits of every step stay those of the model.
+// POST /v1/chat/completions (stream or not), GET /v1/models, POST /park,
+// GET /health ({status, loaded, busy, last: the timings of the last chat}).
+// with a key, all but /health need "authorization: bearer KEY"; a host
+// other than loopback needs a key. a park puts the model to disk (a
+// snapshot of the last conversation) and out of memory, until the next
+// chat request: after --idle-unload seconds idle, on POST /park, at memory
+// pressure (warn) and, before an exit, on SIGTERM; it waits for the chat
+// that runs. with the dspark drafter beside the model, tokens are verified
+// ahead in batches where that pays (dr.rs); the logits of every step stay
+// those of the model.
 // the chat template of the gguf is written out in prompt(); the model
 // answers in blocks, <|message_model|> then <|content_thinking|>,
 // <|content_text|> or NAME<|content_invoke_tool_json|>, each closed by
@@ -19,7 +23,7 @@ use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::{mpsc::{channel, Sender}, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub trait Lm {
@@ -827,18 +831,28 @@ impl Srv {
                 JSON value and nothing else. It must fit this JSON schema: \
                 {s}{END}");
         }
-        // the rows of each image, as token ids, go in at its place; a
-        // full image store empties itself and the second try starts again
+        // the rows of each image, as token ids, go in at its place. a full
+        // image store empties itself; the next try starts again, and then
+        // the oldest images are left out (an empty part) until the rest fit
         type R = Result<Vec<Range<u32>>, String>;
-        let t = Instant::now();
-        let mut get = || urls.iter().map(|u| self.lm.image(&u.1)).collect::<R>();
-        let ids = match get().or_else(|_| get()) {
-            Ok(i) => i,
-            Err(e) => return reply(w, 400, &err(&e)),
+        let (t, mut skip, mut again) = (Instant::now(), 0, false);
+        let ids = loop {
+            let r = urls[skip..].iter().map(|u| self.lm.image(&u.1));
+            match r.collect::<R>() {
+                Ok(i) => break (0..skip).map(|_| 0..0).chain(i),
+                Err(e) if e == FULL && skip < urls.len() => {
+                    skip += again as usize;
+                    again = true;
+                }
+                Err(e) => return reply(w, 400, &err(&e)),
+            }
         };
         if !urls.is_empty() {
-            eprintln!("gall: {} images in {:.2} s", urls.len(),
-                t.elapsed().as_secs_f64());
+            eprintln!("gall: {} images in {:.2} s{}", urls.len(),
+                t.elapsed().as_secs_f64(), match skip {
+                    0 => String::new(),
+                    k => format!(", the oldest {k} left out (store full)"),
+                });
         }
         let (enc, mut p, mut at) = (|s: &str| self.tok.enc(s, true), vec![], 0);
         for ((to, _), ids) in urls.iter().zip(ids) {
@@ -1011,6 +1025,7 @@ impl Srv {
             "prompt_ms" => ms(dp), "prompt_per_second" => rate(np, dp),
             "predicted_n" => n, "predicted_ms" => ms(dg),
             "predicted_per_second" => rate(n, dg)];
+        *LAST.lock().unwrap() = timings.clone();
         if stream {
             for (i, key) in ["reasoning_content", "content"].iter().enumerate() {
                 if let Some(s) = part(&b[i], &mut sent[i], 0) {
@@ -1045,10 +1060,19 @@ impl Srv {
 }
 
 // a connection, on its own thread: answers all but a chat, which waits its
-// turn on the queue q for the one model
-type Chat = (J, TcpStream);
-fn conn(mut c: TcpStream, name: &str, auth: &Option<String>, up: &AtomicBool,
-        q: &Sender<Chat>) -> io::Result<()> {
+// turn on the queue q for the one model, as does a park (then an exit if
+// the bool is set; an answer to the stream if there is one)
+enum Q {
+    Chat(J, TcpStream),
+    Park(Option<TcpStream>, bool),
+}
+// loaded, a chat running, a park queued, the timings of the last chat
+static UP: AtomicBool = AtomicBool::new(true);
+static BUSY: AtomicBool = AtomicBool::new(false);
+static PEND: AtomicBool = AtomicBool::new(false);
+static LAST: Mutex<J> = Mutex::new(J::Null);
+fn conn(mut c: TcpStream, name: &str, auth: &Option<String>, q: &Sender<Q>)
+        -> io::Result<()> {
     c.set_nodelay(true)?;
     c.set_read_timeout(Some(Duration::from_secs(30)))?;
     let Some((m, p, body, a)) = request(&c) else { return Ok(()) };
@@ -1056,7 +1080,8 @@ fn conn(mut c: TcpStream, name: &str, auth: &Option<String>, up: &AtomicBool,
     match (m.as_str(), p) {
         ("OPTIONS", _) => head(&mut c, 204, "text/plain", ""),
         ("GET", "/health") => reply(&mut c, 200, &obj!["status" => "ok",
-            "loaded" => up.load(Relaxed)]),
+            "loaded" => UP.load(Relaxed), "busy" => BUSY.load(Relaxed),
+            "last" => LAST.lock().unwrap().clone()]),
         _ if auth.as_ref().is_some_and(|k| *k != a) => {
             reply(&mut c, 401, &err("invalid api key"))
         }
@@ -1065,9 +1090,10 @@ fn conn(mut c: TcpStream, name: &str, auth: &Option<String>, up: &AtomicBool,
             reply(&mut c, 200, &obj!["object" => "list", "data" => vec![m]])
         }
         ("POST", "/chat/completions") => match J::parse(&body) {
-            Some(r) => Ok(q.send((r, c)).unwrap()),
+            Some(r) => Ok(q.send(Q::Chat(r, c)).unwrap()),
             None => reply(&mut c, 400, &err("the body is not json")),
         },
+        ("POST", "/park") => Ok(q.send(Q::Park(Some(c), false)).unwrap()),
         _ => reply(&mut c, 404, &err("not found")),
     }
 }
@@ -1095,6 +1121,8 @@ impl Lm for Dummy {
         true
     }
 }
+
+const FULL: &str = "the image store is full";
 
 // the engine as an Lm; a checkpoint at each feed (the prompt). the
 // vision encoder, and the row count of each image held, by its url's hash;
@@ -1201,7 +1229,7 @@ impl Lm for Ink {
             if twin {
                 m.reset();
             }
-            return Err("the image store was full; send the request again".into());
+            return Err(FULL.into());
         }
         self.4.insert(key, e.len() / 2304);
         Ok(Model::ids(key as u32, e.len() / 2304))
@@ -1231,6 +1259,17 @@ pub fn main(a: &[String]) {
         let r = J::parse(&std::fs::read(&a[2]).unwrap()).unwrap();
         return print!("{}", prompt(&r, &"none".into()).unwrap().0);
     }
+    // SIGTERM, blocked in every thread, is a park then an exit
+    let (tx, rx) = channel();
+    let (t, mut m) = (tx.clone(), 0);
+    unsafe {
+        libc::sigaddset(&mut m, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &m, 0 as _);
+    }
+    std::thread::spawn(move || {
+        unsafe { libc::sigwait(&m, &mut 0) };
+        t.send(Q::Park(None, true)).unwrap()
+    });
     let ctx: usize = opt("--ctx", "102400").parse().unwrap();
     let say = "<|message_model|><|content_text|>hello from gall\
                <|end_message|><|content_model_end_sampling|>";
@@ -1238,7 +1277,12 @@ pub fn main(a: &[String]) {
         let (say, n) = (tok.enc(&opt("--dummy", say), true), tok.txt.len());
         Box::new(move || Box::new(Dummy(say.clone(), 0, vec![0.0; n], 0)))
     } else {
-        crate::up::guard();
+        let t = tx.clone();
+        crate::up::guard(move || {
+            if UP.load(Relaxed) && !PEND.swap(true, Relaxed) {
+                t.send(Q::Park(None, false)).unwrap()
+            }
+        });
         let (p, draft) = (a[0].clone(), !a.iter().any(|x| x == "--no-draft"));
         Box::new(move || {
             crate::up::lock(true);
@@ -1268,7 +1312,8 @@ pub fn main(a: &[String]) {
         "content_invoke_tool_json", "end_message"]
         .map(|s| tok.id(&format!("<|{s}|>")));
     let port: u16 = opt("--port", "9940").parse().unwrap();
-    let l = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let host = opt("--host", "127.0.0.1");
+    let l = TcpListener::bind((host.as_str(), port)).unwrap();
     let mut s = Srv {
         lm,
         tok,
@@ -1283,29 +1328,42 @@ pub fn main(a: &[String]) {
         sp,
         t,
     };
-    eprintln!("gall: http://127.0.0.1:{port}/v1, context {ctx}");
+    if s.auth.is_none() && !l.local_addr().unwrap().ip().is_loopback() {
+        eprintln!("gall: --host {host} needs --api-key-file");
+        std::process::exit(1)
+    }
+    eprintln!("gall: http://{host}:{port}/v1, context {ctx}");
     let idle: u64 = opt("--idle-unload", "0").parse().unwrap();
-    let (tx, rx) = channel();
-    let up: &AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
     let (name, auth) = (s.name.clone(), s.auth.clone());
     std::thread::spawn(move || for c in l.incoming().flatten() {
         let (name, auth, tx) = (name.clone(), auth.clone(), tx.clone());
-        std::thread::spawn(move || conn(c, &name, &auth, up, &tx));
+        std::thread::spawn(move || conn(c, &name, &auth, &tx));
     });
     loop {
-        up.store(s.lm.loaded(), Relaxed);
+        UP.store(s.lm.loaded(), Relaxed);
         let r = match idle > 0 && s.lm.loaded() {
             true => rx.recv_timeout(Duration::from_secs(idle)).ok(),
             _ => rx.recv().ok(),
         };
-        if let Some((r, mut c)) = r {
-            if let Err(e) = s.chat(&r, &mut c) {
-                eprintln!("gall: {e}");
+        match r.unwrap_or(Q::Park(None, false)) {
+            Q::Chat(r, mut c) => {
+                BUSY.store(true, Relaxed);
+                if let Err(e) = s.chat(&r, &mut c) {
+                    eprintln!("gall: {e}");
+                }
+                BUSY.store(false, Relaxed);
             }
-        } else {
-            let n = if s.lm.len() == s.fed.len() { s.fed.len() } else { 0 };
-            s.lm.park(&s.fed[..n]);
-            s.fed.clear();
+            Q::Park(c, exit) => {
+                let n = if s.lm.len() == s.fed.len() { s.fed.len() } else { 0 };
+                s.lm.park(&s.fed[..n]);
+                s.fed.clear();
+                UP.store(false, Relaxed);
+                PEND.store(false, Relaxed);
+                if exit {
+                    std::process::exit(0)
+                }
+                c.map(|mut c| reply(&mut c, 200, &obj!["parked" => true]));
+            }
         }
     }
 }

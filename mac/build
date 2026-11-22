@@ -1,0 +1,26 @@
+#!/bin/sh
+# mac/build: target/Gall.app, signed with $GALL_SIGN (ad hoc without it);
+# with $GALL_NOTARY (a notarytool keychain profile), a notarized dmg too
+set -e
+cd "$(dirname "$0")/.."
+cargo build --release
+swift build -c release --package-path mac
+a=target/Gall.app c=target/Gall.app/Contents
+rm -rf $a && mkdir -p $c/MacOS $c/Resources
+# the swift binary is GallMenu: on a case-insensitive disk, Gall is gall
+cp "$(swift build -c release --package-path mac --show-bin-path)/GallMenu" \
+  $c/MacOS/
+cp target/release/gall $c/MacOS/
+v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+sed "s|<string>0</string>|<string>$v</string>|" mac/Info.plist >$c/Info.plist
+[ -f mac/AppIcon.icns ] && cp mac/AppIcon.icns $c/Resources/
+s() { codesign -f -s "${GALL_SIGN:--}" --options runtime \
+  ${GALL_SIGN:+--timestamp} --entitlements mac/gall.entitlements "$@"; }
+s $c/MacOS/gall && s $a
+codesign --verify --deep --strict $a
+[ -z "$GALL_NOTARY" ] && exit
+d=target/Gall.dmg
+rm -f $d && hdiutil create -volname Gall -srcfolder $a -ov $d
+codesign -s "$GALL_SIGN" --timestamp $d
+xcrun notarytool submit $d --keychain-profile "$GALL_NOTARY" --wait
+xcrun stapler staple $d
