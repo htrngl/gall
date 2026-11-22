@@ -4,7 +4,7 @@
 // gall mmb
 // gall tok MODEL FILE
 // gall serve MODEL [--port 9940] [--ctx 102400] (see serve.rs)
-// gall up [CTX] | down | log | model | test (see up.rs)
+// gall up [CTX] [SERVE FLAGS] | down | log | model | test (see up.rs)
 mod dr;
 mod gguf;
 mod gpu;

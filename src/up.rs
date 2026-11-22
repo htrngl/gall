@@ -1,4 +1,4 @@
-// gall up [ctx] | down | log | model | test: the server as a background
+// gall up [ctx] [serve flags] | down | log | model | test: the server as a background
 // process (port 9940; log and pid in ~/.cache/gall), the model path, and a
 // greedy self-test against 64 reference tokens from llama.cpp
 use std::os::{fd::IntoRawFd, unix::process::CommandExt};
@@ -75,8 +75,11 @@ pub fn lock(on: bool) {
     if !on {
         op(libc::LOCK_UN);
     } else if op(libc::LOCK_EX | libc::LOCK_NB) {
+        // /tmp/gall.want asks ./wd runs to let the server go first
         eprintln!("gall: /tmp/gall.lock is held, waiting");
+        fs::write("/tmp/gall.want", std::process::id().to_string()).ok();
         op(libc::LOCK_EX);
+        fs::remove_file("/tmp/gall.want").ok();
     }
 }
 
@@ -97,7 +100,7 @@ pub fn main(a: &[String]) {
             let (m, f) = (model(), fs::File::create(&log).unwrap());
             let ctx = a.get(1).map_or("102400", |s| s);
             let mut c = Command::new(env::current_exe().unwrap())
-                .args(["serve", &m, "--ctx", ctx])
+                .args(["serve", &m, "--ctx", ctx]).args(a.iter().skip(2))
                 .stdin(Stdio::null()).stdout(f.try_clone().unwrap())
                 .stderr(f).process_group(0).spawn().unwrap();
             fs::write(pid, c.id().to_string()).unwrap();

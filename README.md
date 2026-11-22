@@ -23,8 +23,8 @@ gall test        # 64 greedy tokens against a llama.cpp reference
 gall down
 ```
 
-- `gall up [ctx]` starts the server in the background with a 102,400-token
-  context by default. It uses a GGUF in the Hugging Face cache if one is
+- `gall up [ctx] [serve flags]` starts the server in the background with a
+  102,400-token context by default. It uses a GGUF in the Hugging Face cache if one is
   there, else it downloads to `~/.cache/gall`. `GALL_MODEL=path` overrides.
 - `gall log` follows the request log. `gall model` prints the model path.
 - The server speaks the OpenAI chat API at `http://127.0.0.1:9940/v1`:
