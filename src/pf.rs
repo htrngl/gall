@@ -10,7 +10,7 @@ use crate::gpu::*;
 use crate::mv::name;
 use std::collections::HashMap;
 
-const MM: &str = concat!(
+pub const MM: &str = concat!(
     "#include <metal_stdlib>\n",
     include_str!("grids.metal"),
     include_str!("mv.metal"),
@@ -86,6 +86,7 @@ impl Model {
     // self.t is the gpu seconds
     pub fn prefill<'a>(&mut self, mut toks: &'a [u32], ub: usize) -> &'a [u32] {
         self.t = 0.;
+        self.stale(self.pos);
         while toks.len() > 16 {
             let (n, tb) = (ub.min(toks.len() - 1), ub.div_ceil(32) * 32);
             let pf = self.pf.take().filter(|p| p.tb >= tb);
@@ -227,11 +228,16 @@ impl Model {
                 if v == 0 {
                     for (i, &x) in toks.iter().enumerate() {
                         let y = (&pf.a, 4 * (i * STR + H));
-                        let (emb, x) = (self.emb, x as usize);
-                        self.mv.row(e, emb.ty, self.gpu.w(emb), x, y, N);
+                        self.embd(e, x, y);
                     }
                     k!(e, "prep", g1, 32, H, BK, 0, 0, 0, H, 1, 0, 0, 0, self.tn, 0,
                         0, VT);
+                    // an image row is the stream as it is: no norm
+                    for (i, &x) in toks.iter().enumerate() {
+                        if x >= super::IMG {
+                            self.embd(e, x, (&pf.a, 4 * (i * STR + H)));
+                        }
+                    }
                 } else {
                     tail(e, v - 1, np, ne);
                 }

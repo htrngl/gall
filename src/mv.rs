@@ -2,6 +2,7 @@
 //   let mv = Mv::new(&gpu, "");
 //   mv.dense(e, ty, w, x, y, n_in, n_out)         y = W x
 //   mv.row(e, ty, w, i, y, n_in)                  y = row i of W
+//   mv.row_id(e, ty, w, ids, y, n_in)             y = row ids[0] of W
 //   mv.experts_up(e, ty, w, ids, x, y, n_in, n_out)    y[k] = W[ids[k]] x
 //   mv.experts_down(e, ty, w, ids, x, y, n_in, n_out)  y = sum W[ids[k]] x[k]
 // w, x, y, ids are (buffer, byte offset); x and y are f32, ids NE u32.
@@ -22,7 +23,7 @@ pub const SRC: &str = concat!(
 struct P(u32, u32, u32, u32); // n_in, n_out, row bytes, experts
 
 // (type, name, rows per threadgroup as in mv.metal)
-const TY: [(u32, &str, usize); 12] = [
+const TY: [(u32, &str, usize); 14] = [
     (0, "f32", 2),
     (30, "bf16", 2),
     (8, "q8_0", 4),
@@ -35,6 +36,8 @@ const TY: [(u32, &str, usize); 12] = [
     (18, "iq3_xxs", 8),
     (20, "iq4_nl", 4),
     (40, "nvfp4", 8),
+    (105, "rq5", 4),
+    (106, "rq6", 4),
 ];
 
 pub fn name(ty: u32) -> &'static str {
@@ -85,9 +88,19 @@ impl Mv {
     }
 
     pub fn row(&self, e: &Enc, ty: u32, w: B, i: usize, y: B, n_in: usize) {
+        let w = (w.0, w.1 + i * (n_in / blk(ty).0 * blk(ty).1));
+        self.rw(e, ty, w, None, y, n_in);
+    }
+
+    // row ids[0] of W
+    pub fn row_id(&self, e: &Enc, ty: u32, w: B, ids: B, y: B, n_in: usize) {
+        self.rw(e, ty, w, Some(ids), y, n_in);
+    }
+
+    fn rw(&self, e: &Enc, ty: u32, w: B, ids: Option<B>, y: B, n_in: usize) {
         let rb = n_in / blk(ty).0 * blk(ty).1;
-        let p = P(n_in as u32, 1, rb as u32, 0);
-        let b = [(w.0, w.1 + i * rb), y, y];
+        let p = P(n_in as u32, 1, rb as u32, ids.is_some() as u32);
+        let b = [w, y, y, ids.unwrap_or(y)];
         call(e, &self.p[&("row", ty)].0, &p, &b, [n_in.div_ceil(32), 1, 1], 32);
     }
 }
@@ -183,6 +196,13 @@ pub fn deq(ty: u32, row: &[u8], n: usize) -> Vec<f32> {
                     };
                     let q = u(4 + 8 * s + e % 8) >> (4 * (e % 16 / 8)) & 15;
                     FP4[q] as f32 * d * 0.5
+                }
+                105 | 106 => {
+                    let (hb, c) = (ty as usize - 104, e % 16);
+                    let hi = (0..hb).fold(0, |a, i| a | u(18 + hb * (c / 4) + i) << (8 * i));
+                    let q = u(2 + c) >> (4 * (e / 16)) & 15
+                        | (hi >> (hb * (c % 4 + e / 16 * 4)) & ((1 << hb) - 1)) << 4;
+                    h(0) * (q as f32 - (8 << hb) as f32)
                 }
                 16 => {
                     let (ib, l) = (k / 4, k % 4);

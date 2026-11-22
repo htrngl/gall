@@ -1,4 +1,4 @@
-// openai-compatible chat server over one model, one request at a time.
+// openai-compatible chat server over one model: chats queue, one at a time.
 //   gall serve <gguf> [--port 9940] [--ctx 102400] [--effort none]
 //             [--alias inkling-2-mini] [--api-key-file F]
 //             [--idle-unload SECONDS] [--dummy [answer]]
@@ -11,11 +11,13 @@
 // <|content_text|> or NAME<|content_invoke_tool_json|>, each closed by
 // <|end_message|>. a new prompt that extends the last one is fed from
 // where they part.
-use crate::tok::Tok;
+use crate::{model::Model, tok::Tok, vis::Vis};
+use std::{collections::HashMap, ops::Range};
 use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::mpsc::{channel, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub trait Lm {
@@ -43,6 +45,10 @@ pub trait Lm {
     fn park(&mut self, _toks: &[u32]) {}
     fn loaded(&self) -> bool {
         true
+    }
+    // the token ids that stand for the image at url (data: or http)
+    fn image(&mut self, _url: &str) -> Result<Range<u32>, String> {
+        Err("this server has no vision model".into())
     }
 }
 
@@ -90,6 +96,9 @@ impl Lm for Lazy {
     }
     fn loaded(&self) -> bool {
         self.0.is_some()
+    }
+    fn image(&mut self, u: &str) -> Result<Range<u32>, String> {
+        self.get().image(u)
     }
 }
 
@@ -341,7 +350,31 @@ fn effort(e: &J) -> Result<String, String> {
 
 // r: the request; eff: the reasoning effort if the request has none
 // the prompt, and the length of its system region
-fn prompt(r: &J, eff: &J) -> Result<(String, usize), String> {
+fn b64(s: &str) -> Vec<u8> {
+    let (mut o, mut a, mut n) = (vec![], 0u32, 0);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - 65,
+            b'a'..=b'z' => c - 71,
+            b'0'..=b'9' => c + 4,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        };
+        (a, n) = (a << 6 | v as u32, n + 6);
+        if n >= 8 {
+            n -= 8;
+            o.push((a >> n) as u8);
+        }
+    }
+    o
+}
+
+// the prompt, the length of its system region, and the images: where
+// in the prompt each one's rows go, and its url
+type Prompt = (String, usize, Vec<(usize, String)>);
+fn prompt(r: &J, eff: &J) -> Result<Prompt, String> {
+    let mut urls = vec![];
     let (mut o, mut sys) = (String::new(), None);
     let tools = r["tools"].a();
     if !tools.is_empty() {
@@ -389,19 +422,35 @@ fn prompt(r: &J, eff: &J) -> Result<(String, usize), String> {
         if !rc.is_empty() {
             o += &format!("{h}<|content_thinking|>{rc}{END}");
         }
-        let mut text = |t: &str| o += &format!("{h}<|content_text|>{t}{END}");
+        macro_rules! part {
+            ($k:expr, $t:expr) => {
+                o += &format!("{h}<|content_{}|>{}{END}", $k, $t)
+            };
+        }
         match &m["content"] {
             J::Str(c) => {
                 if !c.is_empty() || calls.is_empty() && rc.is_empty() {
-                    text(c)
+                    part!("text", c)
                 }
             }
             c => {
                 for p in c.a() {
                     match (p, p["type"].s()) {
-                        (J::Str(s), _) => text(s),
+                        (J::Str(s), _) => part!("text", s),
                         (_, None | Some("text" | "input_text")) => {
-                            text(p["text"].s().unwrap_or(""))
+                            part!("text", p["text"].s().unwrap_or(""))
+                        }
+                        (_, Some("image" | "input_image" | "image_url")) => {
+                            if !["user", "tool"].contains(&role) {
+                                return Err("Image content is only supported \
+                                    for user and tool messages".into());
+                            }
+                            let u = [&p["image_url"]["url"], &p["image_url"],
+                                &p["url"], &p["image"]];
+                            let u = u.iter().find_map(|u| u.s());
+                            let u = u.ok_or("image part without a url")?;
+                            part!("image", "");
+                            urls.push((o.len() - END.len(), u.into()));
                         }
                         (_, Some(t)) => {
                             return Err(format!(
@@ -439,7 +488,7 @@ fn prompt(r: &J, eff: &J) -> Result<(String, usize), String> {
     }
     let o = o + &eff.unwrap_or_default();
     let n = sys.unwrap_or(o.len());
-    Ok((o, n))
+    Ok((o, n, urls))
 }
 
 // ---- sampling: top_k, top_p, min_p, temperature, in llama.cpp's order
@@ -504,6 +553,132 @@ fn sample(l: &[f32], p: &Sp, rng: &mut u64) -> u32 {
         u < 0.0
     });
     c[i.unwrap_or(c.len() - 1)].1
+}
+
+// ---- response_format: text that is json and fits a schema (type,
+// properties, required, additionalProperties: false, items, enum, const,
+// anyOf, oneOf; other keywords are not checked)
+
+fn ws(b: &[u8], i: &mut usize) {
+    while b.get(*i).is_some_and(|c| b" \n\r\t".contains(c)) {
+        *i += 1;
+    }
+}
+
+// a value of schema s at b[*i..]. Some(true): read whole; Some(false): b
+// ends inside a value that still fits; None: no fit
+fn fits(b: &[u8], i: &mut usize, s: &J) -> Option<bool> {
+    for k in ["anyOf", "oneOf"] {
+        if s[k] != NULL {
+            let f = |s| {
+                let mut j = *i;
+                fits(b, &mut j, s).map(|d| (d, j))
+            };
+            let (d, j) = s[k].a().iter().filter_map(f).max()?;
+            *i = j;
+            return Some(d);
+        }
+    }
+    ws(b, i);
+    let Some(&c) = b.get(*i) else { return Some(false) };
+    let ty = match c {
+        b'{' => "object",
+        b'[' => "array",
+        b'"' => "string",
+        b't' | b'f' => "boolean",
+        b'n' => "null",
+        b'-' | b'0'..=b'9' => "number",
+        _ => return None,
+    };
+    let int = |t: &J| t.s() == Some("integer");
+    let ok = |t: &J| t.s() == Some(ty) || ty == "number" && int(t);
+    let (want, a) = (&s["type"], *i);
+    if !(*want == NULL || ok(want) || want.a().iter().any(ok)) {
+        return None;
+    }
+    let done = raw(b, i, s, int(want))?;
+    let en = s["enum"].a().iter().chain((s["const"] != NULL).then_some(&s["const"]));
+    let (mut en, t) = (en.peekable(), &b[a..*i]);
+    let is = |e: &J| match done {
+        true => J::parse(t).as_ref() == Some(e),
+        _ => e.to_string().as_bytes().starts_with(t),
+    };
+    (en.peek().is_none() || en.any(is)).then_some(done)
+}
+
+fn raw(b: &[u8], i: &mut usize, s: &J, int: bool) -> Option<bool> {
+    let c = b[*i];
+    if c == b'{' || c == b'[' {
+        let (obj, mut seen) = (c == b'{', vec![]);
+        *i += 1;
+        ws(b, i);
+        if b.get(*i) == Some(&(c + 2)) {
+            *i += 1;
+        } else {
+            loop {
+                let mut sub = &s["items"];
+                if obj {
+                    ws(b, i);
+                    let a = *i;
+                    match b.get(a) {
+                        Some(b'"') if raw(b, i, &NULL, false)? => {}
+                        c => return c.is_none_or(|c| *c == b'"').then_some(false),
+                    }
+                    let J::Str(k) = J::parse(&b[a..*i])? else { return None };
+                    ws(b, i);
+                    match b.get(*i) {
+                        Some(b':') => *i += 1,
+                        c => return c.is_none().then_some(false),
+                    }
+                    sub = &s["properties"][k.as_str()];
+                    if *sub == NULL && s["additionalProperties"] == J::Bool(false) {
+                        return None;
+                    }
+                    seen.push(k);
+                }
+                if !fits(b, i, sub)? {
+                    return Some(false);
+                }
+                ws(b, i);
+                match b.get(*i) {
+                    Some(b',') => *i += 1,
+                    Some(&e) if e == c + 2 => break *i += 1,
+                    e => return e.is_none().then_some(false),
+                }
+            }
+        }
+        let has = |r: &J| r.s().is_some_and(|r| seen.iter().any(|k| k == r));
+        return s["required"].a().iter().all(has).then_some(true);
+    } else if c == b'"' {
+        *i += 1;
+        loop {
+            match b.get(*i) {
+                None => return Some(false),
+                Some(b'"') => break *i += 1,
+                Some(b'\\') => *i += 2,
+                Some(0..32) => return None,
+                _ => *i += 1,
+            }
+        }
+        return (*i <= b.len()).then_some(true).or(Some(false));
+    } else if let Some(w) = ["true", "false", "null"].iter().find(|w| w.as_bytes()[0] == c) {
+        let n = (b.len() - *i).min(w.len());
+        *i += n;
+        return (b[*i - n..*i] == w.as_bytes()[..n]).then_some(n == w.len());
+    }
+    let a = *i;
+    while b.get(*i).is_some_and(|c| b"-+.eE0123456789".contains(c)) {
+        *i += 1;
+    }
+    let t = std::str::from_utf8(&b[a..*i]).unwrap();
+    let num = |t: &str| t.parse::<f64>().is_ok() && !t.starts_with('+');
+    if int && t.contains(['.', 'e', 'E']) {
+        None
+    } else if *i == b.len() {
+        (num(t) || num(&format!("{t}0"))).then_some(false)
+    } else {
+        num(t).then_some(true)
+    }
 }
 
 // ---- http
@@ -584,10 +759,43 @@ struct Srv {
 
 impl Srv {
     fn chat(&mut self, r: &J, w: &mut TcpStream) -> io::Result<()> {
-        let (p, sys) = match prompt(r, &self.effort) {
-            Ok((p, n)) => (self.tok.enc(&p, true), self.tok.enc(&p[..n], true)),
+        let (mut o, n, urls) = match prompt(r, &self.effort) {
+            Ok(p) => p,
             Err(e) => return reply(w, 400, &err(&e)),
         };
+        // response_format: the schema, and a line that tells the model
+        let rf = &r["response_format"];
+        let js = match rf["type"].s() {
+            Some("json_schema") => Some(rf["json_schema"]["schema"].clone()),
+            Some("json_object") => Some(obj!["type" => "object"]),
+            _ => None,
+        };
+        if let Some(s) = &js {
+            o += &format!("<|message_system|><|content_text|>Answer with one \
+                JSON value and nothing else. It must fit this JSON schema: \
+                {s}{END}");
+        }
+        // the rows of each image, as token ids, go in at its place; a
+        // full image store empties itself and the second try starts again
+        type R = Result<Vec<Range<u32>>, String>;
+        let t = Instant::now();
+        let mut get = || urls.iter().map(|u| self.lm.image(&u.1)).collect::<R>();
+        let ids = match get().or_else(|_| get()) {
+            Ok(i) => i,
+            Err(e) => return reply(w, 400, &err(&e)),
+        };
+        if !urls.is_empty() {
+            eprintln!("gall: {} images in {:.2} s", urls.len(),
+                t.elapsed().as_secs_f64());
+        }
+        let (enc, mut p, mut at) = (|s: &str| self.tok.enc(s, true), vec![], 0);
+        for ((to, _), ids) in urls.iter().zip(ids) {
+            p.extend(enc(&o[at..*to]));
+            p.extend(ids);
+            at = *to;
+        }
+        p.extend(enc(&o[at..]));
+        let sys = enc(&o[..n]);
         let sys = if p.starts_with(&sys) { sys.len() } else { 0 };
         if p.is_empty() || p.len() >= self.ctx {
             let e = format!("{} prompt tokens, context {}", p.len(), self.ctx);
@@ -611,6 +819,7 @@ impl Srv {
         let stops: Vec<_> = stops.into_iter().filter(|s| !s.is_empty()).collect();
         let hold = stops.iter().map(|s| s.len()).max().unwrap_or(1) - 1;
         let stream = r["stream"].t();
+
         let (id, name) = (format!("chatcmpl-{}", now.as_nanos()), &self.name);
         let chunk = |delta: J, fin: J| {
             obj!["id" => id.as_str(), "object" => "chat.completion.chunk",
@@ -649,7 +858,38 @@ impl Srv {
             if n == max || self.fed.len() >= self.ctx {
                 break "length";
             }
-            let t = sample(lg, &sp, &mut rng);
+            // the client hung up (a read of 0 bytes): stop
+            w.set_nonblocking(true)?;
+            let gone = matches!(w.peek(&mut [0]), Ok(0));
+            w.set_nonblocking(false)?;
+            if gone {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            // response_format: of the text tokens, take one that keeps the
+            // text a fit; the message ends when the value is whole
+            let fit = |t: u32| {
+                let (mut x, stop) = (b[1].clone(), t == end);
+                let y = if stop { b" " as &[u8] } else { &self.tok.txt[t as usize] };
+                // no space at the start, nor after a space
+                let sp = |c: &u8| c.is_ascii_whitespace();
+                if !stop && y.iter().all(sp) && x.last().is_none_or(sp) {
+                    return false;
+                }
+                x.extend(y);
+                let mut i = 0;
+                match js.as_ref().and_then(|s| fits(&x, &mut i, s)) {
+                    Some(d) => (d || !stop) && x[i..].trim_ascii().is_empty(),
+                    None => false,
+                }
+            };
+            let fit = |t: u32| fit(t) && (t == end || !self.tok.ctl[t as usize]);
+            let mut t = sample(lg, &sp, &mut rng);
+            if js.is_some() && st == text && !fit(t) {
+                // the likeliest token that fits
+                let mut ix: Vec<u32> = (0..lg.len() as u32).collect();
+                ix.sort_unstable_by(|a, b| lg[*b as usize].total_cmp(&lg[*a as usize]));
+                t = ix.into_iter().find(|&t| fit(t)).unwrap_or(end);
+            }
             n += 1;
             if t == self.tok.eos {
                 break "stop";
@@ -747,30 +987,33 @@ impl Srv {
             "created" => now.as_secs() as usize, "model" => name.as_str(),
             "choices" => vec![c], "usage" => usage, "timings" => timings])
     }
+}
 
-    fn conn(&mut self, mut c: TcpStream) -> io::Result<()> {
-        c.set_nodelay(true)?;
-        c.set_read_timeout(Some(Duration::from_secs(30)))?;
-        let Some((m, p, body, a)) = request(&c) else { return Ok(()) };
-        let p = p.trim_start_matches("/v1");
-        match (m.as_str(), p) {
-            ("OPTIONS", _) => head(&mut c, 204, "text/plain", ""),
-            ("GET", "/health") => reply(&mut c, 200, &obj!["status" => "ok",
-                "loaded" => self.lm.loaded()]),
-            _ if self.auth.as_ref().is_some_and(|k| *k != a) => {
-                reply(&mut c, 401, &err("invalid api key"))
-            }
-            ("GET", "/models") => {
-                let m = obj!["id" => self.name.as_str(), "object" => "model",
-                    "owned_by" => "gall"];
-                reply(&mut c, 200, &obj!["object" => "list", "data" => vec![m]])
-            }
-            ("POST", "/chat/completions") => match J::parse(&body) {
-                Some(r) => self.chat(&r, &mut c),
-                None => reply(&mut c, 400, &err("the body is not json")),
-            },
-            _ => reply(&mut c, 404, &err("not found")),
+// a connection, on its own thread: answers all but a chat, which waits its
+// turn on the queue q for the one model
+type Chat = (J, TcpStream);
+fn conn(mut c: TcpStream, name: &str, auth: &Option<String>, up: &AtomicBool,
+        q: &Sender<Chat>) -> io::Result<()> {
+    c.set_nodelay(true)?;
+    c.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let Some((m, p, body, a)) = request(&c) else { return Ok(()) };
+    let p = p.trim_start_matches("/v1");
+    match (m.as_str(), p) {
+        ("OPTIONS", _) => head(&mut c, 204, "text/plain", ""),
+        ("GET", "/health") => reply(&mut c, 200, &obj!["status" => "ok",
+            "loaded" => up.load(Relaxed)]),
+        _ if auth.as_ref().is_some_and(|k| *k != a) => {
+            reply(&mut c, 401, &err("invalid api key"))
         }
+        ("GET", "/models") => {
+            let m = obj!["id" => name, "object" => "model", "owned_by" => "gall"];
+            reply(&mut c, 200, &obj!["object" => "list", "data" => vec![m]])
+        }
+        ("POST", "/chat/completions") => match J::parse(&body) {
+            Some(r) => Ok(q.send((r, c)).unwrap()),
+            None => reply(&mut c, 400, &err("the body is not json")),
+        },
+        _ => reply(&mut c, 404, &err("not found")),
     }
 }
 
@@ -798,8 +1041,10 @@ impl Lm for Dummy {
     }
 }
 
-// the engine as an Lm; a checkpoint after each feed (the prompt)
-struct Ink(crate::model::Model, Vec<f32>, crate::model::snap::Snaps);
+// the engine as an Lm; a checkpoint at each feed (the prompt). the
+// vision encoder, and the row count of each image held, by its url's hash
+struct Ink(crate::model::Model, Vec<f32>, crate::model::snap::Snaps,
+    Option<Vis>, HashMap<u64, usize>);
 
 impl Lm for Ink {
     fn reset(&mut self) {
@@ -816,14 +1061,69 @@ impl Lm for Ink {
     fn truncate(&mut self, n: usize) -> bool {
         self.0.truncate(n)
     }
+    // the checkpoint is before the last token: the same prompt again
+    // (regenerate) goes back to it
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
-        self.0.feed(toks);
+        let (l, h) = toks.split_last().unwrap();
+        if !h.is_empty() {
+            self.0.feed(h);
+        }
         self.0.save();
+        self.0.step(*l);
         self.1 = self.0.logits();
         &self.1
     }
     fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
         self.2.prime(&mut self.0, p, k, sys)
+    }
+    fn image(&mut self, url: &str) -> Result<Range<u32>, String> {
+        let v = self.3.as_ref().ok_or("no mmproj file beside the model")?;
+        let mut h = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(url, &mut h);
+        let key = std::hash::Hasher::finish(&h);
+        if let Some(&n) = self.4.get(&key) {
+            return Ok(Model::ids(key as u32, n));
+        }
+        // rows are kept on disk too (the 32 newest), for after an unload
+        let dir = crate::up::cache().join("img");
+        let f = dir.join(format!("{key:016x}.{}", v.max));
+        let e = crate::f32s(f.to_str().unwrap());
+        let e = if !e.is_empty() { e } else {
+            let b = match url.split_once(";base64,") {
+                Some((_, b)) if url.starts_with("data:") => b64(b),
+                _ if url.starts_with("http") => {
+                    let c = std::process::Command::new("curl")
+                        .args(["-sfL", "--max-time", "30", "--", url]).output();
+                    c.map(|o| o.stdout).unwrap_or_default()
+                }
+                _ => vec![],
+            };
+            let (w, h, rgb) = crate::vis::decode(&b, v.max)
+                .ok_or("the image could not be read")?;
+            let e = v.embed(w, h, &rgb);
+            let b: Vec<u8> = e.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::create_dir_all(&dir).ok();
+            std::fs::write(&f, b).ok();
+            let age = |p: &std::path::PathBuf| p.metadata().and_then(|m| m.modified()).ok();
+            let mut old: Vec<_> = std::fs::read_dir(&dir).into_iter().flatten()
+                .flatten().map(|d| d.path()).collect();
+            old.sort_by_key(|p| std::cmp::Reverse(age(p)));
+            old.iter().skip(32).for_each(|p| { std::fs::remove_file(p).ok(); });
+            e
+        };
+        // two images with one 19-bit key: forget what was built on the first
+        let (id, m) = (|k: u64| k as u32 & 0x7ffff, &mut self.0);
+        let twin = self.4.keys().any(|&k| id(k) == id(key));
+        if twin || !m.image(key as u32, &e) {
+            (m.ni, self.4) = (0, HashMap::new());
+            m.ib.clear();
+            if twin {
+                m.reset();
+            }
+            return Err("the image store was full; send the request again".into());
+        }
+        self.4.insert(key, e.len() / 2304);
+        Ok(Model::ids(key as u32, e.len() / 2304))
     }
     fn park(&mut self, toks: &[u32]) {
         let t = Instant::now();
@@ -850,6 +1150,11 @@ pub fn main(a: &[String]) {
         let r = J::parse(&std::fs::read(&a[2]).unwrap()).unwrap();
         return print!("{}", prompt(&r, &"none".into()).unwrap().0);
     }
+    if a.get(1).is_some_and(|x| x == "--fits") {
+        // gall serve <gguf> --fits <schema json> <text>: the fit and its end
+        let (s, mut i) = (J::parse(a[2].as_bytes()).unwrap(), 0);
+        return println!("{:?} {i}", fits(a[3].as_bytes(), &mut i, &s));
+    }
     let ctx: usize = opt("--ctx", "102400").parse().unwrap();
     let say = "<|message_model|><|content_text|>hello from gall\
                <|end_message|><|content_model_end_sampling|>";
@@ -863,7 +1168,9 @@ pub fn main(a: &[String]) {
             crate::up::lock(true);
             let m = crate::model::Model::open(&p, ctx);
             let s = crate::model::snap::Snaps::new(&p, &m);
-            Box::new(Ink(m, vec![], s))
+            let v = std::path::Path::new(&p).with_file_name(crate::up::MMPROJ);
+            let v = v.exists().then(|| Vis::open(v.to_str().unwrap()));
+            Box::new(Ink(m, vec![], s, v, HashMap::new()))
         })
     };
     let lm = Box::new(Lazy(Some(load()), load));
@@ -897,17 +1204,28 @@ pub fn main(a: &[String]) {
         t,
     };
     eprintln!("gall: http://127.0.0.1:{port}/v1, context {ctx}");
-    let idle: i32 = opt("--idle-unload", "0").parse().unwrap();
-    let mut pf = libc::pollfd { fd: l.as_raw_fd(), events: libc::POLLIN,
-        revents: 0 };
+    let idle: u64 = opt("--idle-unload", "0").parse().unwrap();
+    let (tx, rx) = channel();
+    let up: &AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
+    let (name, auth) = (s.name.clone(), s.auth.clone());
+    std::thread::spawn(move || for c in l.incoming().flatten() {
+        let (name, auth, tx) = (name.clone(), auth.clone(), tx.clone());
+        std::thread::spawn(move || conn(c, &name, &auth, up, &tx));
+    });
     loop {
-        let t = if idle > 0 && s.lm.loaded() { idle * 1000 } else { -1 };
-        if unsafe { libc::poll(&mut pf, 1, t) } == 0 {
+        up.store(s.lm.loaded(), Relaxed);
+        let r = match idle > 0 && s.lm.loaded() {
+            true => rx.recv_timeout(Duration::from_secs(idle)).ok(),
+            _ => rx.recv().ok(),
+        };
+        if let Some((r, mut c)) = r {
+            if let Err(e) = s.chat(&r, &mut c) {
+                eprintln!("gall: {e}");
+            }
+        } else {
             let n = if s.lm.len() == s.fed.len() { s.fed.len() } else { 0 };
             s.lm.park(&s.fed[..n]);
             s.fed.clear();
-        } else if let Err(e) = l.accept().and_then(|c| s.conn(c.0)) {
-            eprintln!("gall: {e}");
         }
     }
 }

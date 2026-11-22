@@ -5,6 +5,7 @@
 use crate::gguf::{self, Gguf, Tensor};
 use crate::gpu::*;
 use crate::mv::Mv;
+use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -92,7 +93,13 @@ struct L {
 // (kind, visit, encode, a weight op's (mode, tensor, x, y) in floats)
 pub type Op<'a> =
     (&'static str, usize, Box<dyn Fn(&Enc) + 'a>, Option<(&'static str, T, usize, usize)>);
+// an image row's token id: IMG, a 19-bit key of the image, the row
+// (12 bits). the same image has the same ids in every process
+pub const IMG: u32 = 1 << 31;
+const IMR: usize = 8192; // image rows kept
 pub const ROWS: usize = 8; // activation rows, for dr.rs's batched verify
+const TID: u32 = !0; // the token of id[9]
+type Cb = objc2::rc::Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 
 pub struct Model {
     pub g: &'static Gguf,
@@ -107,6 +114,9 @@ pub struct Model {
     pub id: Buf,
     l: Vec<L>,
     emb: T,
+    im: Buf, // image embeddings, f32 rows
+    pub ni: usize,
+    pub ib: HashMap<u32, usize>, // first row of an image by its key
     out: T,
     tn: u32,
     oq: u32,
@@ -124,6 +134,8 @@ pub struct Model {
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
     pf: Option<pf::Pf>,
+    rq: crate::rq::Rq,
+    pre: Option<(usize, Cb)>, // the encoded token of a position
 }
 
 // f32 to f16, round to nearest; tiny values to 0
@@ -151,8 +163,8 @@ impl Model {
         let g: &'static Gguf = G.get_or_init(|| gguf::open(path));
         let mut gpu = Gpu::new();
         gpu.map(g);
-        // small tensors, as f32 in one buffer; offset 0 is 128 ones
-        let mut s = vec![1f32; 128];
+        // small tensors, as f32 in one buffer; offset 0 is N ones
+        let mut s = vec![1f32; N];
         let mut sm = |n: String| -> u32 {
             let Some(t) = g.t.get(n.as_str()) else { return 0 };
             let (o, d) = (s.len() as u32, g.data(t));
@@ -270,6 +282,9 @@ impl Model {
             id: gpu.buf(4 * 16 * ROWS),
             l,
             emb: &g.t["token_embd.weight"],
+            im: gpu.buf(4 * N * IMR),
+            ni: 0,
+            ib: HashMap::new(),
             out: &g.t["output.weight"],
             tn,
             oq,
@@ -290,6 +305,8 @@ impl Model {
             t: 0.,
             ck: None,
             pf: None,
+            rq: crate::rq::Rq::open(g, &gpu, &crate::up::cache()),
+            pre: None,
             g,
             gpu,
         }
@@ -300,9 +317,45 @@ impl Model {
         [slice(&self.kv), slice(&self.cs)]
     }
 
+    // a token's embedding: a row of the table, or an image row past IMG
+    pub fn embd(&self, e: &Enc, tok: u32, y: B) {
+        match tok.checked_sub(IMG) {
+            Some(i) => {
+                let i = self.ib[&(i >> 12)] + (i & 0xfff) as usize;
+                self.mv.row(e, 0, (&self.im, 0), i, y, N)
+            }
+            None => self.mv.row(e, self.emb.ty, self.gpu.w(self.emb), tok as usize, y, N),
+        }
+    }
+
+    // the token ids of an image's n rows
+    pub fn ids(key: u32, n: usize) -> std::ops::Range<u32> {
+        let a = IMG | (key & 0x7ffff) << 12;
+        a..a + n as u32
+    }
+
+    // keep the rows of image key; false when the store is full
+    pub fn image(&mut self, key: u32, e: &[f32]) -> bool {
+        let (a, b) = (self.ni, self.ni + e.len() / N);
+        let Some(r) = slice::<f32>(&self.im).get_mut(a * N..b * N) else {
+            return false;
+        };
+        r.copy_from_slice(e);
+        self.ib.insert(key & 0x7ffff, a);
+        self.ni = b;
+        true
+    }
+
+    // the f16 rows from n on change without their int8 copy, so a token
+    // encoded ahead is void too: it holds no copy of the rows before it
+    fn stale(&mut self, n: usize) {
+        self.hi.set(self.hi.get().min(n));
+        self.pre = None;
+    }
+
     pub fn reset(&mut self) {
         (self.pos, self.ck) = (0, None);
-        self.hi.set(0);
+        self.stale(0);
         slice::<f32>(&self.cs).fill(0.);
     }
 
@@ -340,7 +393,7 @@ impl Model {
             return false;
         }
         self.pos = n;
-        self.hi.set(self.hi.get().min(n));
+        self.stale(n);
         true
     }
 
@@ -380,24 +433,34 @@ impl Model {
         macro_rules! mv {
             ($n:expr, $t:expr, $x:expr, $y:expr, $ni:expr, $no:expr) => {{
                 let (t, x, y): (T, usize, usize) = ($t, $x, $y);
-                ops.push((crate::mv::name(t.ty), vi, Box::new(move |e: &Enc| {
-                    let (w, id) = (self.gpu.w(t), (&self.id, io));
+                let (ty, w) = self.rq.w(&self.gpu, t);
+                ops.push((crate::mv::name(ty), vi, Box::new(move |e: &Enc| {
+                    let id = (&self.id, io);
                     let (x, y) = ((&self.a, ro + 4 * x), (&self.a, ro + 4 * y));
                     match $n {
                         "up" => self.mv.experts_up(e, t.ty, w, id, x, y, $ni, $no),
                         "down" => self.mv.experts_down(e, t.ty, w, id, x, y, $ni, $no),
-                        _ => self.mv.dense(e, t.ty, w, x, y, $ni, $no),
+                        _ => self.mv.dense(e, ty, w, x, y, $ni, $no),
                     }
                 }), Some(($n, t, x, y))));
             }};
         }
-        let (emb, t32) = (self.emb, [18, 1, 1]);
+        let t32 = [18, 1, 1];
         ops.push(("row", 0, Box::new(move |e: &Enc| {
-            self.mv.row(e, emb.ty, self.gpu.w(emb), tok as usize, (&self.a, ro + 4 * VR), N)
+            let y = (&self.a, ro + 4 * VR);
+            match tok {
+                TID => {
+                    let w = self.gpu.w(self.emb);
+                    self.mv.row_id(e, self.emb.ty, w, (&self.id, io + 36), y, N)
+                }
+                _ => self.embd(e, tok, y),
+            }
         }), None));
         k!("dots", [2, 1, 1], 576, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC);
-        k!("elem", t32, 32, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC, 1, VR, H, self.tn,
-            0, 0, 1);
+        // an image row is the stream as it is: no norm (ones, no scale)
+        let (tn, sc) = if tok < IMG || tok == TID { (self.tn, 1) } else { (0, 0) };
+        k!("elem", t32, 32, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC, 1, VR, H, tn,
+            0, 0, sc);
         let (mut nb, mut fin) = (0, [0, H, 0, 0, 0]); // pending ffn conv
         // the int8 copy of the rows that prefill or a snapshot wrote
         let (lt, full) = (self.vt.ln().to_bits(), visits().into_iter().filter(|v| v.0 % 6 == 5));
@@ -494,7 +557,9 @@ impl Model {
             fin = [D, F, H, cs + 4352, l.fpc as usize];
             if i == 17 && pass < 2 {
                 k!("elem", t32, 32, D, F, H, fin[3], fin[4], pos, BK, nb, 0, 0, SC);
-                k!("msg", [72, 12, 1], 32, BK + 2 * N, H, self.mq, MSG);
+                let (b, q) = (BK + 2 * N, self.mq);
+                k!("dots", [3, 48, 1], 576, 0, H, 0, 0, 0, pos, b, 1, 0, q, GC);
+                k!("msg", [18, 48, 1], 32, b, H, GC, MSG);
             }
             vi += 1;
         }
@@ -507,35 +572,39 @@ impl Model {
         k!("dots", [nb + 2, 1, 1], 576, f0, f1, 0, f3, f4, pos, BK, nb, 1, self.oq, SC);
         k!("elem", t32, 32, f0, f1, 0, f3, f4, pos, BK, nb, 1, self.oq, SC, 1, VR, X,
             self.on);
+        // v . v to LGT + 1, for the scale of the logits
+        k!("dots", [2, 1, 1], 576, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, LGT);
         mv!("mv", self.out, X, LG, N, 201024);
-        k!("amax", [1563, 1, 1], 32, LG, 200058, PT);
+        let c = self.g.f("inkling2.final_logit_softcapping") as f32;
+        k!("amax", [1563, 1, 1], 32, LG, 200058, PT, LGT + 1, c.to_bits());
         k!("best", [1, 1, 1], 1024, PT, 1563, 8);
         ops
     }
 
-    // decode one token; returns the greedy next id
+    // the command buffer of the token at pos; the token is read from id[9]
+    fn enc(&self, pos: usize) -> Cb {
+        objc2::rc::autoreleasepool(|_| {
+            let cb = self.gpu.q.commandBuffer().unwrap();
+            let e = cb.computeCommandEncoder().unwrap();
+            self.sched(TID, pos, true).iter().for_each(|o| o.2(&e));
+            e.endEncoding();
+            cb
+        })
+    }
+
+    // decode one token; returns the greedy next id. the next position is
+    // encoded while this one runs, so a step starts with a commit
     pub fn step(&mut self, tok: u32) -> u32 {
-        let ops = self.sched(tok, self.pos, true);
-        // several command buffers: the gpu starts while the rest encodes
-        let t = objc2::rc::autoreleasepool(|_| {
-            let cbs: Vec<_> = ops
-                .chunks(128)
-                .map(|c| {
-                    let cb = self.gpu.q.commandBuffer().unwrap();
-                    let e = cb.computeCommandEncoder().unwrap();
-                    c.iter().for_each(|o| o.2(&e));
-                    e.endEncoding();
-                    cb.commit();
-                    cb
-                })
-                .collect();
-            let l = cbs.last().unwrap();
-            l.waitUntilCompleted();
-            assert!(l.error().is_none(), "metal: {:?}", l.error());
-            l.GPUEndTime() - cbs[0].GPUStartTime()
-        });
-        drop(ops);
-        (self.t, self.pos) = (t, self.pos + 1);
+        slice::<u32>(&self.id)[9] = tok;
+        let cb = self.pre.take().filter(|c| c.0 == self.pos);
+        let cb = cb.map_or_else(|| self.enc(self.pos), |c| c.1);
+        cb.commit();
+        self.pos += 1;
+        let p = self.pos;
+        self.pre = (p < self.n_ctx).then(|| (p, self.enc(p)));
+        cb.waitUntilCompleted();
+        assert!(cb.error().is_none(), "metal: {:?}", cb.error());
+        self.t = cb.GPUEndTime() - cb.GPUStartTime();
         self.next()
     }
 
@@ -566,11 +635,8 @@ impl Model {
 
     // logits of the last step, unpadded vocabulary, after the softcap
     pub fn logits(&self) -> Vec<f32> {
-        let (c, a) = (self.g.f("inkling2.final_logit_softcapping") as f32, slice::<f32>(&self.a));
-        // the output norm scale is left to the reader
-        let n = a[VR..VR + N].iter().map(|x| x * x).sum::<f32>() / N as f32;
-        let (n, l) = ((n + 1e-6).sqrt(), &a[LG..LG + self.g.u("inkling2.vocab_size_unpadded")]);
-        l.iter().map(|x| c * (x / n / c).tanh()).collect()
+        let n = self.g.u("inkling2.vocab_size_unpadded");
+        slice::<f32>(&self.a)[LG..LG + n].to_vec()
     }
 
     // a region of the activations by ref dump name

@@ -469,30 +469,25 @@ kernel void act(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                               s[p[4] + id[e]];
 }
 
-// cross-pass messages, grid (72, 12 core layers): mix of the bank block
-// and the pass output with 4 queries each
-// p: 0 bank block (normalized), 1 pass output, 2 queries, 3 messages
-kernel void msg(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
-                GP) {
-  S b = a + p[0], v = a + p[1];
-  uint e0 = gp.x * 32 + ln;
-  float o = 0;
-  for (uint e = ln; e < N; e += 32) o += v[e] * v[e];
-  o = rsqrt(simd_sum(o) / N + 1e-6);
-  for (uint j = gp.y * 4; j < gp.y * 4 + 4; j++) {
-    S q = s + p[2] + j * N;
-    float x = 0, y = 0;
-    for (uint e = ln; e < N; e += 32) x += b[e] * q[e], y += v[e] * q[e];
-    x = 1 / (1 + exp((simd_sum(y) * o - simd_sum(x)) / 48));
-    a[p[3] + j * N + e0] = x * b[e0] + (1 - x) * v[e0] * o;
-  }
+// cross-pass messages, grid (18, 48): message j of 4 per core layer is a
+// mix of the bank block and the pass output by sigmoid; dots leaves
+// block . q[j], out . q[j], out . out at c + 8 j
+// p: 0 bank block (normalized), 1 pass output, 2 c, 3 messages
+kernel void msg(U p [[buffer(0)]], A a [[buffer(1)]], GP) {
+  uint t = gp.x * 32 + ln;
+  S c = a + p[2] + gp.y * 8;
+  float o = rsqrt(c[2] / N + 1e-6), x = 1 / (1 + exp((c[1] * o - c[0]) / 48));
+  W(a + p[3] + gp.y * N, t) = x * L(a + p[0], t) + (1 - x) * o * L(a + p[1], t);
 }
 
-// greedy token, stage 1: (max, index) of each 128 logits, one simdgroup
-// p: 0 logits, 1 count, 2 out
+// the logits, softcapped in place: c tanh(x / rms / c), the output norm
+// scale from v . v. greedy token, stage 1: (max, index) of each 128
+// logits, one simdgroup. p: 0 logits, 1 count, 2 out, 3 v . v, 4 c
 kernel void amax(U p [[buffer(0)]], A a [[buffer(1)]], GP) {
   uint i = (gp.x * 32 + ln) * 4, k = ~0u;
-  float4 v = L(a + p[0] + i, 0);
+  float4 v = L(a + p[0] + i, 0) * precise::rsqrt(a[p[3]] / N + 1e-6);
+  v = F(4) * precise::tanh(v / F(4));
+  W(a + p[0] + i, 0) = v;
   float m = -1e30;
   for (uint c = 0; c < 4; c++)
     if (i + c < p[1] && v[c] > m) m = v[c], k = i + c;
