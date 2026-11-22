@@ -120,6 +120,14 @@ func alert(_ s: String) {
 
     // a poll a second: the icon follows a load or an unload at once
     init() {
+        // every quit stops the server: Quit Gall, a logout, or a quit from
+        // outside the menu (which an update of the app needs)
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil,
+            queue: nil) { _ in
+            try? bin.map { try Process.run($0, arguments: ["down"]) }?
+                .waitUntilExit()
+        }
         Task {
             NSApp.setActivationPolicy(.accessory)
             await start()
@@ -234,10 +242,5 @@ func alert(_ s: String) {
         }
     }
 
-    func quit() {
-        Task {
-            await gall(["down"])
-            NSApp.terminate(nil)
-        }
-    }
+    func quit() { NSApp.terminate(nil) }
 }
