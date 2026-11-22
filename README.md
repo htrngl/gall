@@ -32,16 +32,16 @@ ggml or MLX.
 3. On first use, the app checks for 24 GB of memory and 14 GB of free disk
    space. Then it downloads the model files (12.7 GB). The menu shows the
    progress.
-4. When the menu shows `ready`, select `copy endpoint` and paste the URL
+4. When the menu shows `Ready`, select `Copy endpoint` and paste the URL
    (`http://127.0.0.1:9940/v1`) into an OpenAI-compatible client.
 
-The menu shows the server state, its memory use, and the cache use and
-speed of the last answer. `unload now` releases the model's memory and
-keeps the conversation. The settings submenu sets the idle time before an
-unload (instant, 1 to 60 minutes, or never; 15 minutes by default), the
-context length, start at login, and
-access from other devices on the network. Network access makes a key in
-`~/.cache/gall/key`; `copy key` copies it. Quit stops the server.
+The menu shows the server state, its memory use, and the cache use and speed
+of the last answer. `Unload now` releases the model's memory and keeps the
+conversation. The settings submenu sets the idle time before an unload
+(instant, 1 to 60 minutes, or never; 15 minutes by default), the context
+length, start at login, and access from other devices on the network.
+Network access makes a key in `~/.cache/gall/key`; `Copy key` copies it.
+Quit stops the server.
 
 To build the app from source, run `mac/build`. It makes `target/Gall.app`
 and signs it ad hoc. Set `GALL_SIGN` to a signing identity to sign it with
