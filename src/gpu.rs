@@ -151,6 +151,8 @@ fn sz([width, height, depth]: [usize; 3]) -> MTLSize {
 }
 
 pub fn call<P>(e: &Enc, p: &Pipe, args: &P, bufs: &[B], groups: [usize; 3], threads: usize) {
+    // a larger threadgroup runs nothing, without an error
+    assert!(threads <= p.maxTotalThreadsPerThreadgroup(), "threadgroup of {threads}");
     bind(e, p, args, bufs);
     e.dispatchThreadgroups_threadsPerThreadgroup(sz(groups), sz([threads, 1, 1]));
 }

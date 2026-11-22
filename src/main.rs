@@ -1,5 +1,8 @@
-// gall run MODEL --tokens FILE [-n 64] [-c 4096] [--prof]
-// gall check MODEL REFDIR [-n 64] [-c 4096] [-ub]
+// gall run MODEL --tokens FILE [-n 64] [-c 4096] [--prof] [--state FILE]
+//   [--vt 0,0.01]
+// gall check MODEL REFDIR [-n 64] [-c 4096] [-ub [--state FILE]]
+// gall snap MODEL --tokens FILE [-n 16] [-c 4096] [--state FILE] (set HOME:
+//   it writes a snapshot)
 // gall pp MODEL TOKENS [-n all] [-ub 512] [-c 4096] [--cmp] [--ref REFDIR]
 // gall mmb
 // gall tok MODEL FILE
@@ -11,10 +14,12 @@ mod gguf;
 mod gpu;
 mod model;
 mod mv;
+mod rq;
 mod serve;
 mod tok;
 mod up;
 mod vis;
+use std::io::{Read, Write};
 use std::{collections::BTreeMap, fs, time::Instant};
 
 fn ids(p: &str) -> Vec<u32> {
@@ -43,6 +48,20 @@ fn kl(p: &[f32], q: &[f32]) -> f64 {
 fn rel(a: &[f32], b: &[f32]) -> f64 {
     let d: f64 = a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
     (d / b.iter().map(|y| (*y as f64).powi(2)).sum::<f64>().max(1e-30)).sqrt()
+}
+
+// feed the prompt. --state FILE keeps the cache before its last token
+fn prime(m: &mut model::Model, toks: &[u32], st: Option<String>) -> u32 {
+    let (Some(st), (l, h)) = (st, toks.split_last().unwrap()) else { return m.feed(toks) };
+    if let Ok(mut f) = fs::File::open(&st) {
+        m.raw().into_iter().for_each(|b| f.read_exact(b).unwrap());
+        m.pos = h.len();
+    } else {
+        m.feed(h);
+        let mut f = fs::File::create(st).unwrap();
+        m.raw().into_iter().for_each(|b| f.write_all(b).unwrap());
+    }
+    m.step(*l)
 }
 
 fn main() {
@@ -75,7 +94,15 @@ fn main() {
     if a[1] == "kb" {
         // gall kb KERNEL GX,GY THREADS P0,P1,..: time 100 dispatches on zeros
         let g = gpu::Gpu::new();
-        let b = [256, 512, 600, 128, 1].map(|n| g.buf(n << 20));
+        let b = [256, 512, 600, 128, 1, 1, 400].map(|n| g.buf(n << 20));
+        // FILL=R: the activations are random in [-R, 0]
+        if let Ok(r) = std::env::var("FILL") {
+            let (r, mut x) = (r.parse::<f32>().unwrap(), 1u32);
+            for v in gpu::slice::<f32>(&b[0]) {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                *v = -r * (x >> 8) as f32 / (1 << 24) as f32;
+            }
+        }
         let defs = std::env::var("DEFS").unwrap_or_default().replace(';', "\n");
         let pipe = g.pipe(include_str!("ops.metal"), &defs, &a[2]);
         let v = |s: &str| s.split(',').map(|x| x.parse().unwrap()).collect::<Vec<usize>>();
@@ -99,28 +126,50 @@ fn main() {
         "run" => {
             let toks = ids(&opt("--tokens").expect("--tokens FILE"));
             let t0 = Instant::now();
-            let mut next = m.feed(&toks);
+            let next = prime(&mut m, &toks, opt("--state"));
             let pp = t0.elapsed().as_secs_f64();
             // --deep N: time decode as if N tokens deep, on a stale cache
             m.pos = opt("--deep").map_or(m.pos, |v| v.parse().unwrap());
             eprintln!("prompt: {} tokens, {:.1} t/s", toks.len(), toks.len() as f64 / pp);
-            let (t0, mut gpu) = (Instant::now(), 0.);
             m.save();
-            let mut out = vec![];
-            for _ in 0..n {
-                print!("{next} ");
-                out.push(next);
-                next = m.step(next);
-                gpu += m.t;
+            // --vt A,B,..: decode again from the same cache at each threshold
+            // (model.rs: vt); kl and greedy flips against the first
+            let vts = opt("--vt").unwrap_or(m.vt.to_string());
+            let (p0, mut out, mut base) = (m.pos, vec![], vec![]);
+            for vt in vts.split(',') {
+                m.vt = vt.parse().unwrap();
+                assert!(m.truncate(p0));
+                let (first, t0, mut gpu) = (out.is_empty(), Instant::now(), 0.);
+                let (mut x, mut kls, mut flips) = (next, vec![], 0);
+                for i in 0..n {
+                    if first {
+                        out.push(x);
+                    }
+                    let y = m.step(out[i]);
+                    gpu += m.t;
+                    if first {
+                        print!("{x} ");
+                        base.push(m.logits());
+                        x = y;
+                    } else {
+                        kls.push(kl(&base[i], &m.logits()));
+                        flips += (y != *out.get(i + 1).unwrap_or(&y)) as usize;
+                    }
+                }
+                let w = t0.elapsed().as_secs_f64() / n as f64;
+                if first {
+                    println!();
+                }
+                eprint!("decode: {:.1} ms/token wall, {:.1} gpu, {:.1} t/s", 1e3 * w,
+                    1e3 * gpu / n as f64, 1. / w);
+                let mx = kls.iter().fold(0f64, |a, &b| a.max(b));
+                if !first {
+                    eprint!(", vt {vt}: kl mean {:.2e} max {mx:.2e}, {flips} flips",
+                        kls.iter().sum::<f64>() / n as f64);
+                }
+                eprintln!();
             }
-            let w = t0.elapsed().as_secs_f64() / n as f64;
-            println!();
-            eprintln!(
-                "decode: {:.1} ms/token wall, {:.1} gpu, {:.1} t/s",
-                1e3 * w,
-                1e3 * gpu / n as f64,
-                1. / w
-            );
+            let next = m.next();
             if a.iter().any(|x| x == "--rollback") {
                 // 5 steps back by the rings, then back to the checkpoint
                 for k in [n - 5, 0] {
@@ -164,6 +213,38 @@ fn main() {
                 }
             }
         }
+        "snap" => {
+            // decode after the prompt, then again in a new model from a
+            // snapshot of it: kl and greedy flips, and the first step's time
+            let toks = ids(&opt("--tokens").expect("--tokens FILE"));
+            let mut x = prime(&mut m, &toks, opt("--state"));
+            m.save();
+            let (mut out, mut base) = (vec![], vec![]);
+            for _ in 0..n {
+                out.push(x);
+                x = m.step(x);
+                base.push(m.logits());
+            }
+            assert!(m.truncate(toks.len()));
+            model::snap::Snaps::new(&a[2], &m).write(&m, &toks).unwrap();
+            drop(m);
+            let mut m = model::Model::open(&a[2], ctx);
+            let p: Vec<u32> = toks.iter().chain(&out).copied().collect();
+            let got = model::snap::Snaps::new(&a[2], &m).prime(&mut m, &p, 0, 0);
+            assert!(got == (toks.len(), toks.len()), "restored {got:?}");
+            let (mut kls, mut flips, mut ms) = (vec![], 0, vec![]);
+            for i in 0..n {
+                let t0 = Instant::now();
+                let y = m.step(out[i]);
+                ms.push(1e3 * t0.elapsed().as_secs_f64());
+                kls.push(kl(&base[i], &m.logits()));
+                flips += (y != *out.get(i + 1).unwrap_or(&x)) as usize;
+            }
+            let mx = kls.iter().fold(0f64, |a, &b| a.max(b));
+            eprintln!("restored at {}: kl mean {:.2e} max {mx:.2e}, {flips} flips; first step \
+                {:.1} ms, the others {:.1}", toks.len(), kls.iter().sum::<f64>() / n as f64,
+                ms[0], ms[1..].iter().sum::<f64>() / (n - 1) as f64);
+        }
         "pp" => {
             // batched prefill: speed, and logits against stepping / a ref row
             let toks = ids(&a[3]);
@@ -200,7 +281,7 @@ fn main() {
             // LOGITS=file keeps every row
             let (mut next, ub) = (0, opt("-ub").is_some());
             if ub {
-                next = m.feed(&toks);
+                next = prime(&mut m, &toks, opt("--state"));
             }
             for (i, &t) in toks.iter().chain(&gen[..n.min(gen.len() - 1)]).enumerate() {
                 let Some(g) = i.checked_sub(toks.len()) else {

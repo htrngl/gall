@@ -88,8 +88,8 @@ on 21 November 2026. The MacBook Air has no fan. Throughput drops by roughly
 | Measurement | llama.cpp (`llama/`) | Gall |
 | --- | --- | --- |
 | Decode, short context | 15 t/s | 20.5 t/s cold |
-| Decode, 8k context | 12.4 t/s | 17.6 t/s |
-| Decode, 31.5k context (real prompt) | No reliable measurement | 13.8–14.6 t/s |
+| Decode, 10.5k context (real prompt) | 12.4 t/s (at 8k) | 18.0 t/s |
+| Decode, 29.9k context (real prompt) | No reliable measurement | 16.2–16.5 t/s |
 | Prefill, 512 tokens | 121 t/s | 130 t/s |
 | Prefill, 10.5k tokens | 89 t/s (measured to 8.3k) | 106 t/s |
 | Time to first token with a stored prefix | Not measured | 0.5–1.2 s |
@@ -117,6 +117,7 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
 
 - `src/gguf.rs`, `gpu.rs`: GGUF memory mapping and the Metal host.
 - `src/mv.*`, `grids.metal`: Matrix-vector kernels for the 12 weight formats.
+- `src/rq.rs`: Attention weights requantized at load (`RQ`, disabled by default).
 - `src/model.rs`, `ops.metal`: Single-token decode, key-value (KV) cache rings, and rollback.
 - `src/pf*`: Batched prefill.
 - `src/tok.rs`, `serve.rs`, `snap.rs`, `up.rs`: Tokenizer, chat template,
@@ -138,16 +139,26 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
   loads take 0.20 ms. Three tuning passes produced no further improvement.
 - The k-quant kernels unpack 4 bytes as one word. The q5_k head reads at
   73 GB/s (4.4 ms), and q6_k at 87 GB/s.
-- KV cache reads limit performance at longer contexts, at 81 GB/s.
-  Decode takes 56.7 ms at 8k, 67 ms at 32k, and 102 ms at 100k.
-  The 32k and 100k measurements use synthetic inputs.
-- `KV=q8` stores full-attention caches as int8 and halves cache memory at
-  100k context. It does not improve speed and is disabled by default.
-  Its prefill path is untested.
-- The drafter (`gall run --draft`) produces the same text as greedy
-  decoding. Verification of two or four rows takes 73 or 123 ms, compared
-  with 51 ms per serial token, and a draft is verified only where the
-  drafter is confident. See the [drafter notes](docs/DRAFT.md).
+- KV cache reads limit performance at longer contexts, at 85 GB/s. From
+  4,096 tokens of context, the 8 full-attention visits read an int8 copy
+  of the cache (2,304 bytes per key; f16 uses 4,096). They read the f16
+  rows only for keys within 1% of the largest weight.
+  On real prompts, GPU time per token is 53.6 ms at 10.5k (54.3 ms with
+  f16 only) and 58.6 ms at 29.9k (61.9 ms with f16 only). The two modes
+  were measured back to back in one run. No 100k measurement exists.
+- Against f16 only, no greedy token differs across 16 steps. The mean KL
+  divergence is 4e-9 at 10.5k and 4e-8 at 29.9k.
+  `gall check ref/8k.b256 -ub -n 32` finds no greedy mismatches, with a
+  mean KL divergence of 1.30e-3 (1.32e-3 with f16 only).
+- The int8 copy uses 18 KB of memory per token of context, in addition to
+  33 KB for the f16 rows. It uses no memory until it is written. After a
+  snapshot restore or a prefill, the first decoded token rebuilds the copy
+  from the f16 rows. At 29.9k, the first token after a restore takes
+  235 ms (259 ms with f16 only), and the logits equal those without the
+  restore. `VT=0` disables the copy. `VT` sets the
+  weight threshold (default 0.01).
+- The drafter verifies drafted tokens in batches, and the logits of every
+  step remain those of the model. See the [drafter notes](docs/DRAFT.md).
 - Prefill uses half-precision tiles, as llama.cpp does. The `HT` setting in
   `pfm.metal` selects float precision at approximately 0.8 times the speed.
 - The vision encoder runs on the GPU. A 640 x 488 image (208 tokens) takes
@@ -157,8 +168,24 @@ See `src/main.rs` for other commands, including `run`, `pp`, `tok`, and `dr`.
 - The server runs one chat at a time; other chats wait in a queue, and
   `/health` and `/v1/models` answer meanwhile.
 - Unsupported features include GBNF grammars and drafting in the server.
-- A proposed 4-bit attention requantization has a projected cost of
-  3.7 ms per token. It requires the 53 GB original model and a quality check.
+- `RQ=5` requantizes the 100 q8_0 attention projections (234 dispatches
+  per token) from their q8_0 values to 5 bits, in a 293 MB buffer. The
+  first run takes about 5 s. Later runs read `~/.cache/gall/*.rq` with no
+  measurable load time. The attention read takes 8.9 ms instead of 12.7 ms,
+  and a token takes 45.1 ms instead of 48.7 ms. `RQ=6` gives 46.5 ms.
+  `RQ=4` and `RQ=5,5:h` (the output head at 5 bits) are also accepted.
+  Prefill and the drafter read the tensors of the file.
+- `RQ` is disabled by default because it changes the weights. The relative
+  error is 4.5% at 5 bits and 2.3% at 6 bits. On `ref/short`, the KL mean
+  changes from 1.05e-4 to 3.15e-3 at 5 bits and 2.77e-3 at 6 bits, with 0
+  greedy mismatches in 64 steps. On `ref/2k`, it changes from 1.1e-3 to
+  2.4e-3 and 1.4e-3, with 2 and 1 mismatches. On 500 tokens of each of two
+  texts, the negative log-likelihood does not change (-0.001 +- 0.004 at
+  4 bits). A selection of projection kinds or layers gave no better
+  result than a different bit width.
+- At 6 bits, the rq6 format is no faster than the q6_k kernel (10.0 ms
+  and 9.9 ms for the attention read). At 5 bits, rq5 takes 8.9 ms and
+  q5_k takes 11.0 ms.
 
 ## License
 

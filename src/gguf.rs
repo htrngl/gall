@@ -42,6 +42,8 @@ pub fn blk(ty: u32) -> (usize, usize) {
         20 => (32, 18),   // iq4_nl
         22 => (256, 82),  // iq2_s
         40 => (64, 36),   // nvfp4
+        105 => (32, 22),  // rq5, rq6: see rq.rs
+        106 => (32, 26),
         _ => panic!("gguf: tensor type {ty}"),
     }
 }

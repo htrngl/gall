@@ -81,6 +81,7 @@ pub struct Dr {
 impl Dr {
     pub fn open(m: &mut Model, path: &str, n_ctx: usize) -> Dr {
         m.taps();
+        drop(m.sched_z(&[0; 2], 0, true, 0)); // compiles the row kernels now
         let g: &'static Gguf = Box::leak(Box::new(gguf::open(path)));
         let mut w = Gpu::new();
         w.map(g);
@@ -375,7 +376,10 @@ impl Dr {
         st.kept[st.r - 1] += (st.j > 0) as usize;
         let mut d = if hit { st.d.split_off(st.r) } else { vec![] };
         let (t0, on) = (Instant::now(), st.block.map_or(st.on(), |b| b > 0));
-        let ema = |x: &mut f64, t: Instant| *x += 0.1 * (t.elapsed().as_secs_f64() - *x);
+        // one slow pass (a first use, another process) must not close a block
+        let ema = |x: &mut f64, t: Instant| {
+            *x += 0.1 * (t.elapsed().as_secs_f64().min(1.5 * *x) - *x)
+        };
         let nd = st.block.unwrap_or(if on || st.n >= st.due[0] { st.nb() } else { 0 });
         if d.is_empty() && nd > 0 {
             d = self.draft(m, tok, nd);
@@ -496,7 +500,7 @@ pub struct Spec {
 impl Spec {
     pub fn new() -> Spec {
         let ms = |v: [f64; 8]| v.map(|x| 1e-3 * x);
-        let tv = [51., 73., 96., 123., 159., 197., 255., 266.];
+        let tv = [49., 70., 96., 117., 150., 181., 235., 244.];
         Spec {
             block: None,
             q: std::array::from_fn(|i| 0.9 / (1. + (1.75 - i as f64 / 2.).exp())),

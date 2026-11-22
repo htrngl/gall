@@ -7,6 +7,7 @@ use crate::gpu::*;
 use crate::mv::Mv;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+use std::cell::Cell;
 use std::collections::HashMap;
 
 #[path = "pf.rs"]
@@ -16,9 +17,10 @@ pub mod snap;
 
 const N: usize = 2304;
 const OPS: &str = include_str!("ops.metal");
-pub const KINDS: [&str; 16] = [
+pub const KINDS: [&str; 20] = [
     "dots", "elem", "low", "ctl", "rows", "post", "score", "smax", "gather",
-    "merge", "top8", "act", "msg", "amax", "best", "keep",
+    "merge", "top8", "act", "msg", "amax", "best", "pack", "scorew", "gatherw",
+    "fix", "keep",
 ];
 // regions of the activation buffer, in floats. 0 means "none" in params.
 const PRE: usize = N; // prelude output
@@ -51,6 +53,7 @@ pub const FT: usize = LG + 201024; // the residual entering visits 5, 23, 41
 const PT: usize = FT + 3 * N; // attention scratch, to the end: scores
 // (24 per key), their maxima per 8 keys, the 24 maxima, partials per 256
 const CH: usize = 6656; // conv channels per slot
+const W8: usize = 4096; // full attention reads the int8 copy from this depth
 const CS: usize = 16 * CH; // conv state floats per slot, a ring of 16
 const SW: usize = 2048; // sliding window ring
 
@@ -124,13 +127,18 @@ pub struct Model {
     kvo: Vec<usize>, // kv slot offsets, in halfs
     hp: [f32; 4],    // qk clip, rel clip, log floor, log alpha
     n_ctx: usize,
-    pub q8: bool, // full-attention cache as int8 with f16 scales
+    k8: Buf, // int8 copy of the full-attention slots, 2304 bytes per key
+    hi: Cell<usize>, // its rows [0, hi) are current
+    // from W8 deep, full attention reads the copy, and f16 for the keys
+    // within vt of the greatest weight. 0: f16 only
+    pub vt: f32,
     pub pos: usize,
     pub top: usize, // a batched pass (dr.rs) wrote the conv rings up to here
     taps: bool,     // keep the drafter's features at FT
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
     pf: Option<pf::Pf>,
+    rq: crate::rq::Rq,
     pre: Option<(usize, Cb)>, // the encoded token of a position
 }
 
@@ -258,12 +266,11 @@ impl Model {
         let (sb, hb) = (gpu.buf(4 * s.len()), gpu.buf(2 * sh.len()));
         slice::<f32>(&sb)[..s.len()].copy_from_slice(&s);
         slice::<u16>(&hb)[..sh.len()].copy_from_slice(&sh);
-        let q8 = std::env::var("KV").is_ok_and(|v| v == "q8");
         let mut kvo = vec![0];
         let mut by_slot = visits();
         by_slot.sort_by_key(|v| v.1);
         for (i, _, _) in by_slot {
-            let n = if i % 6 != 5 { SW * 2048 } else { n_ctx * Self::row(q8) };
+            let n = if i % 6 != 5 { SW * 2048 } else { n_ctx * 2048 };
             kvo.push(kvo.last().unwrap() + n);
         }
         let nk = n_ctx.max(1024) + 256;
@@ -272,7 +279,7 @@ impl Model {
             mv: Mv::new(&gpu, ""),
             pipes,
             zp: Default::default(),
-            a: gpu.buf(4 * ROWS * (PT + nk * 27 + 24 + nk.div_ceil(256) * 24 * 132)),
+            a: gpu.buf(4 * ROWS * (PT + nk * 27 + 48 + (nk.div_ceil(256).max(65) + 64) * 24 * 132)),
             s: sb,
             sh: hb,
             kv: gpu.buf(2 * kvo[48]),
@@ -296,22 +303,25 @@ impl Model {
                 g.f("inkling2.attention.log_scale_alpha") as f32,
             ],
             n_ctx,
-            q8,
+            k8: gpu.buf(n_ctx * 8 * 2304),
+            hi: Cell::new(0),
+            vt: std::env::var("VT").map_or(0.01, |v| v.parse().unwrap()),
             pos: 0,
             top: 0,
             taps: false,
             t: 0.,
             ck: None,
             pf: None,
+            rq: crate::rq::Rq::open(g, &gpu, &crate::up::cache()),
             pre: None,
             g,
             gpu,
         }
     }
 
-    // halfs per key of a full-attention slot
-    pub fn row(q8: bool) -> usize {
-        if q8 { 1088 } else { 2048 }
+    // the raw cache and conv state
+    pub fn raw(&self) -> [&mut [u8]; 2] {
+        [slice(&self.kv), slice(&self.cs)]
     }
 
     // a token's embedding: a row of the table, or an image row past IMG
@@ -348,8 +358,16 @@ impl Model {
         (self.taps, self.pre) = (true, None);
     }
 
+    // the f16 rows from n on change without their int8 copy, so a token
+    // encoded ahead is void too: it holds no copy of the rows before it
+    fn stale(&mut self, n: usize) {
+        self.hi.set(self.hi.get().min(n));
+        self.pre = None;
+    }
+
     pub fn reset(&mut self) {
         (self.pos, self.ck) = (0, None);
+        self.stale(0);
         slice::<f32>(&self.cs).fill(0.);
     }
 
@@ -389,6 +407,7 @@ impl Model {
             return false;
         }
         self.pos = n;
+        self.stale(n);
         true
     }
 
@@ -431,7 +450,8 @@ impl Model {
                 let (pipe, mut g): (_, [usize; 3]) = (&pz[$n], $g);
                 g[2] = nz;
                 ops.push(($n, vi, Box::new(move |e: &Enc| {
-                    let b = [&self.a, &self.s, &self.kv, &self.cs, &self.id, &self.sh];
+                    let b = [&self.a, &self.s, &self.kv, &self.cs, &self.id, &self.sh,
+                        &self.k8];
                     let mut b = b.map(|b| (b, 0));
                     (b[0].1, b[4].1) = (ro, io);
                     call(e, pipe, &p, &b, g, $th)
@@ -442,13 +462,14 @@ impl Model {
         macro_rules! mv {
             ($n:expr, $t:expr, $x:expr, $y:expr, $ni:expr, $no:expr) => {{
                 let (t, x, y): (T, usize, usize) = ($t, $x, $y);
-                ops.push((crate::mv::name(t.ty), vi, Box::new(move |e: &Enc| {
-                    let (w, id) = (self.gpu.w(t), (&self.id, io));
+                let (ty, w) = self.rq.w(&self.gpu, t);
+                ops.push((crate::mv::name(ty), vi, Box::new(move |e: &Enc| {
+                    let id = (&self.id, io);
                     let (x, y) = ((&self.a, ro + 4 * x), (&self.a, ro + 4 * y));
                     match $n {
                         "up" => self.mv.experts_up(e, t.ty, w, id, x, y, $ni, $no),
                         "down" => self.mv.experts_down(e, t.ty, w, id, x, y, $ni, $no),
-                        _ => self.mv.dense(e, t.ty, w, x, y, $ni, $no),
+                        _ => self.mv.dense(e, ty, w, x, y, $ni, $no),
                     }
                 }), Some(($n, t, x, y))));
             }};
@@ -479,6 +500,22 @@ impl Model {
         k!("elem", t32, 32, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC, 1, VR, H, tn,
             0, 0, sc);
         let (mut nb, mut fin) = (0, [0, H, 0, 0, 0]); // pending ffn conv
+        // the int8 copy of the rows that prefill or a snapshot wrote
+        let (lt, full) = (self.vt.ln().to_bits(), visits().into_iter().filter(|v| v.0 % 6 == 5));
+        let full: Vec<_> = full.map(|v| v.1).collect();
+        let k8 = |slot| full.iter().position(|&s| s == slot).unwrap() * self.n_ctx * 1152;
+        let (hi, w8) = (self.hi.get().min(pos), self.vt > 0. && pos >= W8);
+        if w8 {
+            if hi < pos {
+                self.gpu.run(|e| for &s in &full {
+                    let p = [self.kvo[s] + hi * 2048, k8(s) + hi * 1152].map(|x| x as u32);
+                    let mut b = [&self.kv; 7].map(|b| (b, 0));
+                    b[6].0 = &self.k8;
+                    call(e, &self.pipes["pack"], &p, &b, [pos - hi, 4, 1], 32)
+                });
+            }
+            self.hi.set(pos + 1);
+        }
         for (i, slot, pass) in visits() {
             let l = &self.l[i];
             let (first, lp) = (i % 6 == 0, pass > 0);
@@ -520,26 +557,38 @@ impl Model {
             let ((idx, nk, tau), nkm) = (at(pos), at(pos + nz - 1).1);
             (0..nz).for_each(|z| tz[z] = at(pos + z).2.to_bits());
             let (cs, kv) = (slot * CS, self.kvo[slot]);
-            let q8 = self.q8 && !l.swa;
             // ZR: the cache row follows from the ring size, and a first
             // run only stores the conv inputs
             let (kw, ring) = match nz {
-                1 => (kv + idx * Self::row(q8), 0),
+                1 => (kv + idx * 2048, 0),
                 _ => (kv, if l.swa { SW } else { 0 }),
             };
             for so in [2, 0].into_iter().skip((nz == 1) as usize) {
                 k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd,
                     l.vd, cs, kw, f32::to_bits(tau), self.hp[0].to_bits(),
-                    self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK,
-                    q8 as u32 | so, ring);
+                    self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK, so, ring);
             }
-            let (ng, nc) = (nkm.div_ceil(128), nkm.div_ceil(256));
+            let ng = nkm.div_ceil(128);
             let nm = self.n_ctx.max(1024) + 256;
-            let (mx, gm, pa) = (PT + 24 * nm, PT + 27 * nm, PT + 27 * nm + 24);
-            k!("score", [ng, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb, mx, q8);
+            let (mx, gm, pa) = (PT + 24 * nm, PT + 27 * nm, PT + 27 * nm + 48);
             let th = (ng * 16).next_multiple_of(32).min(1024);
-            k!("smax", [24, 1, 1], th, mx, ng * 16, SK, gm, th);
-            k!("gather", [nc, 8, 1], 512, gm, 0, PT, kv, nk, pos, l.swa, 0, pa, q8);
+            let nc = if l.swa || !w8 {
+                k!("score", [ng, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb, mx);
+                k!("smax", [24, 1, 1], th, mx, ng * 16, SK, gm, th);
+                k!("gather", [nkm.div_ceil(256), 8, 1], 512, gm, 0, PT, kv, nk, pos, l.swa,
+                    0, pa);
+                nkm.div_ceil(256)
+            } else {
+                // int8 first, f16 for the keys with weight
+                let (k8, cw) = (k8(slot), (nk / 64).min(256));
+                k!("pack", [nz, 4, 1], 32, kv + pos * 2048, k8 + pos * 1152);
+                k!("scorew", [ng * 16, 2, 1], 32, Q, R, PT, k8, nk, pos, 0, l.rb, mx);
+                k!("smax", [24, 1, 1], th, mx, ng * 16, 0, gm, th, lt);
+                let nc = nkm.div_ceil(cw);
+                k!("gatherw", [nc, 2, 1], 32, gm, 0, PT, 0, nk, 0, 0, 0, pa, 0, 0, k8, cw);
+                k!("fix", [64, 8, 1], 32, Q, R, PT, kv, nk, pos, 0, l.rb, pa, gm, 0, 0, 64, nc);
+                nc + 64
+            };
             let ns = nc.min(16);
             k!("merge", [24, 1, 1], 32 * ns, pa, nc, SK, G, O, IS, gm, ns);
             mv!("mv", l.o, O, AO, 3072, N);

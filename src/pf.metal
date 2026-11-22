@@ -84,30 +84,14 @@ kernel void ctl(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
   }
 }
 
-// a cache row as q8 (see kvl in ops.metal): lane l has element l of each
-// block of 32
-static void q8w(device half *r, float4 x, uint ln) {
-  float4 d;
-  for (uint i = 0; i < 4; i++) d[i] = float(half(simd_max(abs(x[i])) / 127));
-  char4 c = char4(clamp(round(x / max(d, 1e-20)), -127., 127.));
-  for (uint i = 0; i < 4; i++) ((device char *)r)[ln + 32 * i] = c[i];
-  for (uint i = 0; i < 4 && !ln; i++) r[64 + i] = half(d[i]);
-}
-
-static float4 kvl(const device half *r, uint i, bool q8) {
-  if (!q8) return float4(((const device half4 *)r)[i]);
-  return float4(((const device char4 *)r)[i]) * float(r[64 + i / 8]);
-}
-
 // after the projections: conv on k and v, clips, rms; k, v to the cache
 // p: 0 q, 1 k, 2 v, 3 rel, 4 q clip, 5 rel clip, 6 k conv, 7 v conv,
 // 8 k taps (0: none), 9 v taps, 10 conv state, 11 pos of token 0, 12 swa,
-// 13 qk clip, 14 rel clip, 15 log floor, 16 log alpha, 17 kv slot (halfs),
-// 18 q8
+// 13 qk clip, 14 rel clip, 15 log floor, 16 log alpha, 17 kv slot (halfs)
 kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                  device half *kv [[buffer(3)]], S cs [[buffer(4)]], TG) {
   uint tk = gp.x, pos = p[11] + tk;
-  a += tk * STR, cs += p[10], kv += p[17] + (p[12] ? pos % 2048 : pos) * (p[18] ? 1088 : 2048);
+  a += tk * STR, cs += p[10], kv += p[17] + (p[12] ? pos % 2048 : pos) * 2048;
   float o, c = p[8] ? 1 / 3. : 0.4472135955,
            tau = p[12] ? 1 : 1 + F(16) * log(max(1., (pos + 1) / F(15)));
   for (uint hd = 0; hd < 8; hd++) {
@@ -120,8 +104,7 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
     }
     k /= max(1., (sqrt(simd_sum(dot(k, k))) + 1e-6) / F(13));
     v *= rsqrt(simd_sum(dot(v, v)) / 128 + 1e-6);
-    if (p[18]) q8w(kv + hd * 68, k, ln), q8w(kv + (8 + hd) * 68, v, ln);
-    for (uint i = 0, e = hd * 128 + ln; i < 4 && !p[18]; i++, e += 32)
+    for (uint i = 0, e = hd * 128 + ln; i < 4; i++, e += 32)
       kv[e] = k[i], kv[1024 + e] = v[i];
   }
   for (uint hd = 0; hd < 24; hd++) {
@@ -222,53 +205,6 @@ kernel void attn(U p [[buffer(0)]], A a [[buffer(1)]],
       at[p[8] + e + k] = o[i * 128 + ln * 4 + k] / L[i] /
                          (1 + exp(-at[p[4] + e + k]));
   }
-}
-
-// the q8 cache: one query per (kv head, token) threadgroup of 96, a q head per
-// simdgroup: online softmax over chunks of C keys, bias and sink inside,
-// then the sigmoid gate.
-// p: 0 q, 1 rel, 2 sink, 3 kv slot (halfs), 4 gate, 5 pos of token 0,
-// 6 swa, 7 rel bias, 8 out, 9 first token, 10 q8
-kernel void attq(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
-                 const device half *kv [[buffer(3)]],
-                 uint sg [[simdgroup_index_in_threadgroup]], TG) {
-#define C 256 // keys per chunk
-  threadgroup float sc[3 * C];
-  uint tk = gp.y + p[9], h = gp.x * 3 + sg, pos = p[5] + tk,
-       lo = p[6] && pos > 1023 ? pos - 1023 : 0;
-  a += tk * STR;
-  const device float4 *q = (const device float4 *)(a + p[0] + h * 128);
-  float r[16], m = a[p[2] + h], l = 1;
-  for (uint i = 0; i < 16; i++) r[i] = a[p[1] + h * 16 + i];
-  float4 acc = 0;
-#define KEY(j, r) kv + p[3] + (r) * (p[10] ? 68 : 128) + \
-  (p[6] ? (j) % 2048 : (j)) * (p[10] ? 1088 : 2048)
-  for (uint j0 = lo; j0 <= pos; j0 += C) {
-    uint j1 = min(j0 + C, pos + 1);
-    float cm = -1e30;
-    for (uint j = j0 + ln; j < j1; j += 32) {
-      const device half *k = KEY(j, gp.x);
-      float o = 0;
-      for (uint i = 0; i < 32; i++) o += dot(kvl(k, i, p[10]), q[i]);
-      o *= 0.08838834764;
-      S b = s + p[7] + (pos - j) * 16;
-      if (pos - j < 1024)
-        for (uint i = 0; i < 16; i++) o += b[i] * r[i];
-      cm = max(cm, sc[sg * C + j - j0] = o);
-    }
-    cm = max(m, simd_max(cm));
-    acc *= exp(m - cm), l *= exp(m - cm), m = cm;
-    for (uint j = j0 + ln; j < j1; j += 32)
-      sc[sg * C + j - j0] = exp(sc[sg * C + j - j0] - m);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint j = j0; j < j1; j++) {
-      float w = sc[sg * C + j - j0];
-      l += w, acc += w * kvl(KEY(j, 8 + gp.x), ln, p[10]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-  for (uint i = 0, e = h * 128 + ln * 4; i < 4; i++, e++)
-    a[p[8] + e] = acc[i] / l / (1 + exp(-a[p[4] + e]));
 }
 
 // ffn_inp = conv(attention out) + residual, then its mix

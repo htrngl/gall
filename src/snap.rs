@@ -124,6 +124,7 @@ impl Snaps {
         let f = fs::OpenOptions::new().append(true).open(p).ok()?;
         f.set_modified(SystemTime::now()).ok();
         (m.pos, m.ck) = (toks.len(), None);
+        m.stale(0);
         Some(())
     }
 
