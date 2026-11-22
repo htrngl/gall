@@ -127,6 +127,8 @@ impl Gpu {
 
 pub fn call<P>(e: &Enc, p: &Pipe, args: &P, bufs: &[B], groups: [usize; 3], threads: usize) {
     let sz = |[width, height, depth]: [usize; 3]| MTLSize { width, height, depth };
+    // a larger threadgroup runs nothing, without an error
+    assert!(threads <= p.maxTotalThreadsPerThreadgroup(), "threadgroup of {threads}");
     unsafe {
         e.setComputePipelineState(p);
         e.setBytes_length_atIndex(NonNull::from(args).cast(), size_of::<P>(), 0);

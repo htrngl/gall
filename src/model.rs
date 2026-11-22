@@ -6,6 +6,7 @@ use crate::gguf::{self, Gguf, Tensor};
 use crate::gpu::*;
 use crate::mv::Mv;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+use std::cell::Cell;
 use std::collections::HashMap;
 
 #[path = "pf.rs"]
@@ -15,9 +16,10 @@ pub mod snap;
 
 const N: usize = 2304;
 const OPS: &str = include_str!("ops.metal");
-pub const KINDS: [&str; 15] = [
+pub const KINDS: [&str; 19] = [
     "dots", "elem", "low", "ctl", "rows", "post", "score", "smax", "gather",
-    "merge", "top8", "act", "msg", "amax", "best",
+    "merge", "top8", "act", "msg", "amax", "best", "pack", "scorew", "gatherw",
+    "fix",
 ];
 // regions of the activation buffer, in floats. 0 means "none" in params.
 const PRE: usize = N; // prelude output
@@ -49,6 +51,7 @@ const LG: usize = MSG + 48 * N; // logits
 const PT: usize = LG + 201024; // attention scratch, to the end: scores
 // (24 per key), their maxima per 8 keys, the 24 maxima, partials per 256
 const CH: usize = 6656; // conv channels per slot
+const W8: usize = 1024; // full attention reads the int8 copy from this depth
 const CS: usize = 16 * CH; // conv state floats per slot, a ring of 16
 const SW: usize = 2048; // sliding window ring
 
@@ -112,7 +115,11 @@ pub struct Model {
     kvo: Vec<usize>, // kv slot offsets, in halfs
     hp: [f32; 4],    // qk clip, rel clip, log floor, log alpha
     n_ctx: usize,
-    pub q8: bool, // full-attention cache as int8 with f16 scales
+    k8: Buf, // int8 copy of the full-attention slots, 2304 bytes per key
+    hi: Cell<usize>, // its rows [0, hi) are current
+    // from W8 deep, full attention reads the copy, and f16 for the keys
+    // within vt of the greatest weight. 0: f16 only
+    pub vt: f32,
     pub pos: usize,
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
@@ -243,12 +250,11 @@ impl Model {
         let (sb, hb) = (gpu.buf(4 * s.len()), gpu.buf(2 * sh.len()));
         slice::<f32>(&sb)[..s.len()].copy_from_slice(&s);
         slice::<u16>(&hb)[..sh.len()].copy_from_slice(&sh);
-        let q8 = std::env::var("KV").is_ok_and(|v| v == "q8");
         let mut kvo = vec![0];
         let mut by_slot = visits();
         by_slot.sort_by_key(|v| v.1);
         for (i, _, _) in by_slot {
-            let n = if i % 6 != 5 { SW * 2048 } else { n_ctx * Self::row(q8) };
+            let n = if i % 6 != 5 { SW * 2048 } else { n_ctx * 2048 };
             kvo.push(kvo.last().unwrap() + n);
         }
         let nk = n_ctx.max(1024) + 256;
@@ -256,7 +262,7 @@ impl Model {
         Model {
             mv: Mv::new(&gpu, ""),
             pipes,
-            a: gpu.buf(4 * ROWS * (PT + nk * 27 + 24 + nk.div_ceil(256) * 24 * 132)),
+            a: gpu.buf(4 * ROWS * (PT + nk * 27 + 24 + (nk.div_ceil(256).max(65) + 64) * 24 * 132)),
             s: sb,
             sh: hb,
             kv: gpu.buf(2 * kvo[48]),
@@ -277,7 +283,9 @@ impl Model {
                 g.f("inkling2.attention.log_scale_alpha") as f32,
             ],
             n_ctx,
-            q8,
+            k8: gpu.buf(n_ctx * 8 * 2304),
+            hi: Cell::new(0),
+            vt: std::env::var("VT").map_or(0.01, |v| v.parse().unwrap()),
             pos: 0,
             t: 0.,
             ck: None,
@@ -287,13 +295,14 @@ impl Model {
         }
     }
 
-    // halfs per key of a full-attention slot
-    pub fn row(q8: bool) -> usize {
-        if q8 { 1088 } else { 2048 }
+    // the raw cache and conv state
+    pub fn raw(&self) -> [&mut [u8]; 2] {
+        [slice(&self.kv), slice(&self.cs)]
     }
 
     pub fn reset(&mut self) {
         (self.pos, self.ck) = (0, None);
+        self.hi.set(0);
         slice::<f32>(&self.cs).fill(0.);
     }
 
@@ -331,6 +340,7 @@ impl Model {
             return false;
         }
         self.pos = n;
+        self.hi.set(self.hi.get().min(n));
         true
     }
 
@@ -358,7 +368,8 @@ impl Model {
                 p[..v.len()].copy_from_slice(&v);
                 let pipe = &self.pipes[$n];
                 ops.push(($n, vi, Box::new(move |e: &Enc| {
-                    let b = [&self.a, &self.s, &self.kv, &self.cs, &self.id, &self.sh];
+                    let b = [&self.a, &self.s, &self.kv, &self.cs, &self.id, &self.sh,
+                        &self.k8];
                     let mut b = b.map(|b| (b, 0));
                     (b[0].1, b[4].1) = (ro, io);
                     call(e, pipe, &p, &b, $g, $th)
@@ -388,6 +399,22 @@ impl Model {
         k!("elem", t32, 32, 0, VR, 0, 0, 0, pos, BK, 0, 0, 0, SC, 1, VR, H, self.tn,
             0, 0, 1);
         let (mut nb, mut fin) = (0, [0, H, 0, 0, 0]); // pending ffn conv
+        // the int8 copy of the rows that prefill or a snapshot wrote
+        let (lt, full) = (self.vt.ln().to_bits(), visits().into_iter().filter(|v| v.0 % 6 == 5));
+        let full: Vec<_> = full.map(|v| v.1).collect();
+        let k8 = |slot| full.iter().position(|&s| s == slot).unwrap() * self.n_ctx * 1152;
+        let (hi, w8) = (self.hi.get().min(pos), self.vt > 0. && pos >= W8);
+        if w8 {
+            if hi < pos {
+                self.gpu.run(|e| for &s in &full {
+                    let p = [self.kvo[s] + hi * 2048, k8(s) + hi * 1152].map(|x| x as u32);
+                    let mut b = [&self.kv; 7].map(|b| (b, 0));
+                    b[6].0 = &self.k8;
+                    call(e, &self.pipes["pack"], &p, &b, [pos - hi, 4, 1], 32)
+                });
+            }
+            self.hi.set(pos + 1);
+        }
         for (i, slot, pass) in visits() {
             let l = &self.l[i];
             let (first, lp) = (i % 6 == 0, pass > 0);
@@ -422,17 +449,31 @@ impl Model {
                 (pos, pos + 1, 1. + self.hp[3] * t)
             };
             let (cs, kv) = (slot * CS, self.kvo[slot]);
-            let q8 = self.q8 && !l.swa;
             k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd, l.vd,
-                cs, kv + idx * Self::row(q8), f32::to_bits(tau), self.hp[0].to_bits(),
-                self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK, q8);
-            let (ng, nc) = (nk.div_ceil(128), nk.div_ceil(256));
+                cs, kv + idx * 2048, f32::to_bits(tau), self.hp[0].to_bits(),
+                self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK);
+            let ng = nk.div_ceil(128);
             let nm = self.n_ctx.max(1024) + 256;
             let (mx, gm, pa) = (PT + 24 * nm, PT + 27 * nm, PT + 27 * nm + 24);
-            k!("score", [ng, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb, mx, q8);
             let th = (ng * 16).next_multiple_of(32).min(1024);
-            k!("smax", [24, 1, 1], th, mx, ng * 16, SK, gm, th);
-            k!("gather", [nc, 8, 1], 512, gm, 0, PT, kv, nk, pos, l.swa, 0, pa, q8);
+            let nc = if l.swa || !w8 {
+                k!("score", [ng, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb, mx);
+                k!("smax", [24, 1, 1], th, mx, ng * 16, SK, gm, th);
+                k!("gather", [nk.div_ceil(256), 8, 1], 512, gm, 0, PT, kv, nk, pos, l.swa,
+                    0, pa);
+                nk.div_ceil(256)
+            } else {
+                // int8 first, f16 for the keys with weight
+                let (k8, cw) = (k8(slot), (nk / 64).clamp(16, 256));
+                k!("pack", [1, 4, 1], 32, kv + pos * 2048, k8 + pos * 1152);
+                k!("scorew", [ng * 16, 2, 1], 32, Q, R, PT, k8, nk, pos, 0, l.rb, mx);
+                k!("smax", [24, 1, 1], th, mx, ng * 16, 0, gm, th);
+                let nc = nk.div_ceil(cw);
+                k!("gatherw", [nc, 2, 1], 32, gm, 0, PT, 0, nk, 0, 0, 0, pa, 0, 0, k8, cw);
+                k!("fix", [64, 8, 1], 32, gm, Q, PT, kv, nk, 0, 0, 0, pa, 0, lt, k8,
+                    nk.div_ceil(64), nc);
+                nc + 64
+            };
             let ns = nc.min(16);
             k!("merge", [24, 1, 1], 32 * ns, pa, nc, SK, G, O, IS, gm, ns);
             mv!("mv", l.o, O, AO, 3072, N);
