@@ -858,6 +858,13 @@ impl Srv {
             if n == max || self.fed.len() >= self.ctx {
                 break "length";
             }
+            // the client hung up (a read of 0 bytes): stop
+            w.set_nonblocking(true)?;
+            let gone = matches!(w.peek(&mut [0]), Ok(0));
+            w.set_nonblocking(false)?;
+            if gone {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
             // response_format: of the text tokens, take one that keeps the
             // text a fit; the message ends when the value is whole
             let fit = |t: u32| {
