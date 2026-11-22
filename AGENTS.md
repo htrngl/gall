@@ -36,4 +36,4 @@ runtime compile, so `mac/gall.entitlements` is empty.
 Gall is for a person at their own Mac. The app runs as the user, with no
 root, no daemons and no settings that keep the Mac awake. Server use
 (always on, no login, no sleep, a chat bridge) belongs in a separate
-wrapper script, as grain was, that runs `gall up` or `gall serve`.
+wrapper script that runs `gall up` or `gall serve`.
