@@ -30,3 +30,10 @@ The app runs its bundled `gall` (`up`, `down`, `model`) and reads
 `$GALL_NOTARY`, a `notarytool` keychain profile name, it also makes and
 notarizes a dmg. The hardened runtime needs no entitlement for the Metal
 runtime compile, so `mac/gall.entitlements` is empty.
+
+## Scope
+
+Gall is for a person at their own Mac. The app runs as the user, with no
+root, no daemons and no settings that keep the Mac awake. Server use
+(always on, no login, no sleep, a chat bridge) belongs in a separate
+wrapper script, as grain was, that runs `gall up` or `gall serve`.
