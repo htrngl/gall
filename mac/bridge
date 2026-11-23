@@ -79,6 +79,7 @@ while :; do
         t="$t
 (the user sent an image: $PWD/img/${ph##*/}. read it to see it.)"; }
     printf "%s %s: %s\n" "$(date "+%F %T")" "$f" "$t"
+    touch ~/.cache/gall/bridge.run # the app keeps the mac awake for it
     # the server restarts when a setting changes: wait for it
     i=0; until curl -sf -m 5 $g/health >/dev/null || [ $i = 60 ]; do
       i=$((i + 1)); sleep 2; done
@@ -87,5 +88,6 @@ while :; do
     watch "$ch" $a & w=$!; wait $a; s=$?; kill $w 2>/dev/null; touch .cont
     [ $s = 0 ] && send "$ch" "$(cat .out)" ||
       send "$ch" "$(cat .out; grep -v '^resume with' .err | tail -4)"
+    rm -f ~/.cache/gall/bridge.run
   done
 done

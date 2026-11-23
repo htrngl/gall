@@ -77,6 +77,7 @@ struct Menu: View {
             Toggle("Allow other devices on the network",
                    isOn: pick("net", false))
             Toggle("Telegram bridge", isOn: $m.tg)
+            Toggle("Wake every 5 minutes", isOn: $m.wake).disabled(!m.tg)
         }
         Divider()
         Button("Quit Gall") { m.quit() }

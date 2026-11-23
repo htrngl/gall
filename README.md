@@ -118,8 +118,18 @@ sends hax's answer back.
 4. Turn on **Settings** > **Telegram bridge**.
 
 While the bridge is on, the Mac does not go to sleep when it is idle or
-when you close the lid. It can get warm in a closed bag. The agent works in `~/Gall`; set
-`BOT_DIR` in the file to change this. A run stops after `TIMEOUT` seconds
+when you close the lid. It can get warm in a closed bag.
+
+To save power, turn on **Settings** > **Wake every 5 minutes**. With the
+lid closed, the Mac then sleeps and wakes every 5 minutes to look for
+messages. A reply can take up to 5 minutes, and the Mac goes back to
+sleep 2 minutes after the last message. To schedule a wake, macOS needs
+administrator rights: the first time, Gall asks for your password and
+installs `/etc/sudoers.d/gall`, which lets it run only
+`pmset schedule wake`. To remove it, run
+`sudo rm /etc/sudoers.d/gall`.
+
+The agent works in `~/Gall`; set `BOT_DIR` in the file to change this. A run stops after `TIMEOUT` seconds
 (default 1800). The log is `~/.cache/gall/bridge.log`.
 
 - Any message continues the same conversation. `/new` starts a new one.

@@ -16,6 +16,7 @@ var bot: Process?
 func unbot() {
     if let p = bot, p.isRunning { kill(-p.processIdentifier, SIGTERM) }
     bot = nil
+    try? fm.removeItem(at: run)
     lid(false)
 }
 
@@ -24,14 +25,18 @@ func unbot() {
 // kPMSetClamshellSleepState (12), which needs no root. the kernel keeps
 // the bit after we exit, so every start of the app clears it (bridge()
 // calls unbot), and the poll sets it again if powerd clears it
+let rd = IOServiceGetMatchingService(kIOMainPortDefault,
+    IOServiceMatching("IOPMrootDomain"))
 let pm: io_connect_t = {
     var c: io_connect_t = 0
-    IOServiceOpen(IOServiceGetMatchingService(kIOMainPortDefault,
-        IOServiceMatching("IOPMrootDomain")), mach_task_self_, 0, &c)
+    IOServiceOpen(rd, mach_task_self_, 0, &c)
     return c
 }()
 var nap: IOPMAssertionID = 0
+var held = true // so the first clear runs
 func lid(_ on: Bool) {
+    guard on || held else { return }
+    held = on
     var v: UInt64 = on ? 1 : 0
     if on, nap == 0 {
         IOPMAssertionCreateWithName(
@@ -40,6 +45,62 @@ func lid(_ on: Bool) {
             "Gall Telegram bridge" as CFString, &nap)
     } else if !on, nap != 0 { IOPMAssertionRelease(nap); nap = 0 }
     IOConnectCallScalarMethod(pm, 12, &v, 1, nil, nil)
+}
+
+// "Wake every 5 minutes": with the lid closed the mac sleeps between
+// checks. before each sleep pmset schedules a wake (as root, through the
+// sudoers rule that the setting installs); the app makes that wake a full
+// one, so the bridge polls again, and lets the mac sleep 2 minutes after
+// the last message (bridge.run is there while one runs)
+let rule = "/etc/sudoers.d/gall"
+let run = cache.appendingPathComponent("bridge.run")
+var seen = Date() // the last wake or message
+var wakes: Bool { UserDefaults.standard.bool(forKey: "wake") }
+func closed() -> Bool {
+    IORegistryEntryCreateCFProperty(rd, "AppleClamshellState" as CFString,
+        nil, 0)?.takeRetainedValue() as? Bool == true
+}
+func sh(_ a: String...) {
+    try? Process.run(URL(fileURLWithPath: a[0]),
+                     arguments: Array(a.dropFirst())).waitUntilExit()
+}
+func allow() -> Bool {
+    let s = "t=$(mktemp) && echo '\(NSUserName()) ALL=(root) NOPASSWD: "
+        + "/usr/bin/pmset schedule wake *' >$t && visudo -cf $t && "
+        + "install -m 440 -o root -g wheel $t \(rule); rm -f $t"
+    var e: NSDictionary?
+    NSAppleScript(source: "do shell script \"\(s)\" with administrator "
+        + "privileges")?.executeAndReturnError(&e)
+    return e == nil && fm.fileExists(atPath: rule)
+}
+var port: io_connect_t = 0
+func power() {
+    var n: IONotificationPortRef?, o: io_object_t = 0
+    port = IORegisterForSystemPower(nil, &n, { _, _, m, a in
+        let on = wakes && closed()
+        if m == 0xe0000280, on, bot != nil { // will sleep
+            let f = DateFormatter()
+            f.dateFormat = "MM/dd/yy HH:mm:ss"
+            sh("/usr/bin/sudo", "-n", "/usr/bin/pmset", "schedule", "wake",
+               f.string(from: Date(timeIntervalSinceNow: 300)), "Gall")
+        }
+        if m == 0xe0000300, on, let b = bot { // has powered on
+            seen = Date()
+            lid(true)
+            var u: IOPMAssertionID = 0
+            IOPMAssertionDeclareUserActivity("Gall Telegram bridge"
+                as CFString, kIOPMUserActiveLocal, &u)
+            // the long poll from before the sleep is dead
+            sh("/usr/bin/pkill", "-g", "\(b.processIdentifier)", "-f",
+               "timeout=60")
+        }
+        if m == 0xe0000270 || m == 0xe0000280 { // can sleep, will sleep
+            IOAllowPowerChange(port, Int(bitPattern: a))
+        }
+    }, &o)
+    CFRunLoopAddSource(CFRunLoopGetMain(),
+        IONotificationPortGetRunLoopSource(n).takeUnretainedValue(),
+        .defaultMode)
 }
 
 struct Health: Decodable, Equatable {
@@ -142,6 +203,12 @@ func alert(_ s: String) {
     @Published var tg = UserDefaults.standard.bool(forKey: "bridge") {
         didSet { d.set(tg, forKey: "bridge"); bridge() }
     }
+    @Published var wake = UserDefaults.standard.bool(forKey: "wake") {
+        didSet {
+            if wake, !fm.fileExists(atPath: rule), !allow() { wake = false }
+            d.set(wake, forKey: "wake")
+        }
+    }
 
     var status: String {
         guard phase.isEmpty else { return phase }
@@ -171,13 +238,18 @@ func alert(_ s: String) {
         Task {
             NSApp.setActivationPolicy(.accessory)
             await start()
+            power()
             bridge()
             while true {
                 if fetching {
                     let p = "Downloading \(min(100, Int(got() / 12.7e7)))%"
                     if p != phase { phase = p }
                 }
-                if let b = bot { b.isRunning ? lid(true) : unbot() }
+                if let b = bot, !b.isRunning { unbot() } else if bot != nil {
+                    if fm.fileExists(atPath: run.path) { seen = Date() }
+                    lid(!(wakes && closed()
+                          && -seen.timeIntervalSinceNow > 120))
+                }
                 await poll()
                 await sleep(1)
             }
