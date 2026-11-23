@@ -49,8 +49,9 @@ a separate wrapper script that runs `gall up` or `gall serve`.
 The Telegram bridge is `mac/bridge`, a shell script in
 `Contents/Resources`. The app runs it while the `bridge` setting is on
 and kills its process group when the setting goes off or the app quits.
-It reads `~/.config/gall/bridge` and runs hax as a llama.cpp client of
-the server. Its `caffeinate -i` is the app's only sleep assertion.
+It reads `~/.config/gall/bridge` and pipes each message through
+`AGENT` (`sh -c`), by default hax as a llama.cpp client of the server. Its
+`caffeinate -i` is the app's only sleep assertion.
 
 ## Model lock
 

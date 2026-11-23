@@ -103,7 +103,8 @@ your Mac. Each message goes to [hax](https://github.com/OleksandrChekhovskyi/hax
 a small coding agent that runs as you and uses Gall's model. The bridge
 sends hax's answer back.
 
-1. Install hax: `brew install oleksandrchekhovskyi/hax/hax`.
+1. Install hax: `brew install oleksandrchekhovskyi/hax/hax`, or see
+   below for another agent.
 2. Message @BotFather in Telegram, send `/newbot`, and keep the token.
    Find your own numeric ID with @userinfobot.
 3. Put both in `~/.config/gall/bridge`, and run
@@ -117,17 +118,32 @@ sends hax's answer back.
 4. Turn on **Settings** > **Telegram bridge**.
 
 While the bridge is on, the Mac does not go to sleep when it is idle. It
-still sleeps when you close the lid. hax works in `~/Gall`; set `BOT_DIR`
-in the file to change this. A run stops after `HAX_TIMEOUT` seconds
+still sleeps when you close the lid. The agent works in `~/Gall`; set
+`BOT_DIR` in the file to change this. A run stops after `TIMEOUT` seconds
 (default 1800). The log is `~/.cache/gall/bridge.log`.
 
 - Any message continues the same conversation. `/new` starts a new one.
 - A message that you send during a run stops it, and then runs. `/stop`
   only stops it. The conversation keeps the completed work.
-- A draft at the foot of the chat shows the tool that hax ran last.
+- A draft at the foot of the chat shows the tool that hax ran last, or
+  "working" for another agent.
 - A photo is saved in `img/`, and the model looks at it.
 - `AGENTS.md` in the folder tells the model to reply without markdown.
   Edit it to give the model other rules.
+
+To use another coding agent, set `AGENT` in the file to a command. The
+command reads the message on standard input and writes the answer on
+standard output. It gets these variables:
+
+- `GALL_URL`, `GALL_KEY` and `GALL_MODEL`: the endpoint, its key and the
+  model name. Set up your agent to use them, or another model.
+- `CONTINUE`: empty for the first message of a conversation, `1` after.
+
+For example, hax without the tool drafts:
+
+```sh
+AGENT='hax -p ${CONTINUE:+--continue} --provider=llamacpp --model=$GALL_MODEL'
+```
 
 hax has no approval prompts. It runs whatever the model decides to run,
 as your user. Keep `TELEGRAM_ALLOWED_USERS` to yourself, and keep the
