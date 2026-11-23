@@ -112,6 +112,12 @@ Measured pass times in the integrated build:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | GPU ms | 49.5 | 70.3 | 95.7 | 117.0 | 149.9 | 181.4 | 235.1 | 243.9 |
 
+On 23 November 2026, NVFP4 and IQ4_NL slabs with one use moved to two
+weight rows per threadgroup, as in single-token decode. Best pass times
+by `gall dr --tv 1,2,3,4` went from 46.9, 71.4, 97.8 and 115.3 ms to
+46.9, 67.4, 92.6 and 113.8 ms. Greedy output with `--block 3` matched
+ordinary decode.
+
 Two or four rows cost less than serial decoding of the same number of
 tokens, but the draft itself must also be paid for. Larger batches are
 not automatically better: expert arithmetic and register pressure grow

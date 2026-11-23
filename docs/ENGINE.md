@@ -128,7 +128,25 @@ token runs. A measured short-context token used 1,071 dispatches and
 accounted for 44.2 ms, with small kernels measured at about 4.9 ms.
 
 Expert kernels took about 23 ms per token and were limited by arithmetic.
-Three tuning passes produced no further improvement. The k-quant kernels
+Three tuning passes produced no further improvement. On 23 November 2026,
+two rows per threadgroup raised the NVFP4 and IQ4_NL down kernels from
+62–75 GB/s to about 80 GB/s, and one 16-bit load of the two IQ3_XXS grid
+indices raised that kernel from 54 to 57 GB/s. Decode uses a concurrent
+encoder with a barrier before each dispatch, except among the q, k, v,
+rel and gate projections, which read the same input. Back to back, the
+short-context rate went from 20.0 to 20.9 tokens/s (49.4 to 47.5 ms of
+GPU time per token).
+
+The weight bytes read per token are about 2.9 GB: 1.30 GB of experts,
+1.11 GB of Q8_0 attention, 0.32 GB of output head and 0.18 GB of other
+attention. At the Q8_0 rate of about 87 GB/s that is 33 ms, or 30
+tokens/s, with no time for small kernels. The IQ kernels remain at
+39–57 GB/s. Tests that removed parts of the IQ3_XXS unit showed that
+the loads alone ran at about 87 GB/s; the scale and sign work took the
+rest. Integer sign masks, a sign-mask table, threadgroup copies of the
+grids, half-precision dots and other row counts did not help. With no
+barriers at all (incorrect results), a token took 42 ms, which bounds
+the gain from more concurrency at about 5 ms. The k-quant kernels
 unpack four bytes as a word: the Q5_K head read at 73 GB/s (4.4 ms), and
 Q6_K at 87 GB/s.
 

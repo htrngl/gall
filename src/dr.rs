@@ -31,7 +31,7 @@ const KINDS: [&str; 16] = [
 ];
 // drm.metal x_*: (type, weight rows per threadgroup at 1 use), as XS there
 const XT: [(u32, usize); 10] = [(8, 4), (12, 2), (13, 2), (14, 2), (16, 8),
-    (17, 4), (18, 8), (20, 4), (22, 8), (40, 8)];
+    (17, 4), (18, 8), (20, 2), (22, 8), (40, 2)];
 // target activations, as in model.rs: the normed output and its source
 const TA: [usize; 2] = [3 * N, 15 * N];
 // drafter activations, in floats; block regions hold 8 rows

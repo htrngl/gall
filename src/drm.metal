@@ -247,4 +247,4 @@ kernel void N##_##F##_##C(constant PX &p, W w [[buffer(1)]], \
     XI(F, D, 5) XI(F, D, 6) XW(F, 2, 7) XW(F, 2, 8)
 XS(q8_0, 4, 4, 4) XS(q4_k, 2, 4, 2) XS(q5_k, 2, 4, 2) XS(q6_k, 2, 4, 2)
 XS(iq2_xxs, 8, 4, 2) XS(iq2_xs, 4, 4, 2) XS(iq2_s, 8, 4, 2)
-XS(iq3_xxs, 8, 4, 2) XS(iq4_nl, 4, 4, 2) XS(nvfp4, 8, 4, 2)
+XS(iq3_xxs, 8, 4, 2) XS(iq4_nl, 2, 4, 2) XS(nvfp4, 2, 4, 2)

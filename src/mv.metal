@@ -136,10 +136,10 @@ UNIT(iq2_s) {
 UNIT(iq3_xxs) {
     uint ib = e/4, l = e%4;
     H a = (H)(b + 66 + 4*ib);
-    uint aux = a[0] | (uint(a[1]) << 16);
+    uint aux = a[0] | (uint(a[1]) << 16), q = ((H)b)[1 + e];
     uint sg = ksigns_iq2xs[(aux >> 7*l) & 127];
     return F16(b)*(0.5f + (aux >> 28))*0.5f*
-           GDOT(iq3xxs_grid[b[2 + 2*e]], iq3xxs_grid[b[3 + 2*e]], sg);
+           GDOT(iq3xxs_grid[q & 255], iq3xxs_grid[q >> 8], sg);
 }
 
 // both nibbles of 4 bytes: xa and xb are the inputs of the low and the
@@ -242,8 +242,8 @@ KERNELS(iq2_xxs, R(8))
 KERNELS(iq2_xs, R(4))
 KERNELS(iq2_s, R(8))
 KERNELS(iq3_xxs, R(8))
-KERNELS_(iq4_nl, R(4), ACC16)
-KERNELS_(nvfp4, R(8), ACC8)
+KERNELS_(iq4_nl, R(2), ACC16)
+KERNELS_(nvfp4, R(2), ACC8)
 
 // device bandwidth ceiling: every thread sums a contiguous run of words
 kernel void bw(constant P &p, device const uint4 *w [[buffer(1)]],

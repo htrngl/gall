@@ -34,8 +34,8 @@ const TY: [(u32, &str, usize); 12] = [
     (17, "iq2_xs", 4),
     (22, "iq2_s", 8),
     (18, "iq3_xxs", 8),
-    (20, "iq4_nl", 4),
-    (40, "nvfp4", 8),
+    (20, "iq4_nl", 2),
+    (40, "nvfp4", 2),
 ];
 
 pub fn name(ty: u32) -> &'static str {

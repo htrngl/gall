@@ -6,7 +6,8 @@ use crate::gguf::{self, Gguf, Tensor};
 use crate::gpu::*;
 use crate::mv::Mv;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+use objc2_metal::{MTLBarrierScope, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+use objc2_metal::{MTLComputeCommandEncoder, MTLDispatchType};
 use std::cell::Cell;
 use std::collections::HashMap;
 
@@ -638,8 +639,20 @@ impl Model {
     fn enc(&self, pos: usize) -> Cb {
         objc2::rc::autoreleasepool(|_| {
             let cb = self.gpu.q.commandBuffer().unwrap();
-            let e = cb.computeCommandEncoder().unwrap();
-            self.sched(TID, pos, true).iter().for_each(|o| o.2(&e));
+            // concurrent: a barrier before each op, except between mat-vecs
+            // that read none of the earlier ones' outputs (q, k, v, rel, gate)
+            let e = cb.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent);
+            let (e, mut ys) = (e.unwrap(), vec![]);
+            for o in self.sched(TID, pos, true) {
+                match o.3 {
+                    Some(("mv", _, x, y)) if !ys.is_empty() && !ys.contains(&x) => ys.push(y),
+                    m => {
+                        e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+                        ys = m.iter().filter(|m| m.0 == "mv").map(|m| m.3).collect();
+                    }
+                }
+                o.2(&e);
+            }
             e.endEncoding();
             cb
         })
