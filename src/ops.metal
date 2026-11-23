@@ -360,14 +360,29 @@ kernel void smax(U p [[buffer(0)]], A a [[buffer(1)]], TG) {
 // turn each. leaves (acc[128], sum) per chunk and q head. skipping keys
 // of no weight does not pay: at 10k deep all are within e^-20 of the
 // maximum, and 75% are needed for 1 - 1e-3 of it
-// p: 0 max, 2 scores, 3 kv slot, 4 keys, 5 pos, 6 swa, 8 partials
+// p[10] > 0: the head maxima are those of score's p[10] group maxima at
+// p[9] and the sinks at p[11], and chunk 0 leaves them at p[0] for merge
+// (else smax left them there)
+// p: 0 max, 2 scores, 3 kv slot, 4 keys, 5 pos, 6 swa, 8 partials,
+// 9 group maxima, 10 their count, 11 sinks
 kernel void gather(U p [[buffer(0)]], A a [[buffer(1)]],
                    const device half *kv [[buffer(3)]], TG) {
   threadgroup float4 ac[16 * 3 * 32];
   threadgroup float ls[16 * 3];
   ZA;
   uint h = gp.y * 3;
-  float3 m = float3(a[p[0] + h], a[p[0] + h + 1], a[p[0] + h + 2]), l = 0;
+  float3 m = -1e30, l = 0;
+  for (uint g = t; g < p[10]; g += 512)
+    m = max(m, float3(*(const device packed_float3 *)(a + p[9] + g * 24 + h)));
+  m = float3(simd_max(m.x), simd_max(m.y), simd_max(m.z));
+  for (uint i = 0; i < 3; i++)
+    if (!ln) ls[sg * 3 + i] = m[i];
+  BAR;
+  m = float3(*(const device packed_float3 *)(a + p[p[10] ? 11 : 0] + h));
+  for (uint g = 0; g < 16; g++)
+    m = max(m, float3(ls[g * 3], ls[g * 3 + 1], ls[g * 3 + 2]));
+  BAR;
+  if (!gp.x && t < 3 && p[10]) a[p[0] + h + t] = m[t];
   float4 acc[3] = {0, 0, 0};
   for (uint j = gp.x * C + sg * KV, j1 = min(j + KV, NK); j < j1; j++) {
     float3 w = exp(float3(*(const device packed_float3 *)(a + p[2] + j * 24 + h)) - m);

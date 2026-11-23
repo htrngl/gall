@@ -67,6 +67,22 @@ UNIT(q5_k) {
     return d.x*DOTU(q) - d.y*SX;
 }
 
+// q5_k mat-vecs: units 2j, 2j + 1, inputs x0..x3, one scale decode for
+// both (the decode limits the one-unit kernel)
+static inline float w_q5_k(W b, uint j, float4 x0, float4 x1, float4 x2,
+        float4 x3) {
+    uint sb = j/2, o = 16*(j & 1);
+    float2 d = D2*k4(b + 4, sb);
+    device const uint4 *qp = (device const uint4 *)(b + 48 + 32*(sb/2) + o);
+    uint4 q = (*qp >> 4*(sb & 1)) & 0x0f0f0f0f;
+    q |= ((*(device const uint4 *)(b + 16 + o) >> sb) & 0x01010101) << 4;
+    return d.x*(dot(float4(as_type<uchar4>(q.x)), x0) +
+                dot(float4(as_type<uchar4>(q.y)), x1) +
+                dot(float4(as_type<uchar4>(q.z)), x2) +
+                dot(float4(as_type<uchar4>(q.w)), x3)) -
+           d.y*dot(x0 + x1 + x2 + x3, 1);
+}
+
 // a block is 210 bytes, so its words are read as halves
 static inline uint2 h2(W p) {
     uint4 v = uint4(*(device const packed_ushort4 *)p);
@@ -191,6 +207,16 @@ NIB(nvfp4) {
             s[i] += u_##F((w0) + i*p.rb + k*gb, l, xa, xb); \
     }
 
+// as ACC, a lane taking units 2j, 2j + 1 (j = l%16) of group 2k + l/16
+#define ACCW(F, R, w0, x) \
+    for (uint k = l/16, j = l%16; k < U/32; k += 2) { \
+        device const packed_float4 *xp = \
+            (device const packed_float4 *)((x) + 256*k + 16*j); \
+        float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3]; \
+        for (uint i = 0; i < R; i++) \
+            s[i] += w_##F((w0) + i*p.rb + k*gb, j, x0, x1, x2, x3); \
+    }
+
 #define ARGS constant P &p, W w [[buffer(1)]], X x [[buffer(2)]], \
     device float *y [[buffer(3)]], device const uint *ids [[buffer(4)]], \
     uint3 tg [[threadgroup_position_in_grid]], \
@@ -254,7 +280,7 @@ KERNELS(f32, R(2))
 KERNELS(bf16, R(2))
 KERNELS(q8_0, R(4))
 KERNELS(q4_k, R(2))
-KERNELS(q5_k, R(2))
+KERNELS_(q5_k, R(2), ACCW, )
 KERNELS(q6_k, R(2))
 #define u_iq2_xxs(b, e, xa, xb) t_iq2_xxs(b, e, xa, xb, tgg)
 #define u_iq2_xs(b, e, xa, xb) t_iq2_xs(b, e, xa, xb, tgg)

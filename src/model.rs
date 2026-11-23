@@ -572,9 +572,13 @@ impl Model {
             let th = (ng * 16).next_multiple_of(32).min(1024);
             let nc = if l.swa || !w8 {
                 k!("score", [ng, 8, 1], 512, Q, R, PT, kv, nk, pos, l.swa, l.rb, mx);
-                k!("smax", [24, 1, 1], th, mx, ng * 16, SK, gm, th);
+                // up to 512 group maxima, gather finds the head maxima
+                let ns = if ng <= 32 { ng * 16 } else {
+                    k!("smax", [24, 1, 1], th, mx, ng * 16, SK, gm, th);
+                    0
+                };
                 k!("gather", [nkm.div_ceil(256), 8, 1], 512, gm, 0, PT, kv, nk, pos, l.swa,
-                    0, pa);
+                    0, pa, mx, ns, SK);
                 nkm.div_ceil(256)
             } else {
                 // int8 first, f16 for the keys with weight

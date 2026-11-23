@@ -159,9 +159,20 @@ formats and NVFP4 all reach about 140–150 billion, which suggests a
 per-weight instruction limit rather than a memory limit.
 
 With no barriers at all (incorrect results), a token took 42 ms, which
-bounds the gain from more concurrency at about 5 ms. The k-quant kernels
-unpack four bytes as a word: the Q5_K head read at 73 GB/s (4.4 ms), and
-Q6_K at 87 GB/s.
+bounds the gain from more concurrency at about 5 ms. Most of that is in
+the weight kernels: skipping the barrier before a single kind of small
+kernel saved 0.7 ms at most (the attention softmax, gather and merge),
+and skipping small kernels outright saved nothing measurable. The loop
+controllers (`low`, `ctl`) and the router (`rows`) read about 0.2 GB of
+f16 weights per token at 75–100 GB/s. The f16 attention path finds the
+head maxima in `gather`, so it has no `smax` dispatch.
+
+The k-quant kernels unpack four bytes as a word. The Q5_K decode of the
+scales limits the head: without it the head read at 82–87 GB/s. A lane
+now takes two units of a sub-block, one scale decode for both, which
+raised the head from 73 to 75 GB/s (4.3 ms). Both nibbles per lane, a
+whole sub-block per lane, word loads and simdgroup shuffles of the
+scales were slower. Q6_K reads at 87 GB/s.
 
 Prefill uses half-precision matrix tiles, as the reference llama.cpp build
 does. The `HT` setting in `pfm.metal` selects float precision at about 80%
