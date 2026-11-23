@@ -55,7 +55,10 @@ While the bridge runs, the app holds a `PreventUserIdleSystemSleep`
 assertion (the system drops it if the app dies) and sets the root
 domain's clamshell-sleep-disable bit (`kPMSetClamshellSleepState`, no
 root needed). The kernel keeps that bit after the app exits, so the app
-clears it on each start and stop.
+clears it on each start and stop. The `sleep` default (a test, set with
+`defaults write io.github.ltrgoddard.gall sleep -bool true`) turns both
+off: the Mac sleeps, and the bridge holds `caffeinate -isu` from a
+message to its answer, to see if a Telegram reply wakes a sleeping Mac.
 
 ## Model lock
 

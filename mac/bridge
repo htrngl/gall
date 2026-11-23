@@ -22,6 +22,7 @@ export GALL_URL=$g/v1 GALL_MODEL=inkling-2-mini \
   GALL_KEY=$(cat ~/.cache/gall/key 2>/dev/null || echo none)
 # hax as a llama.cpp client of gall, compacting before the app's window fills
 x=$(defaults read io.github.ltrgoddard.gall ctx 2>/dev/null)
+z=$(defaults read io.github.ltrgoddard.gall sleep 2>/dev/null)
 export HAX_LLAMACPP_BASE_URL=$GALL_URL HAX_LLAMACPP_API_KEY=$GALL_KEY \
   HAX_CONTEXT_LIMIT=${x:-102400} HAX_MAX_TURNS=0 HAX_IMAGE_INPUT=on
 send() { printf %s "$2" | jq -Rsc --arg c "$1" '(if . == "" then "(no output)"
@@ -75,6 +76,9 @@ while :; do
         t="$t
 (the user sent an image: $PWD/img/${ph##*/}. read it to see it.)"; }
     printf "%s %s: %s\n" "$(date "+%F %T")" "$f" "$t"
+    # with the sleep default on, the app lets the mac sleep, and a message
+    # that wakes it holds it awake (-u: a full wake) until the answer is sent
+    [ "$z" = 1 ] && { caffeinate -isu -t 3600 & k=$!; }
     # the server restarts when a setting changes: wait for it
     i=0; until curl -sf -m 5 $g/health >/dev/null || [ $i = 60 ]; do
       i=$((i + 1)); sleep 2; done
@@ -83,5 +87,6 @@ while :; do
     watch "$ch" $a & w=$!; wait $a; s=$?; kill $w 2>/dev/null; touch .cont
     [ $s = 0 ] && send "$ch" "$(cat .out)" ||
       send "$ch" "$(cat .out; grep -v '^resume with' .err | tail -4)"
+    [ "$z" = 1 ] && kill $k
   done
 done

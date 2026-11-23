@@ -177,7 +177,10 @@ func alert(_ s: String) {
                     let p = "Downloading \(min(100, Int(got() / 12.7e7)))%"
                     if p != phase { phase = p }
                 }
-                if let b = bot { b.isRunning ? lid(true) : unbot() }
+                // the "sleep" test default: the mac sleeps, and the bridge
+                // holds it awake for each message that wakes it
+                if let b = bot, !b.isRunning { unbot() }
+                else if bot != nil, !d.bool(forKey: "sleep") { lid(true) }
                 await poll()
                 await sleep(1)
             }
