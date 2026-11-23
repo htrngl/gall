@@ -143,10 +143,23 @@ attention. At the Q8_0 rate of about 87 GB/s that is 33 ms, or 30
 tokens/s, with no time for small kernels. The IQ kernels remain at
 39–57 GB/s. Tests that removed parts of the IQ3_XXS unit showed that
 the loads alone ran at about 87 GB/s; the scale and sign work took the
-rest. Integer sign masks, a sign-mask table, threadgroup copies of the
-grids, half-precision dots and other row counts did not help. With no
-barriers at all (incorrect results), a token took 42 ms, which bounds
-the gain from more concurrency at about 5 ms. The k-quant kernels
+rest. Integer sign masks, sign-mask tables, threadgroup copies of the
+IQ3_XXS tables, half-precision dots, two units per lane, larger
+threadgroups for IQ3_XXS and a fixed loop count did not help. Tables
+with 16-byte rows were slow from constant and threadgroup memory, and a
+16 KB pre-signed IQ3_XXS grid fell to 22 GB/s.
+
+The IQ2 grids have 8-byte rows (2, 4 and 8 KB), which read slowly from
+the constant cache. Their mat-vecs copy the grid to threadgroup memory
+and run four simdgroups per threadgroup: IQ2_XXS went from 39 to 43 GB/s,
+IQ2_XS from 39 to 41 and IQ2_S from 43 to 47. Prefill and batched
+verification keep the constant tables. Back to back, decode went from
+21.2 to 21.4 tokens/s (46.6 to 46.2 ms of GPU time). In weights per second, the grid
+formats and NVFP4 all reach about 140–150 billion, which suggests a
+per-weight instruction limit rather than a memory limit.
+
+With no barriers at all (incorrect results), a token took 42 ms, which
+bounds the gain from more concurrency at about 5 ms. The k-quant kernels
 unpack four bytes as a word: the Q5_K head read at 73 GB/s (4.4 ms), and
 Q6_K at 87 GB/s.
 

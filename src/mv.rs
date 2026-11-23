@@ -22,20 +22,22 @@ pub const SRC: &str = concat!(
 #[repr(C)]
 struct P(u32, u32, u32, u32); // n_in, n_out, row bytes, experts
 
-// (type, name, rows per threadgroup as in mv.metal)
-const TY: [(u32, &str, usize); 12] = [
-    (0, "f32", 2),
-    (30, "bf16", 2),
-    (8, "q8_0", 4),
-    (12, "q4_k", 2),
-    (13, "q5_k", 2),
-    (14, "q6_k", 2),
-    (16, "iq2_xxs", 8),
-    (17, "iq2_xs", 4),
-    (22, "iq2_s", 8),
-    (18, "iq3_xxs", 8),
-    (20, "iq4_nl", 2),
-    (40, "nvfp4", 2),
+// (type, name, rows per simdgroup as in mv.metal, simdgroups per
+// threadgroup: 4 for the iq2 formats, which copy their grids to
+// threadgroup memory)
+const TY: [(u32, &str, usize, usize); 12] = [
+    (0, "f32", 2, 1),
+    (30, "bf16", 2, 1),
+    (8, "q8_0", 4, 1),
+    (12, "q4_k", 2, 1),
+    (13, "q5_k", 2, 1),
+    (14, "q6_k", 2, 1),
+    (16, "iq2_xxs", 8, 4),
+    (17, "iq2_xs", 4, 4),
+    (22, "iq2_s", 8, 4),
+    (18, "iq3_xxs", 8, 1),
+    (20, "iq4_nl", 2, 1),
+    (40, "nvfp4", 2, 1),
 ];
 
 pub fn name(ty: u32) -> &'static str {
@@ -43,7 +45,7 @@ pub fn name(ty: u32) -> &'static str {
 }
 
 pub struct Mv {
-    p: HashMap<(&'static str, u32), (Pipe, usize)>,
+    p: HashMap<(&'static str, u32), (Pipe, usize, usize)>,
 }
 
 impl Mv {
@@ -53,10 +55,10 @@ impl Mv {
             s.split_whitespace().next().unwrap().parse().unwrap()
         });
         let mut p = HashMap::new();
-        for (ty, name, r) in TY {
+        for (ty, name, r, sg) in TY {
             for k in ["mv", "up", "down", "row"] {
                 let f = g.pipe(SRC, defs, &format!("{k}_{name}"));
-                p.insert((k, ty), (f, nr.unwrap_or(r)));
+                p.insert((k, ty), (f, nr.unwrap_or(r), sg));
             }
         }
         Mv { p }
@@ -66,8 +68,8 @@ impl Mv {
     fn go(&self, e: &Enc, k: &'static str, ty: u32, b: &[B], n_in: usize, n_out: usize, rows: usize) {
         let rb = n_in / blk(ty).0 * blk(ty).1;
         let p = P(n_in as u32, n_out as u32, rb as u32, NE as u32);
-        let (f, r) = &self.p[&(k, ty)];
-        call(e, f, &p, b, [rows / r, 1, 1], 32);
+        let (f, r, sg) = &self.p[&(k, ty)];
+        call(e, f, &p, b, [rows / r / sg, 1, 1], 32 * sg);
     }
 
     #[allow(clippy::too_many_arguments)]

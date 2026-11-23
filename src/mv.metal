@@ -109,29 +109,36 @@ UNIT(nvfp4) {
 #define GDOT(g0, g1, sg) \
     DOT8(SGN(as_type<uchar4>(uint(g0)), sg, M0), SGN(as_type<uchar4>(uint(g1)), sg, M1))
 
-UNIT(iq2_xxs) {
-    uint ib = e/4, l = e%4;
-    H a = (H)(b + 2 + 8*ib);
-    uint aux = a[2] | (uint(a[3]) << 16);
-    ulong g = iq2xxs_grid[b[2 + 8*ib + l]];
-    uint sg = ksigns_iq2xs[(aux >> 7*l) & 127];
+// the iq2 grids are tables of 8-byte rows, which run slowly from the
+// constant cache: G is the table, and the mat-vecs below use a copy in
+// threadgroup memory (tgg), with 4 simdgroups per threadgroup
+#define IQ2XXS(G) \
+    uint ib = e/4, l = e%4; \
+    H a = (H)(b + 2 + 8*ib); \
+    uint aux = a[2] | (uint(a[3]) << 16); \
+    ulong g = G[b[2 + 8*ib + l]]; \
+    uint sg = ksigns_iq2xs[(aux >> 7*l) & 127]; \
     return F16(b)*(0.5f + (aux >> 28))*0.25f*GDOT(g, g >> 32, sg);
-}
-
-UNIT(iq2_xs) {
-    uint q = ((H)(b + 2))[e];
-    ulong g = iq2xs_grid[q & 511];
-    uint sg = ksigns_iq2xs[q >> 9];
-    float ls = (b[66 + e/4] >> 4*((e%4)/2)) & 15;
+#define IQ2XS(G) \
+    uint q = ((H)(b + 2))[e]; \
+    ulong g = G[q & 511]; \
+    uint sg = ksigns_iq2xs[q >> 9]; \
+    float ls = (b[66 + e/4] >> 4*((e%4)/2)) & 15; \
     return F16(b)*(0.5f + ls)*0.25f*GDOT(g, g >> 32, sg);
-}
-
-UNIT(iq2_s) {
-    ulong g = iq2s_grid[b[2 + e] | (((b[66 + e/4] >> 2*(e%4)) & 3) << 8)];
-    uint sg = b[34 + e];
-    float ls = (b[74 + e/4] >> 4*((e%4)/2)) & 15;
+#define IQ2S(G) \
+    ulong g = G[b[2 + e] | (((b[66 + e/4] >> 2*(e%4)) & 3) << 8)]; \
+    uint sg = b[34 + e]; \
+    float ls = (b[74 + e/4] >> 4*((e%4)/2)) & 15; \
     return F16(b)*(0.5f + ls)*0.25f*GDOT(g, g >> 32, sg);
-}
+#define IQ2(F, B, T) UNIT(F) { B(T) } \
+    static inline float t_##F(W b, uint e, float4 xa, float4 xb, \
+        threadgroup const ulong *G) { B(G) }
+IQ2(iq2_xxs, IQ2XXS, iq2xxs_grid)
+IQ2(iq2_xs, IQ2XS, iq2xs_grid)
+IQ2(iq2_s, IQ2S, iq2s_grid)
+#define TGG(T, N) threadgroup ulong tgg[N]; \
+    for (uint i = ti; i < N; i += tn) tgg[i] = T[i]; \
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
 UNIT(iq3_xxs) {
     uint ib = e/4, l = e%4;
@@ -187,8 +194,12 @@ NIB(nvfp4) {
 #define ARGS constant P &p, W w [[buffer(1)]], X x [[buffer(2)]], \
     device float *y [[buffer(3)]], device const uint *ids [[buffer(4)]], \
     uint3 tg [[threadgroup_position_in_grid]], \
-    ushort l [[thread_index_in_threadgroup]]
-#define HEAD(R) uint U = p.n_in/8, gb = p.rb*256/p.n_in, r0 = tg.x*R; \
+    ushort l [[thread_index_in_simdgroup]], \
+    ushort sg [[simdgroup_index_in_threadgroup]], \
+    ushort nsg [[simdgroups_per_threadgroup]]
+// simdgroup sg of a threadgroup takes R rows from r0; ti of tn threads
+#define HEAD(R) uint U = p.n_in/8, gb = p.rb*256/p.n_in, \
+    r0 = (tg.x*nsg + sg)*R, ti = 32*sg + l, tn = 32*nsg; \
     float s[R] = {0}
 #define TAIL(R) for (uint i = 0; i < R; i++) { \
         float v = simd_sum(s[i]); \
@@ -199,32 +210,39 @@ NIB(nvfp4) {
 // down: y[n_out] = sum_e W[ids[e]] x[e].  row: y[n_in] = row of W, row
 // ids[0] if ne.
 // R rows per threadgroup (NR overrides it); n_out is a multiple of R.
-#define KERNELS(F, R) KERNELS_(F, R, ACC)
-#define KERNELS_(F, R, ACC) \
+// PRE: the format's threadgroup setup, if any
+#define KERNELS(F, R) KERNELS_(F, R, ACC, )
+#define KERNELS_(F, R, ACC, PRE) \
 kernel void mv_##F(ARGS) { \
     HEAD(R); \
+    PRE \
     ACC(F, R, w + (ulong)r0*p.rb, x) \
     TAIL(R); \
 } \
 kernel void up_##F(ARGS) { \
     HEAD(R); \
+    PRE \
     ACC(F, R, w + ((ulong)ids[r0/p.n_out]*p.n_out + r0%p.n_out)*p.rb, x) \
     TAIL(R); \
 } \
 kernel void down_##F(ARGS) { \
     HEAD(R); \
+    PRE \
     for (uint j = 0; j < p.ne; j++) \
         ACC(F, R, w + ((ulong)ids[j]*p.n_out + r0)*p.rb, x + j*p.n_in) \
     TAIL(R); \
 } \
 kernel void row_##F(constant P &p, W w [[buffer(1)]], \
         device float *y [[buffer(3)]], device const uint *ids [[buffer(4)]], \
-        uint3 t [[thread_position_in_grid]]) { \
+        uint t [[thread_position_in_grid]], \
+        ushort ti [[thread_index_in_threadgroup]], \
+        ushort tn [[threads_per_threadgroup]]) { \
+    PRE \
     float4 xa = 0, xb = 0; \
-    if (t.x%8 < 4) xa[t.x%4] = 1; else xb[t.x%4] = 1; \
+    if (t%8 < 4) xa[t%4] = 1; else xb[t%4] = 1; \
     if (p.ne) w += (ulong)ids[0]*p.rb; \
-    if (t.x < p.n_in) \
-        y[t.x] = u_##F(w + t.x/256*(p.rb*256/p.n_in), t.x%256/8, xa, xb); \
+    if (t < p.n_in) \
+        y[t] = u_##F(w + t/256*(p.rb*256/p.n_in), t%256/8, xa, xb); \
 }
 
 #ifdef NR
@@ -238,12 +256,18 @@ KERNELS(q8_0, R(4))
 KERNELS(q4_k, R(2))
 KERNELS(q5_k, R(2))
 KERNELS(q6_k, R(2))
-KERNELS(iq2_xxs, R(8))
-KERNELS(iq2_xs, R(4))
-KERNELS(iq2_s, R(8))
+#define u_iq2_xxs(b, e, xa, xb) t_iq2_xxs(b, e, xa, xb, tgg)
+#define u_iq2_xs(b, e, xa, xb) t_iq2_xs(b, e, xa, xb, tgg)
+#define u_iq2_s(b, e, xa, xb) t_iq2_s(b, e, xa, xb, tgg)
+KERNELS_(iq2_xxs, R(8), ACC, TGG(iq2xxs_grid, 256))
+KERNELS_(iq2_xs, R(4), ACC, TGG(iq2xs_grid, 512))
+KERNELS_(iq2_s, R(8), ACC, TGG(iq2s_grid, 1024))
+#undef u_iq2_xxs
+#undef u_iq2_xs
+#undef u_iq2_s
 KERNELS(iq3_xxs, R(8))
-KERNELS_(iq4_nl, R(2), ACC16)
-KERNELS_(nvfp4, R(2), ACC8)
+KERNELS_(iq4_nl, R(2), ACC16, )
+KERNELS_(nvfp4, R(2), ACC8, )
 
 // device bandwidth ceiling: every thread sums a contiguous run of words
 kernel void bw(constant P &p, device const uint4 *w [[buffer(1)]],
