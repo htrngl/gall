@@ -17,7 +17,7 @@ Parallel agents divide the work by area. Two agents do not edit one file.
 | --- | --- |
 | Engine and server | `src/serve.rs`, `src/up.rs` (and the other `src/` files) |
 | Menu bar app (Swift) | `mac/Package.swift`, `mac/Sources/Gall/*.swift` |
-| Bundle and release | `mac/build`, `mac/Info.plist`, `mac/gall.entitlements`, `.gitignore` |
+| Bundle and release | `mac/build`, `mac/bridge`, `mac/Info.plist`, `mac/gall.entitlements`, `.gitignore` |
 | Documentation | `README.md`, `AGENTS.md`, `docs/`, `tools/README.md` |
 
 The app runs its bundled `gall` (`up`, `down`, `model`) and reads
@@ -43,9 +43,14 @@ from one outline: `mac/Sources/Gall/Leaf.swift` (menu bar) and
 ## Scope
 
 Gall is for a person at their own Mac. The app runs as the user, with no
-root, no daemons and no settings that keep the Mac awake. Server use
-(always on, no login, no sleep, a chat bridge) belongs in a separate
-wrapper script that runs `gall up` or `gall serve`.
+root and no daemons. Server use (always on, no login, no sleep) belongs in
+a separate wrapper script that runs `gall up` or `gall serve`.
+
+The Telegram bridge is `mac/bridge`, a shell script in
+`Contents/Resources`. The app runs it while the `bridge` setting is on
+and kills its process group when the setting goes off or the app quits.
+It reads `~/.config/gall/bridge` and runs hax as a llama.cpp client of
+the server. Its `caffeinate -i` is the app's only sleep assertion.
 
 ## Model lock
 

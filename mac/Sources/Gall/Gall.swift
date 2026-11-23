@@ -6,6 +6,16 @@ let fm = FileManager.default
 let cache = fm.homeDirectoryForCurrentUser.appendingPathComponent(".cache/gall")
 let key = cache.appendingPathComponent("key")
 let endpoint = "http://127.0.0.1:9940"
+let conf = fm.homeDirectoryForCurrentUser
+    .appendingPathComponent(".config/gall/bridge")
+
+// the telegram bridge (Resources/bridge) while its setting is on; its
+// process group goes with it: hax, curl and its caffeinate
+var bot: Process?
+func unbot() {
+    if let p = bot, p.isRunning { kill(-p.processIdentifier, SIGTERM) }
+    bot = nil
+}
 
 struct Health: Decodable, Equatable {
     var loaded: Bool
@@ -103,6 +113,7 @@ func alert(_ s: String) {
     var idle: Int { d.object(forKey: "unload") as? Int ?? 1 } // seconds
     var ctx: Int { d.object(forKey: "ctx") as? Int ?? 102400 }
     var net: Bool { d.bool(forKey: "net") }
+    var tg: Bool { d.bool(forKey: "bridge") }
 
     var status: String {
         guard phase.isEmpty else { return phase }
@@ -125,12 +136,14 @@ func alert(_ s: String) {
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil,
             queue: nil) { _ in
+            unbot()
             try? bin.map { try Process.run($0, arguments: ["down"]) }?
                 .waitUntilExit()
         }
         Task {
             NSApp.setActivationPolicy(.accessory)
             await start()
+            bridge()
             while true {
                 if fetching {
                     let p = "Downloading \(min(100, Int(got() / 12.7e7)))%"
@@ -240,6 +253,24 @@ func alert(_ s: String) {
             _ = try? await session.data(for: r)
             await poll()
         }
+    }
+
+    // log in ~/.cache/gall/bridge.log
+    func bridge() {
+        unbot()
+        guard tg, let s = Bundle.main.url(forResource: "bridge",
+                                          withExtension: nil) else { return }
+        guard fm.fileExists(atPath: conf.path) else {
+            return alert("Put TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USERS "
+                + "(your numeric ID) in ~/.config/gall/bridge.")
+        }
+        let l = cache.appendingPathComponent("bridge.log").path
+        if !fm.fileExists(atPath: l) { fm.createFile(atPath: l, contents: nil) }
+        let (p, o) = (Process(), FileHandle(forWritingAtPath: l))
+        o?.seekToEndOfFile()
+        (p.executableURL, p.standardOutput, p.standardError) = (s, o, o)
+        try? p.run()
+        bot = p
     }
 
     func quit() { NSApp.terminate(nil) }

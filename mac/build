@@ -18,7 +18,7 @@ cp "$(swift build -c release --package-path mac --show-bin-path)/GallMenu" \
   target/release/gall $c/MacOS/
 v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 sed "s|<string>0</string>|<string>$v</string>|" mac/Info.plist >$c/Info.plist
-cp mac/AppIcon.icns LICENSE NOTICE $c/Resources/
+cp mac/AppIcon.icns mac/bridge LICENSE NOTICE $c/Resources/
 t=$([ "$S" = - ] || echo --timestamp)
 s() { codesign -f -s "$S" $t "$@"; }
 s --options runtime --entitlements mac/gall.entitlements $c/MacOS/gall

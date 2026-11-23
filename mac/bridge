@@ -1,0 +1,79 @@
+#!/bin/sh
+# the telegram bridge: Gall.app runs it while "Telegram bridge" is on and
+# kills its process group on a toggle or a quit. it long-polls the bot and
+# hands each message from an allowed id to hax on gall, one at a time.
+# ~/.config/gall/bridge (sh) sets TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS
+# (comma separated), and optionally BOT_DIR and HAX_TIMEOUT (seconds)
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+c=~/.config/gall/bridge; [ -r "$c" ] && . "$c" && [ "$TELEGRAM_BOT_TOKEN" ] ||
+  { echo "no TELEGRAM_BOT_TOKEN in $c"; exit 1; }
+command -v hax >/dev/null || { echo "no hax: brew install \
+oleksandrchekhovskyi/hax/hax"; exit 1; }
+caffeinate -i -w $$ &  # no idle sleep while the bridge runs
+api=https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN g=http://127.0.0.1:9940
+d=${BOT_DIR:-$HOME/Gall}; mkdir -p "$d"; cd "$d" || exit 1; o=0
+[ -e AGENTS.md ] || echo "Telegram shows your replies as plain text: never \
+use markdown (no asterisks, headings, backticks or tables)." >AGENTS.md
+# hax as a llama.cpp client of gall, compacting before the app's window fills
+x=$(defaults read io.github.ltrgoddard.gall ctx 2>/dev/null)
+export HAX_LLAMACPP_BASE_URL=$g/v1 HAX_CONTEXT_LIMIT=${x:-102400} \
+  HAX_LLAMACPP_API_KEY=$(cat ~/.cache/gall/key 2>/dev/null || echo none) \
+  HAX_MAX_TURNS=0 HAX_IMAGE_INPUT=on
+send() { printf %s "$2" | jq -Rsc --arg c "$1" '(if . == "" then "(no output)"
+  else . end) | [range(0; length; 4000) as $i
+  | {chat_id: $c, text: .[$i:$i+4000]}][]' | while read -r j; do
+  curl -s -m 30 -H 'content-type: application/json' -d "$j" \
+    "$api/sendMessage" >/dev/null; done; }
+# while hax ($2) runs, a draft (gone with the answer) shows the tool it ran
+# last; a new message (/stop, or one that runs next) or HAX_TIMEOUT stops it
+watch() { n=0; while sleep 4; do n=$((n + 4))
+  x=$(grep '"kind":"tool_call"' .jl | tail -1 | jq -r '"\(.tool_name): \(
+    try (.arguments | fromjson | [.[]][0]) catch "")" | gsub("\\s+"; " ")
+    | .[:80]')
+  curl -s -m 5 "$api/sendMessageDraft" -d chat_id=$1 -d draft_id=1 \
+    --data-urlencode "text=${x:-working}" >/dev/null
+  x=$(curl -s -m 5 "$api/getUpdates?offset=$o" | jq -r --argjson s \
+    "$(cat .stop 2>/dev/null || echo 0)" --arg a ",$TELEGRAM_ALLOWED_USERS," \
+    '[.result[]? | select(.update_id > $s and (.message.text or .message.photo)
+    and (",\(.message.from.id)," as $f | $a | contains($f))) | .update_id]
+    | max // ""')
+  [ -n "$x" ] && { echo $x >.stop; send "$1" stopping; kill $2; break; }
+  [ $n -lt "${HAX_TIMEOUT:-1800}" ] ||
+    { send "$1" "timed out"; kill $2; break; }
+done; }
+while :; do
+  r=$(curl -s -m 70 "$api/getUpdates?timeout=60&offset=$o") || { sleep 5
+    continue; }
+  o=$(printf "%s\n" "$r" | jq --argjson o $o '[.result[]?.update_id] | max
+    | if . then . + 1 else $o end')
+  printf "%s\n" "$r" | jq -c '.result[]?.message | select(.text or .photo)
+    | [.chat.id, .from.id, .text // .caption // "", (.photo // [] | last
+    | .file_id // "")]' | while read -r x; do
+    ch=$(printf %s "$x" | jq -r '.[0]') f=$(printf %s "$x" | jq -r '.[1]')
+    t=$(printf %s "$x" | jq -r '.[2]') ph=$(printf %s "$x" | jq -r '.[3]')
+    case ",$TELEGRAM_ALLOWED_USERS," in *",$f,"*) ;; *)
+      echo "ignored a message from $f"; continue;; esac
+    case $t in /stop) continue;; /new) rm -f .sid
+      send "$ch" "new conversation"; continue;; esac
+    # a photo lands in img/ and the model looks at it with hax's read tool
+    [ -z "$ph" ] || { ph=$(curl -s -m 30 "$api/getFile?file_id=$ph" |
+        jq -r '.result.file_path // ""'); mkdir -p img
+      curl -sf -m 60 -o "img/${ph##*/}" "${api%/bot*}/file/${api##*/}/$ph" &&
+        t="$t
+(the user sent an image: $PWD/img/${ph##*/}. read it to see it.)"; }
+    printf "%s %s: %s\n" "$(date "+%F %T")" "$f" "$t"
+    # the server restarts when a setting changes: wait for it
+    i=0; until curl -sf -m 5 $g/health >/dev/null || [ $i = 60 ]; do
+      i=$((i + 1)); sleep 2; done
+    [ -s .sid ] && cc=--resume=$(cat .sid) || cc=
+    printf %s "$t" | hax --json $cc --provider=llamacpp --model=inkling-2-mini \
+      >.jl 2>.err & hx=$!; watch "$ch" $hx & w=$!
+    wait $hx; s=$?; kill $w 2>/dev/null
+    sed -n '1s/.*"id":"\([^"]*\)".*/\1/p' .jl >.sid.new
+    [ -s .sid.new ] && mv .sid.new .sid
+    x=$(jq -r 'select(.type == "result").text' .jl)
+    [ $s = 0 ] && send "$ch" "$x" ||
+      send "$ch" "$x
+$(grep -v '^resume with' .err | tail -4)"
+  done
+done

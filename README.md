@@ -87,11 +87,51 @@ last prompt was cached, and its generation speed.
 - **Allow other devices on the network** enables network access with an
   API key. Use **Copy key** to configure the other device’s client, with
   your Mac’s network address in place of `127.0.0.1`.
+- **Telegram bridge** passes your Telegram messages to the model while
+  Gall runs. See [Telegram bridge](#telegram-bridge).
 - **Open log** opens the server log in Console.
 
 Changing the unload, context or network setting restarts the server.
 **Quit Gall** saves eligible conversation state and stops it. Gall runs as
-your user and does not prevent your Mac from sleeping.
+your user and does not prevent your Mac from sleeping, except while the
+Telegram bridge is on.
+
+## Telegram bridge
+
+The bridge lets you message the model from your phone while Gall runs on
+your Mac. Each message goes to [hax](https://github.com/OleksandrChekhovskyi/hax),
+a small coding agent that runs as you and uses Gall's model. The bridge
+sends hax's answer back.
+
+1. Install hax: `brew install oleksandrchekhovskyi/hax/hax`.
+2. Message @BotFather in Telegram, send `/newbot`, and keep the token.
+   Find your own numeric ID with @userinfobot.
+3. Put both in `~/.config/gall/bridge`, and run
+   `chmod 600 ~/.config/gall/bridge`:
+
+   ```sh
+   TELEGRAM_BOT_TOKEN=123456:ABC...
+   TELEGRAM_ALLOWED_USERS=12345678   # comma separated
+   ```
+
+4. Turn on **Settings** > **Telegram bridge**.
+
+While the bridge is on, the Mac does not go to sleep when it is idle. It
+still sleeps when you close the lid. hax works in `~/Gall`; set `BOT_DIR`
+in the file to change this. A run stops after `HAX_TIMEOUT` seconds
+(default 1800). The log is `~/.cache/gall/bridge.log`.
+
+- Any message continues the same conversation. `/new` starts a new one.
+- A message that you send during a run stops it, and then runs. `/stop`
+  only stops it. The conversation keeps the completed work.
+- A draft at the foot of the chat shows the tool that hax ran last.
+- A photo is saved in `img/`, and the model looks at it.
+- `AGENTS.md` in the folder tells the model to reply without markdown.
+  Edit it to give the model other rules.
+
+hax has no approval prompts. It runs whatever the model decides to run,
+as your user. Keep `TELEGRAM_ALLOWED_USERS` to yourself, and keep the
+token secret.
 
 ## Performance
 
