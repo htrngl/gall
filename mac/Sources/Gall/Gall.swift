@@ -113,7 +113,10 @@ func alert(_ s: String) {
     var idle: Int { d.object(forKey: "unload") as? Int ?? 1 } // seconds
     var ctx: Int { d.object(forKey: "ctx") as? Int ?? 102400 }
     var net: Bool { d.bool(forKey: "net") }
-    var tg: Bool { d.bool(forKey: "bridge") }
+    // published, so the menu's tick follows a click
+    @Published var tg = UserDefaults.standard.bool(forKey: "bridge") {
+        didSet { d.set(tg, forKey: "bridge"); bridge() }
+    }
 
     var status: String {
         guard phase.isEmpty else { return phase }

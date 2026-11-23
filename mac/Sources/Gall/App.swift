@@ -76,9 +76,7 @@ struct Menu: View {
             Toggle("Start at login", isOn: login)
             Toggle("Allow other devices on the network",
                    isOn: pick("net", false))
-            Toggle("Telegram bridge", isOn: Binding(get: { m.tg }, set: {
-                m.d.set($0, forKey: "bridge"); m.bridge()
-            }))
+            Toggle("Telegram bridge", isOn: $m.tg)
         }
         Divider()
         Button("Quit Gall") { m.quit() }
