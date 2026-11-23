@@ -1,6 +1,7 @@
 // the state of the server and the commands that change it: polls /health,
 // reads the footprint of the server pid, runs the bundled gall binary
 import AppKit
+import IOKit
 
 let fm = FileManager.default
 let cache = fm.homeDirectoryForCurrentUser.appendingPathComponent(".cache/gall")
@@ -15,6 +16,22 @@ var bot: Process?
 func unbot() {
     if let p = bot, p.isRunning { kill(-p.processIdentifier, SIGTERM) }
     bot = nil
+    lid(false)
+}
+
+// no sleep on a closed lid while the bridge runs: the root domain's
+// kPMSetClamshellSleepState (12), which needs no root. the kernel keeps
+// the bit after we exit, so every start of the app clears it (bridge()
+// calls unbot), and the poll sets it again if powerd clears it
+let pm: io_connect_t = {
+    var c: io_connect_t = 0
+    IOServiceOpen(IOServiceGetMatchingService(kIOMainPortDefault,
+        IOServiceMatching("IOPMrootDomain")), mach_task_self_, 0, &c)
+    return c
+}()
+func lid(_ on: Bool) {
+    var v: UInt64 = on ? 1 : 0
+    IOConnectCallScalarMethod(pm, 12, &v, 1, nil, nil)
 }
 
 struct Health: Decodable, Equatable {
@@ -152,6 +169,7 @@ func alert(_ s: String) {
                     let p = "Downloading \(min(100, Int(got() / 12.7e7)))%"
                     if p != phase { phase = p }
                 }
+                if let b = bot { b.isRunning ? lid(true) : unbot() }
                 await poll()
                 await sleep(1)
             }

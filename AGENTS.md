@@ -51,7 +51,10 @@ The Telegram bridge is `mac/bridge`, a shell script in
 and kills its process group when the setting goes off or the app quits.
 It reads `~/.config/gall/bridge` and pipes each message through
 `AGENT` (`sh -c`), by default hax as a llama.cpp client of the server. Its
-`caffeinate -i` is the app's only sleep assertion.
+`caffeinate -i` stops idle sleep. While the bridge runs, the app also
+sets the root domain's clamshell-sleep-disable bit
+(`kPMSetClamshellSleepState`, no root needed). The kernel keeps that bit
+after the app exits, so the app clears it on each start and stop.
 
 ## Model lock
 

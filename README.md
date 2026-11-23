@@ -117,8 +117,8 @@ sends hax's answer back.
 
 4. Turn on **Settings** > **Telegram bridge**.
 
-While the bridge is on, the Mac does not go to sleep when it is idle. It
-still sleeps when you close the lid. The agent works in `~/Gall`; set
+While the bridge is on, the Mac does not go to sleep when it is idle or
+when you close the lid. It can get warm in a closed bag. The agent works in `~/Gall`; set
 `BOT_DIR` in the file to change this. A run stops after `TIMEOUT` seconds
 (default 1800). The log is `~/.cache/gall/bridge.log`.
 
