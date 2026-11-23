@@ -57,13 +57,16 @@ domain's clamshell-sleep-disable bit (`kPMSetClamshellSleepState`, no
 root needed). The kernel keeps that bit after the app exits, so the app
 clears it on each start and stop.
 
-The `wake` setting lets the Mac sleep with the lid closed. Before each
-sleep (`IORegisterForSystemPower`), the app runs
-`sudo -n pmset schedule wake` for 5 minutes later; the sudoers rule in
-`/etc/sudoers.d/gall`, installed with an administrator prompt, allows
-only that. On a wake, the app sets the clamshell bit, declares user
-activity (a dark wake becomes a full wake) and kills the stale long poll.
-It clears the bit, and the Mac sleeps, 2 minutes after the last wake or
+The `wake` setting lets the Mac sleep with the lid closed. The app runs
+`sudo -n pmset schedule wake` for 5 minutes later before a sleep from a
+full wake (`IORegisterForSystemPower`) and at each dark wake, which only
+the `com.apple.powermanagement.systempowerstate` notification reports
+(the capability bits are in `State:/IOKit/SystemPowerCapabilities`). The
+sudoers rule in `/etc/sudoers.d/gall`, installed with an administrator
+prompt, allows only that command. On a dark wake, the app sets the
+clamshell bit, declares user activity (a full wake: on battery no
+assertion holds a dark wake) and kills the stale long poll. It clears
+the bit, and the Mac sleeps, 30 s after a wake or 2 minutes after a
 message. The bridge keeps `~/.cache/gall/bridge.run` while a message
 runs.
 

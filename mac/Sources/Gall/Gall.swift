@@ -2,6 +2,8 @@
 // reads the footprint of the server pid, runs the bundled gall binary
 import AppKit
 import IOKit.pwr_mgt
+import SystemConfiguration
+import notify
 
 let fm = FileManager.default
 let cache = fm.homeDirectoryForCurrentUser.appendingPathComponent(".cache/gall")
@@ -48,13 +50,17 @@ func lid(_ on: Bool) {
 }
 
 // "Wake every 5 minutes": with the lid closed the mac sleeps between
-// checks. before each sleep pmset schedules a wake (as root, through the
-// sudoers rule that the setting installs); the app makes that wake a full
-// one, so the bridge polls again, and lets the mac sleep 2 minutes after
-// the last message (bridge.run is there while one runs)
+// checks. pmset (as root, through the sudoers rule that the setting
+// installs) books a wake 5 minutes on, before a sleep from a full wake
+// and at each dark wake, which IORegisterForSystemPower does not see but
+// powerd's systempowerstate notification does. the app makes a dark wake
+// a full one, so the bridge polls again, and lets the mac sleep 30 s
+// after it, or 2 minutes after a message (bridge.run is there while one
+// runs)
 let rule = "/etc/sudoers.d/gall"
 let run = cache.appendingPathComponent("bridge.run")
-var seen = Date() // the last wake or message
+var stay = Date() // awake until
+var next = Date.distantPast // the wake booked
 var wakes: Bool { UserDefaults.standard.bool(forKey: "wake") }
 func closed() -> Bool {
     IORegistryEntryCreateCFProperty(rd, "AppleClamshellState" as CFString,
@@ -73,27 +79,20 @@ func allow() -> Bool {
         + "privileges")?.executeAndReturnError(&e)
     return e == nil && fm.fileExists(atPath: rule)
 }
-var port: io_connect_t = 0
+// one wake in hand: apple's own maintenance wakes book none
+func book() {
+    guard next < Date(timeIntervalSinceNow: 30) else { return }
+    next = Date(timeIntervalSinceNow: 300)
+    let f = DateFormatter()
+    f.dateFormat = "MM/dd/yy HH:mm:ss"
+    sh("/usr/bin/sudo", "-n", "/usr/bin/pmset", "schedule", "wake",
+       f.string(from: next), "Gall")
+}
+var port: io_connect_t = 0, tok: Int32 = 0
 func power() {
     var n: IONotificationPortRef?, o: io_object_t = 0
     port = IORegisterForSystemPower(nil, &n, { _, _, m, a in
-        let on = wakes && closed()
-        if m == 0xe0000280, on, bot != nil { // will sleep
-            let f = DateFormatter()
-            f.dateFormat = "MM/dd/yy HH:mm:ss"
-            sh("/usr/bin/sudo", "-n", "/usr/bin/pmset", "schedule", "wake",
-               f.string(from: Date(timeIntervalSinceNow: 300)), "Gall")
-        }
-        if m == 0xe0000300, on, let b = bot { // has powered on
-            seen = Date()
-            lid(true)
-            var u: IOPMAssertionID = 0
-            IOPMAssertionDeclareUserActivity("Gall Telegram bridge"
-                as CFString, kIOPMUserActiveLocal, &u)
-            // the long poll from before the sleep is dead
-            sh("/usr/bin/pkill", "-g", "\(b.processIdentifier)", "-f",
-               "timeout=60")
-        }
+        if m == 0xe0000280, wakes, closed(), bot != nil { book() }
         if m == 0xe0000270 || m == 0xe0000280 { // can sleep, will sleep
             IOAllowPowerChange(port, Int(bitPattern: a))
         }
@@ -101,6 +100,22 @@ func power() {
     CFRunLoopAddSource(CFRunLoopGetMain(),
         IONotificationPortGetRunLoopSource(n).takeUnretainedValue(),
         .defaultMode)
+    notify_register_dispatch("com.apple.powermanagement.systempowerstate",
+                             &tok, .main) { _ in
+        let c = SCDynamicStoreCopyValue(nil,
+            "State:/IOKit/SystemPowerCapabilities" as CFString) as? Int ?? 0
+        // a dark wake: the cpu without the display
+        guard c & 3 == 1, wakes, closed(), let b = bot else { return }
+        book()
+        stay = max(stay, Date(timeIntervalSinceNow: 30))
+        lid(true)
+        var u: IOPMAssertionID = 0
+        IOPMAssertionDeclareUserActivity("Gall Telegram bridge" as CFString,
+                                         kIOPMUserActiveLocal, &u)
+        // the long poll from before the sleep is dead
+        sh("/usr/bin/pkill", "-g", "\(b.processIdentifier)", "-f",
+           "timeout=60")
+    }
 }
 
 struct Health: Decodable, Equatable {
@@ -246,9 +261,10 @@ func alert(_ s: String) {
                     if p != phase { phase = p }
                 }
                 if let b = bot, !b.isRunning { unbot() } else if bot != nil {
-                    if fm.fileExists(atPath: run.path) { seen = Date() }
-                    lid(!(wakes && closed()
-                          && -seen.timeIntervalSinceNow > 120))
+                    if fm.fileExists(atPath: run.path) {
+                        stay = Date(timeIntervalSinceNow: 120)
+                    }
+                    lid(!(wakes && closed() && stay < Date()))
                 }
                 await poll()
                 await sleep(1)

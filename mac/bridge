@@ -59,7 +59,8 @@ curl -s -m 30 "$api/setMyCommands" -H 'content-type: application/json' -d \
   '{"commands":[{"command":"new","description":"start a new conversation"}]}' \
   >/dev/null
 while :; do
-  r=$(curl -s -m 70 "$api/getUpdates?timeout=60&offset=$o") || { sleep 5
+  # the app kills a poll that a sleep left dead: poll again soon
+  r=$(curl -s -m 70 "$api/getUpdates?timeout=60&offset=$o") || { sleep 2
     continue; }
   o=$(printf "%s\n" "$r" | jq --argjson o $o '[.result[]?.update_id] | max
     | if . then . + 1 else $o end')
