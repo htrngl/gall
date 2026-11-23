@@ -117,4 +117,5 @@ The header of `src/main.rs` lists the other commands, including `run`,
 
 The [engine notes](docs/ENGINE.md) and [drafter notes](docs/DRAFT.md) hold
 the measurements and implementation notes. Keep them current there, and
-keep the README tables in agreement with them.
+keep the README tables in agreement with them. [Limits](docs/LIMITS.md)
+holds the performance limit model and the ranked next steps.
