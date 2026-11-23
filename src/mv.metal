@@ -237,25 +237,32 @@ NIB(nvfp4) {
 // ids[0] if ne.
 // R rows per threadgroup (NR overrides it); n_out is a multiple of R.
 // PRE: the format's threadgroup setup, if any
+// SLAB b (tests): every row read is one of the first b bytes' rows
+#ifdef SLAB
+#define WR(r) ((r) % max(1u, SLAB/p.rb))
+#else
+#define WR(r) (r)
+#endif
 #define KERNELS(F, R) KERNELS_(F, R, ACC, )
 #define KERNELS_(F, R, ACC, PRE) \
 kernel void mv_##F(ARGS) { \
     HEAD(R); \
     PRE \
-    ACC(F, R, w + (ulong)r0*p.rb, x) \
+    ACC(F, R, w + (ulong)WR(r0)*p.rb, x) \
     TAIL(R); \
 } \
 kernel void up_##F(ARGS) { \
     HEAD(R); \
     PRE \
-    ACC(F, R, w + ((ulong)ids[r0/p.n_out]*p.n_out + r0%p.n_out)*p.rb, x) \
+    ACC(F, R, w + WR((ulong)ids[r0/p.n_out]*p.n_out + r0%p.n_out)*p.rb, x) \
     TAIL(R); \
 } \
 kernel void down_##F(ARGS) { \
     HEAD(R); \
     PRE \
     for (uint j = 0; j < p.ne; j++) \
-        ACC(F, R, w + ((ulong)ids[j]*p.n_out + r0)*p.rb, x + j*p.n_in) \
+        ACC(F, R, w + WR((ulong)ids[j]*p.n_out + r0)*p.rb, \
+            x + j*p.n_in) \
     TAIL(R); \
 } \
 kernel void row_##F(constant P &p, W w [[buffer(1)]], \
@@ -295,10 +302,12 @@ KERNELS(iq3_xxs, R(8))
 KERNELS_(iq4_nl, R(2), ACC16, )
 KERNELS_(nvfp4, R(2), ACC8, )
 
-// device bandwidth ceiling: every thread sums a contiguous run of words
+// device bandwidth ceiling: every thread sums a run of p.n_in words, of
+// its own (p.n_out = 0) or a simdgroup's run, lanes adjacent (1)
 kernel void bw(constant P &p, device const uint4 *w [[buffer(1)]],
         device uint *y [[buffer(3)]], uint3 t [[thread_position_in_grid]]) {
     uint4 s = 0;
-    for (uint i = 0; i < p.n_in; i++) s += w[(ulong)t.x*p.n_in + i];
+    ulong b = p.n_out ? (ulong)(t.x & ~31u)*p.n_in + t.x%32 : (ulong)t.x*p.n_in;
+    for (uint i = 0, d = p.n_out ? 32 : 1; i < p.n_in; i++) s += w[b + i*d];
     y[t.x] = s.x + s.y + s.z + s.w;
 }

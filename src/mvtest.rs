@@ -1,5 +1,7 @@
 // gall mvtest [filter]: every weight kernel against the scalar reference,
-// with its read rate. env: M (gguf), DEFS (extra #defines, ';' = newline).
+// with its read rate. env: M (gguf), DEFS (extra #defines, ';' = newline;
+// SLAB 65536: every kernel on one 64 KB slab, memory out), ANON=1: time
+// copies in anonymous buffers, not the file mapping.
 // gall mvtest synth: attention in other formats (timing).
 use crate::gpu::*;
 use crate::{gguf, mv};
@@ -29,12 +31,15 @@ pub fn main() {
     // ceiling: 1GB of weights, summed as 16-byte words
     if filt.is_empty() || filt == "bw" {
         let w = gpu.w(g.t.values().min_by_key(|t| t.off).unwrap());
-        for n in [64u32, 1024, 16384] {
+        let p = gpu.pipe(mv::SRC, &defs, "bw");
+        for (n, c) in [4u32, 8, 16, 32, 64, 1024].iter().flat_map(|&n| [(n, 0), (n, 1)]) {
             let t = (1usize << 26) / n as usize;
-            let p = gpu.pipe(mv::SRC, &defs, "bw");
-            let run = || gpu.run(|e| call(e, &p, &[n, 0, 0, 0], &[(w.0, 0), (&y, 0), (&y, 0)], [t / 32, 1, 1], 32));
-            let s = run().min(run());
-            println!("bw {n:5} words/thread {:5.1} GB/s", (1u64 << 30) as f64 / s / 1e9);
+            let run = |tg| gpu.run(|e| call(e, &p, &[n, c, 0, 0], &[(w.0, 0), (&y, 0), (&y, 0)], [t / tg, 1, 1], tg));
+            for tg in [64, 256, 1024] {
+                let s = run(tg).min(run(tg)).min(run(tg));
+                println!("bw {n:5} words/thread {} tg {tg:4} {:5.1} GB/s", ["own", "simd"][c as usize],
+                    (1u64 << 30) as f64 / s / 1e9);
+            }
         }
     }
 
@@ -88,10 +93,20 @@ pub fn main() {
         // time over every tensor of this type and shape, expert sets cycling
         let all: Vec<_> = g.t.values().filter(|o| o.ty == t.ty && o.dims == t.dims).collect();
         let reps = (1.5e9 / (rows * rb) as f64).ceil().max(64.) as usize;
+        // ANON: up to 1.5 GB of the tensors copied to fresh buffers
+        let an: Vec<Buf> = if std::env::var("ANON").is_err() { vec![] } else {
+            let k = (1.5e9 / t.len as f64).ceil() as usize;
+            all.iter().take(k).map(|t| {
+                let b = gpu.buf(t.len);
+                slice::<u8>(&b)[..t.len].copy_from_slice(g.data(t));
+                b
+            }).collect()
+        };
         let run = || {
             gpu.run(|e| {
                 for i in 0..reps {
-                    let (w, bi) = (gpu.w(all[i % all.len()]), (&ids, 32 * (i % 16)));
+                    let w = an.get(i % an.len().max(1)).map_or_else(|| gpu.w(all[i % all.len()]), |b| (b, 0));
+                    let bi = (&ids, 32 * (i % 16));
                     match (t.dims.len(), up) {
                         (2, _) => m.dense(e, t.ty, w, bx, by, n_in, n_out),
                         (_, true) => m.experts_up(e, t.ty, w, bi, bx, by, n_in, n_out),
@@ -103,11 +118,12 @@ pub fn main() {
         let s = run().min(run()) / reps as f64;
         let kind = ["", "", "mv", if up { "up" } else { "down" }][t.dims.len()];
         println!(
-            "{:8} {kind:4} {n_in:5}x{n_out:<6} {:6.1} MB {:7.3} ms {:5.1} GB/s  err {:.1e}{}  {}",
+            "{:8} {kind:4} {n_in:5}x{n_out:<6} {:6.1} MB {:7.3} ms {:5.1} GB/s {:5.1} G w/s  err {:.1e}{}  {}",
             mv::name(t.ty),
             (rows * rb) as f64 / 1e6,
             s * 1e3,
             (rows * rb) as f64 / s / 1e9,
+            (rows * n_in) as f64 / s / 1e9,
             err / nrm,
             if nan > 0 || err / nrm > 1e-4 { " FAIL" } else { "" },
             t.name
