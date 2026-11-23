@@ -30,7 +30,7 @@ send() { printf %s "$2" | jq -Rsc --arg c "$1" '(if . == "" then "(no output)"
   curl -s -m 30 -H 'content-type: application/json' -d "$j" \
     "$api/sendMessage" >/dev/null; done; }
 # while the agent ($2) runs, a draft (gone with the answer) shows the tool
-# hax ran last; a new message (/stop, or one that runs next) or TIMEOUT
+# hax ran last; a new message (which runs next) or TIMEOUT
 # stops the agent and its processes
 watch() { n=0 y=-; while sleep 4; do n=$((n + 4))
   # "$ git status …", "read README.md": a command's first line, without a
@@ -56,8 +56,8 @@ watch() { n=0 y=-; while sleep 4; do n=$((n + 4))
 done; pkill -P $2; kill $2; }
 # the bot's command menu is the commands this script handles
 curl -s -m 30 "$api/setMyCommands" -H 'content-type: application/json' -d \
-  '{"commands":[{"command":"new","description":"start a new conversation"},
-  {"command":"stop","description":"stop the current run"}]}' >/dev/null
+  '{"commands":[{"command":"new","description":"start a new conversation"}]}' \
+  >/dev/null
 while :; do
   r=$(curl -s -m 70 "$api/getUpdates?timeout=60&offset=$o") || { sleep 5
     continue; }
@@ -70,7 +70,7 @@ while :; do
     t=$(printf %s "$x" | jq -r '.[2]') ph=$(printf %s "$x" | jq -r '.[3]')
     case ",$TELEGRAM_ALLOWED_USERS," in *",$f,"*) ;; *)
       echo "ignored a message from $f"; continue;; esac
-    case $t in /stop) continue;; /new) rm -f .cont
+    case $t in /new) rm -f .cont
       send "$ch" "new conversation"; continue;; esac
     # a photo lands in img/ and the model looks at it with its read tool
     [ -z "$ph" ] || { ph=$(curl -s -m 30 "$api/getFile?file_id=$ph" |

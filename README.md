@@ -123,8 +123,8 @@ when you close the lid. It can get warm in a closed bag. The agent works in `~/G
 (default 1800). The log is `~/.cache/gall/bridge.log`.
 
 - Any message continues the same conversation. `/new` starts a new one.
-- A message that you send during a run stops it, and then runs. `/stop`
-  only stops it. The conversation keeps the completed work.
+- A message that you send during a run stops it, and then runs. The
+  conversation keeps the completed work.
 - A draft at the foot of the chat shows the tool that hax ran last, or
   "working" for another agent.
 - A photo is saved in `img/`, and the model looks at it.
