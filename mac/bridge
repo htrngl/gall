@@ -26,12 +26,20 @@ send() { printf %s "$2" | jq -Rsc --arg c "$1" '(if . == "" then "(no output)"
     "$api/sendMessage" >/dev/null; done; }
 # while hax ($2) runs, a draft (gone with the answer) shows the tool it ran
 # last; a new message (/stop, or one that runs next) or HAX_TIMEOUT stops it
-watch() { n=0; while sleep 4; do n=$((n + 4))
-  x=$(grep '"kind":"tool_call"' .jl | tail -1 | jq -r '"\(.tool_name): \(
-    try (.arguments | fromjson | [.[]][0]) catch "")" | gsub("\\s+"; " ")
-    | .[:80]')
-  curl -s -m 5 "$api/sendMessageDraft" -d chat_id=$1 -d draft_id=1 \
-    --data-urlencode "text=${x:-working}" >/dev/null
+watch() { n=0 y=-; while sleep 4; do n=$((n + 4))
+  # "$ git status …", "read README.md": a command's first line, without a
+  # leading cd, or a file's name, cut at a word near 40 characters
+  x=$(grep '"kind":"tool_call"' .jl | tail -1 | jq -r '.tool_name as $t
+    | (try (.arguments | fromjson) catch {}) as $a | $a.command
+    // ($a.path | values | sub(".*/"; "")) // "" | tostring
+    | split("\n")[0] // "" | sub("^ *cd [^ ]+ *(&&|;) *"; "")
+    | gsub("\\s+"; " ") | if length > 40 then .[:40] | sub(" [^ ]*$"; "")
+      + " …" else . end | if . == "" then $t elif $t == "bash" then "$ \(.)"
+      else "\($t) \(.)" end')
+  # a draft is typed out again when it changes: send a new one, or each 20 s
+  [ "$x" != "$y" ] || [ $((n % 20)) = 0 ] && y=$x &&
+    curl -s -m 5 "$api/sendMessageDraft" -d chat_id=$1 -d draft_id=1 \
+      --data-urlencode "text=${x:-working}" >/dev/null
   x=$(curl -s -m 5 "$api/getUpdates?offset=$o" | jq -r --argjson s \
     "$(cat .stop 2>/dev/null || echo 0)" --arg a ",$TELEGRAM_ALLOWED_USERS," \
     '[.result[]? | select(.update_id > $s and (.message.text or .message.photo)
