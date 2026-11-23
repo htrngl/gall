@@ -54,6 +54,10 @@ watch() { n=0 y=-; while sleep 4; do n=$((n + 4))
   [ -n "$x" ] && { echo $x >.stop; send "$1" stopping; break; }
   [ $n -lt "${TIMEOUT:-1800}" ] || { send "$1" "timed out"; break; }
 done; pkill -P $2; kill $2; }
+# the bot's command menu is the commands this script handles
+curl -s -m 30 "$api/setMyCommands" -H 'content-type: application/json' -d \
+  '{"commands":[{"command":"new","description":"start a new conversation"},
+  {"command":"stop","description":"stop the current run"}]}' >/dev/null
 while :; do
   r=$(curl -s -m 70 "$api/getUpdates?timeout=60&offset=$o") || { sleep 5
     continue; }
