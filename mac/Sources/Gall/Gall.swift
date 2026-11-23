@@ -1,7 +1,7 @@
 // the state of the server and the commands that change it: polls /health,
 // reads the footprint of the server pid, runs the bundled gall binary
 import AppKit
-import IOKit
+import IOKit.pwr_mgt
 
 let fm = FileManager.default
 let cache = fm.homeDirectoryForCurrentUser.appendingPathComponent(".cache/gall")
@@ -11,7 +11,7 @@ let conf = fm.homeDirectoryForCurrentUser
     .appendingPathComponent(".config/gall/bridge")
 
 // the telegram bridge (Resources/bridge) while its setting is on; its
-// process group goes with it: hax, curl and its caffeinate
+// process group goes with it: hax and curl
 var bot: Process?
 func unbot() {
     if let p = bot, p.isRunning { kill(-p.processIdentifier, SIGTERM) }
@@ -19,7 +19,8 @@ func unbot() {
     lid(false)
 }
 
-// no sleep on a closed lid while the bridge runs: the root domain's
+// no sleep while the bridge runs: an idle-sleep assertion, which the
+// system drops if we die, and for a closed lid the root domain's
 // kPMSetClamshellSleepState (12), which needs no root. the kernel keeps
 // the bit after we exit, so every start of the app clears it (bridge()
 // calls unbot), and the poll sets it again if powerd clears it
@@ -29,8 +30,15 @@ let pm: io_connect_t = {
         IOServiceMatching("IOPMrootDomain")), mach_task_self_, 0, &c)
     return c
 }()
+var nap: IOPMAssertionID = 0
 func lid(_ on: Bool) {
     var v: UInt64 = on ? 1 : 0
+    if on, nap == 0 {
+        IOPMAssertionCreateWithName(
+            kIOPMAssertPreventUserIdleSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "Gall Telegram bridge" as CFString, &nap)
+    } else if !on, nap != 0 { IOPMAssertionRelease(nap); nap = 0 }
     IOConnectCallScalarMethod(pm, 12, &v, 1, nil, nil)
 }
 
