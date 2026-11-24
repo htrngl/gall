@@ -62,6 +62,8 @@ pub trait Lm {
     }
     // a draft of the tokens after the next one fed, each with its chance
     fn copy(&mut self, _d: Vec<(u32, f32)>) {}
+    // the caller feeds the first maximum of step()'s logits
+    fn greedy(&mut self, _on: bool) {}
 }
 
 // an Lm that load() makes again on first use after park()
@@ -119,6 +121,9 @@ impl Lm for Lazy {
     }
     fn copy(&mut self, d: Vec<(u32, f32)>) {
         self.get().copy(d)
+    }
+    fn greedy(&mut self, on: bool) {
+        self.get().greedy(on)
     }
 }
 
@@ -956,6 +961,7 @@ impl Srv {
         self.fed.clear();
         self.fed.extend(&p);
         self.lm.draft();
+        self.lm.greedy(js.is_none() && sp.temp <= 0.0);
         let mut lg = self.lm.feed(&p[at..]);
         let t1 = Instant::now();
 
@@ -1061,6 +1067,7 @@ impl Srv {
             self.lm.copy(d.map(|&t| (t, p)).collect());
             lg = self.lm.step(t);
         };
+        self.lm.greedy(false);
         let fin = if calls.is_empty() { fin } else { "tool_calls" };
 
         let (dp, dg) = (t1 - t0, t1.elapsed());
@@ -1242,6 +1249,11 @@ impl Lm for Ink {
     }
     fn copy(&mut self, d: Vec<(u32, f32)>) {
         self.5.as_mut().map(|x| x.1.cp = d);
+    }
+    // without drafts the next token runs ahead (Model.greedy); every
+    // other use of the gpu waits for it (Model::idle)
+    fn greedy(&mut self, on: bool) {
+        self.0.greedy = on && self.5.is_none();
     }
     fn image(&mut self, url: &str) -> Result<Range<u32>, String> {
         let v = self.3.as_ref().ok_or("no mmproj file beside the model")?;
