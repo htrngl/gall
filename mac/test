@@ -45,7 +45,8 @@ TELEGRAM_ALLOWED_USERS=7
 TELEGRAM_API={url}
 GALL_URL={url}/v1
 BOT_DIR={h}/w
-AGENT=read x; case $x in file) echo data >f.txt; send f.txt cap >/dev/null;; sleep) sleep 60;; esac; echo $x | tr a-z A-Z
+BOT_DIR=$BOT_DIR/x  # the file is sh: a variable and a comment
+AGENT='read x; case $x in file) echo data >f.txt; send f.txt cap >/dev/null;; sleep) sleep 60;; esac; echo $x | tr a-z A-Z'
 """)
     env = {**os.environ, "CFFIXED_USER_HOME": h, "HOME": h,
            "PATH": here + ":" + os.environ["PATH"]}

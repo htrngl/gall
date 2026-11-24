@@ -5,7 +5,7 @@
 // a dead network loses nothing. state is in ~/.cache/gall/bridge: offset
 // (saved before an update is read: a message runs at most once), in/, out/
 // and cont (the chat of the conversation); the log is ../bridge.log.
-// ~/.config/gall/bridge holds KEY=value lines: TELEGRAM_BOT_TOKEN,
+// ~/.config/gall/bridge (sh) sets TELEGRAM_BOT_TOKEN,
 // TELEGRAM_ALLOWED_USERS (comma separated) and optionally BOT_DIR, TIMEOUT
 // (seconds), GALL_URL, TELEGRAM_API and AGENT: a command for sh that reads
 // the message on stdin and writes the answer on stdout. it runs in BOT_DIR,
@@ -49,13 +49,20 @@ func json(_ s: (any StringProtocol)?) -> [String: Any] {
     func at(_ s: String) -> URL { dir.appendingPathComponent(s) }
 
     init?() {
-        for l in text(conf).split(separator: "\n") {
-            let p = l.split(separator: "=", maxSplits: 1).map {
-                $0.trimmingCharacters(in: .whitespaces)
-            }
-            guard p.count == 2, !p[0].hasPrefix("#") else { continue }
-            c[p[0].replacingOccurrences(of: "export ", with: "")] =
-                p[1].trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+        // the file is sh: it is sourced, and sh prints what it set
+        let (p, o) = (Process(), Pipe())
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", ". \"$0\"; for k in TELEGRAM_BOT_TOKEN "
+            + "TELEGRAM_ALLOWED_USERS BOT_DIR TIMEOUT GALL_URL TELEGRAM_API "
+            + "AGENT; do eval \"v=\\${$k-}\"; [ -z \"$v\" ] || "
+            + "printf '%s=%s\\0' $k \"$v\"; done", conf.path]
+        p.standardOutput = o
+        try? p.run()
+        let d = o.fileHandleForReading.readDataToEndOfFile()
+        for l in String(decoding: d, as: UTF8.self).split(separator: "\0") {
+            let p = l.split(separator: "=", maxSplits: 1,
+                            omittingEmptySubsequences: false)
+            c[String(p[0])] = String(p[1])
         }
         if c["TELEGRAM_BOT_TOKEN"] == nil { return nil }
     }
@@ -281,7 +288,8 @@ func json(_ s: (any StringProtocol)?) -> [String: Any] {
                 if n >= Int(c["TIMEOUT"]!) ?? 1800 { end("timed out") }
             }
         }
-        let s = await wait(pid)
+        if pid == 0 { why = "could not start the agent in \(work.path)" }
+        let s = pid == 0 ? 0 : await wait(pid)
         w.cancel()
         pid = 0
         try? chat.write(to: at("cont"), atomically: true, encoding: .utf8)

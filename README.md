@@ -150,8 +150,6 @@ A run stops after `TIMEOUT` seconds
 - A photo is saved in `img/`, and the model looks at it.
 - `AGENTS.md` in the folder tells the model to reply without markdown
   and how to send a file. Edit it to give the model other rules.
-- `~/.config/gall/bridge` holds `KEY=value` lines, one each. It is not
-  a shell script.
 
 To use another coding agent, set `AGENT` in the file to a command. The
 command reads the message on standard input and writes the answer on
