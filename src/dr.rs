@@ -404,13 +404,17 @@ impl Dr {
             *x += 0.1 * (t.elapsed().as_secs_f64().min(1.5 * *x) - *x)
         };
         let nd = st.block.unwrap_or(if on || st.n >= st.due[0] { st.nb() } else { 0 });
-        if d.is_empty() && nd > 0 {
+        // a longer draft from elsewhere (a copy, serve.rs) costs nothing
+        let cp = st.cp.len() > d.len();
+        if cp {
+            d = std::mem::take(&mut st.cp);
+        } else if d.is_empty() && nd > 0 {
             d = self.draft(m, tok, nd);
             ema(&mut st.td[nd], t0);
             st.fresh(&d, on);
         }
         let (t1, room) = (Instant::now(), self.n_ctx - 1 - m.pos);
-        let j = (st.plan(&d).0 * on as usize).min(room);
+        let j = (st.plan(&d).0 * (on || cp) as usize).min(room);
         if j == 0 {
             self.step(m, tok);
         } else {
@@ -512,6 +516,7 @@ pub struct Spec {
     pub rows: [usize; 2],     // drafts verified, and kept
     pub drafts: usize,
     pub n: usize,
+    pub cp: Vec<(u32, f32)>, // a draft for the next round, from elsewhere
     d: Vec<(u32, f32)>, // the draft in hand, after the last pass's token
     j: usize,           // its first j are verified: rows 1..=j of the pass
     r: usize,           // d[r - 1] is the draft of the token to come
@@ -534,6 +539,7 @@ impl Spec {
             rows: [0; 2],
             drafts: 0,
             n: 0,
+            cp: vec![],
             d: vec![],
             j: 0,
             r: 1,

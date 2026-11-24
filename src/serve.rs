@@ -60,6 +60,8 @@ pub trait Lm {
     fn draft(&mut self) -> String {
         String::new()
     }
+    // a draft of the tokens after the next one fed, each with its chance
+    fn copy(&mut self, _d: Vec<(u32, f32)>) {}
 }
 
 // an Lm that load() makes again on first use after park()
@@ -114,6 +116,9 @@ impl Lm for Lazy {
     }
     fn draft(&mut self) -> String {
         self.get().draft()
+    }
+    fn copy(&mut self, d: Vec<(u32, f32)>) {
+        self.get().copy(d)
     }
 }
 
@@ -739,6 +744,39 @@ fn raw(b: &[u8], i: &mut usize, s: &J, int: bool) -> Option<bool> {
     }
 }
 
+// ---- copy drafts: what followed the last place of the longest of the
+// last 12 or 3 tokens before, in the prompt or the answer
+
+struct Cp(HashMap<u64, usize>); // an n-gram's hash: the end of its last place
+
+impl Cp {
+    // s grew by a token: the length of the match, what followed it
+    fn next<'a>(&mut self, s: &'a [u32]) -> (usize, &'a [u32]) {
+        let (mut r, l) = ((0, &[][..]), s.len());
+        let f = |h: u64, &x: &u32| (h ^ x as u64).wrapping_mul(0x100000001b3);
+        for n in [12, 3].into_iter().filter(|&n| n <= l) {
+            let h = s[l - n..].iter().fold(n as u64, f);
+            let e = self.0.insert(h, l).filter(|&e| s[e - n..e] == s[l - n..]);
+            if let Some(e) = e.filter(|_| r.0 == 0) {
+                let m = (1..=e.min(64)).take_while(|i| s[e - i] == s[l - i]);
+                r = (m.count(), &s[e..]);
+            }
+        }
+        r
+    }
+}
+
+#[test]
+fn copy_follows_the_longest_match() {
+    // 10..20 1 2 3 4 1 2 3 9 10..20 1 2 3: the 12 tokens, not the last 3
+    let a: Vec<u32> = (10..20).collect();
+    let s = [&a[..], &[1, 2, 3, 4, 1, 2, 3, 9], &a, &[1, 2, 3]].concat();
+    let mut c = Cp(HashMap::new());
+    let r: Vec<_> = (1..=s.len()).map(|i| c.next(&s[..i])).collect();
+    assert_eq!(r[16], (3, &s[13..17]));
+    assert_eq!(r[s.len() - 1], (13, &s[13..]));
+}
+
 // ---- http
 
 fn head(w: &mut impl Write, code: u16, kind: &str, more: &str) -> io::Result<()> {
@@ -925,6 +963,8 @@ impl Srv {
         let (mut st, mut n, mut sent) = (0, 0, [0; 2]);
         let mut b = [vec![], vec![], vec![], vec![]]; // thinking, text, name, tool
         let mut calls = vec![];
+        let mut cp = Cp(HashMap::new());
+        (1..=p.len()).for_each(|i| _ = cp.next(&p[..i]));
         let fin = loop {
             if n == max || self.fed.len() >= self.ctx {
                 break "length";
@@ -938,8 +978,8 @@ impl Srv {
             }
             // response_format: of the text tokens, take one that keeps the
             // text a fit; the message ends when the value is whole
-            let fit = |t: u32| {
-                let (mut x, stop) = (b[1].clone(), t == end);
+            let fit = |x: &[u8], t: u32| {
+                let (mut x, stop) = (x.to_vec(), t == end);
                 let y = if stop { b" " as &[u8] } else { &self.tok.txt[t as usize] };
                 // no space at the start, nor after a space
                 let sp = |c: &u8| c.is_ascii_whitespace();
@@ -953,13 +993,15 @@ impl Srv {
                     None => false,
                 }
             };
-            let fit = |t: u32| fit(t) && (t == end || !self.tok.ctl[t as usize]);
+            let fit = |x: &[u8], t: u32| {
+                fit(x, t) && (t == end || !self.tok.ctl[t as usize])
+            };
             let mut t = sample(lg, &sp, &mut rng);
-            if js.is_some() && st == text && !fit(t) {
+            if js.is_some() && st == text && !fit(&b[1], t) {
                 // the likeliest token that fits
                 let mut ix: Vec<u32> = (0..lg.len() as u32).collect();
                 ix.sort_unstable_by(|a, b| lg[*b as usize].total_cmp(&lg[*a as usize]));
-                t = ix.into_iter().find(|&t| fit(t)).unwrap_or(end);
+                t = ix.into_iter().find(|&t| fit(&b[1], t)).unwrap_or(end);
             }
             n += 1;
             if t == self.tok.eos {
@@ -1006,6 +1048,17 @@ impl Srv {
                 }
             }
             self.fed.push(t);
+            // a copy of 12 or more tokens goes ahead, as far as the schema
+            // takes it
+            let (m, d) = cp.next(&self.fed);
+            let cut = js.is_some() && st == text;
+            let (mut x, p) = (b[1].clone(), if m < 24 { 0.9 } else { 0.99 });
+            let d = d.iter().take(if m < 12 { 0 } else { 7 });
+            let d = d.take_while(|&&t| !cut || fit(&x, t) && {
+                x.extend(&self.tok.txt[t as usize]);
+                true
+            });
+            self.lm.copy(d.map(|&t| (t, p)).collect());
             lg = self.lm.step(t);
         };
         let fin = if calls.is_empty() { fin } else { "tool_calls" };
@@ -1181,11 +1234,14 @@ impl Lm for Ink {
     // also drops the rows verified ahead: the model is about to move
     fn draft(&mut self) -> String {
         let Some((_, s, c)) = &mut self.5 else { return String::new() };
-        s.drop();
+        (s.drop(), s.cp.clear());
         let n = [s.drafts, s.rows[0], s.rows[1]];
         let d = [0, 1, 2].map(|i| n[i] - c[i]);
         *c = n;
         format!(", {} drafts, {} of {} rows ahead kept", d[0], d[2], d[1])
+    }
+    fn copy(&mut self, d: Vec<(u32, f32)>) {
+        self.5.as_mut().map(|x| x.1.cp = d);
     }
     fn image(&mut self, url: &str) -> Result<Range<u32>, String> {
         let v = self.3.as_ref().ok_or("no mmproj file beside the model")?;
