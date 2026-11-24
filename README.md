@@ -68,6 +68,9 @@ prompts and images change memory use.
 **Instant** unload is the app’s default: after one idle second it saves
 conversation state and releases the model’s working memory. The leaf
 becomes an outline; the next message loads the model automatically.
+After a tool call, the model stays loaded for 4 times the usual wait for
+a tool result (at most 30 seconds), so that the client can send the
+result without a reload.
 
 Conversations of at least 512 tokens can reuse saved state. Shorter ones
 are processed again, and your client still sends the history as usual.

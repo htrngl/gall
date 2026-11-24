@@ -7,11 +7,11 @@
 // with a key, all but /health need "authorization: bearer KEY"; a host
 // other than loopback needs a key. a park puts the model to disk (a
 // snapshot of the last conversation) and out of memory, until the next
-// chat request: after --idle-unload seconds idle, on POST /park, at memory
-// pressure (warn) and, before an exit, on SIGTERM; it waits for the chat
-// that runs. with the dspark drafter beside the model, tokens are verified
-// ahead in batches where that pays (dr.rs); the logits of every step stay
-// those of the model.
+// chat request: after --idle-unload seconds idle (longer after tool_calls),
+// on POST /park, at memory pressure (warn) and, before an exit, on SIGTERM;
+// it waits for the chat that runs. with the dspark drafter beside the
+// model, tokens are verified ahead in batches where that pays (dr.rs); the
+// logits of every step stay those of the model.
 // the chat template of the gguf is written out in prompt(); the model
 // answers in blocks, <|message_model|> then <|content_thinking|>,
 // <|content_text|> or NAME<|content_invoke_tool_json|>, each closed by
@@ -1069,6 +1069,7 @@ impl Srv {
         };
         self.lm.greedy(false);
         let fin = if calls.is_empty() { fin } else { "tool_calls" };
+        TC.store(fin == "tool_calls", Relaxed);
 
         let (dp, dg) = (t1 - t0, t1.elapsed());
         let (np, ms) = (p.len() - k, |d: Duration| d.as_secs_f64() * 1e3);
@@ -1133,6 +1134,7 @@ enum Q {
 static UP: AtomicBool = AtomicBool::new(false);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static PEND: AtomicBool = AtomicBool::new(false);
+static TC: AtomicBool = AtomicBool::new(false); // the last finish: tool_calls
 static LAST: Mutex<J> = Mutex::new(J::Null);
 fn conn(mut c: TcpStream, name: &str, auth: &Option<String>, q: &Sender<Q>)
         -> io::Result<()> {
@@ -1404,7 +1406,9 @@ pub fn main(a: &[String]) {
         std::process::exit(1)
     }
     eprintln!("gall: http://{host}:{port}/v1, context {ctx}");
-    let idle: u64 = opt("--idle-unload", "0").parse().unwrap();
+    let idle = Duration::from_secs(opt("--idle-unload", "0").parse().unwrap());
+    let (cap, mut t) = (Duration::from_secs(30), Instant::now());
+    let mut gaps = vec![];
     let (name, auth) = (s.name.clone(), s.auth.clone());
     std::thread::spawn(move || for c in l.incoming().flatten() {
         let (name, auth, tx) = (name.clone(), auth.clone(), tx.clone());
@@ -1412,17 +1416,27 @@ pub fn main(a: &[String]) {
     });
     loop {
         UP.store(s.lm.loaded(), Relaxed);
-        let r = match idle > 0 && s.lm.loaded() {
-            true => rx.recv_timeout(Duration::from_secs(idle)).ok(),
+        // a client back from its tool: hold for 4 x the median of the last 5
+        // idle gaps after tool_calls, 30 s at most (and with none yet)
+        let mut g = gaps[gaps.len().saturating_sub(5)..].to_vec();
+        g.sort();
+        let m = g.get(g.len() / 2).map_or(cap, |&m: &Duration| cap.min(m * 4));
+        let w = if TC.load(Relaxed) { idle.max(m) } else { idle };
+        let r = match !idle.is_zero() && s.lm.loaded() {
+            true => rx.recv_timeout(w).ok(),
             _ => rx.recv().ok(),
         };
         match r.unwrap_or(Q::Park(None, false)) {
             Q::Chat(r, mut c) => {
+                if TC.swap(false, Relaxed) {
+                    gaps.push(t.elapsed());
+                }
                 BUSY.store(true, Relaxed);
                 if let Err(e) = objc2::rc::autoreleasepool(|_| s.chat(&r, &mut c)) {
                     eprintln!("gall: {e}");
                 }
                 BUSY.store(false, Relaxed);
+                t = Instant::now();
             }
             Q::Park(c, exit) => {
                 let n = if s.lm.len() == s.fed.len() { s.fed.len() } else { 0 };
