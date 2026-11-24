@@ -12,13 +12,11 @@ let endpoint = "http://127.0.0.1:9940"
 let conf = fm.homeDirectoryForCurrentUser
     .appendingPathComponent(".config/gall/bridge")
 
-// the telegram bridge (Resources/bridge) while its setting is on; its
-// process group goes with it: hax and curl
-var bot: Process?
-func unbot() {
-    if let p = bot, p.isRunning { kill(-p.processIdentifier, SIGTERM) }
+// the telegram bridge (Bridge.swift) while its setting is on
+var bot: Bridge?
+@MainActor func unbot() {
+    bot?.stop()
     bot = nil
-    try? fm.removeItem(at: run)
     lid(false)
 }
 
@@ -55,10 +53,8 @@ func lid(_ on: Bool) {
 // and at each dark wake, which IORegisterForSystemPower does not see but
 // powerd's systempowerstate notification does. the app makes a dark wake
 // a full one, so the bridge polls again, and lets the mac sleep 30 s
-// after it, or 2 minutes after a message (bridge.run is there while one
-// runs)
+// after it, or 2 minutes after a message
 let rule = "/etc/sudoers.d/gall"
-let run = cache.appendingPathComponent("bridge.run")
 var stay = Date() // awake until
 var next = Date.distantPast // the wake booked
 var wakes: Bool { UserDefaults.standard.bool(forKey: "wake") }
@@ -113,8 +109,7 @@ func power() {
         IOPMAssertionDeclareUserActivity("Gall Telegram bridge" as CFString,
                                          kIOPMUserActiveLocal, &u)
         // the long poll from before the sleep is dead
-        sh("/usr/bin/pkill", "-g", "\(b.processIdentifier)", "-f",
-           "timeout=60")
+        MainActor.assumeIsolated { b.kick() }
     }
 }
 
@@ -246,7 +241,7 @@ func alert(_ s: String) {
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil,
             queue: nil) { _ in
-            unbot()
+            MainActor.assumeIsolated { unbot() }
             try? bin.map { try Process.run($0, arguments: ["down"]) }?
                 .waitUntilExit()
         }
@@ -260,10 +255,8 @@ func alert(_ s: String) {
                     let p = "Downloading \(min(100, Int(got() / 12.7e7)))%"
                     if p != phase { phase = p }
                 }
-                if let b = bot, !b.isRunning { unbot() } else if bot != nil {
-                    if fm.fileExists(atPath: run.path) {
-                        stay = Date(timeIntervalSinceNow: 120)
-                    }
+                if let b = bot {
+                    if b.busy { stay = Date(timeIntervalSinceNow: 120) }
                     lid(!(wakes && closed() && stay < Date()))
                 }
                 // a server that panicked starts again (up keeps its log
@@ -380,22 +373,15 @@ func alert(_ s: String) {
         }
     }
 
-    // log in ~/.cache/gall/bridge.log
     func bridge() {
         unbot()
-        guard tg, let s = Bundle.main.url(forResource: "bridge",
-                                          withExtension: nil) else { return }
-        guard fm.fileExists(atPath: conf.path) else {
+        guard tg else { return }
+        guard let b = Bridge() else {
             return alert("Put TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USERS "
                 + "(your numeric ID) in ~/.config/gall/bridge.")
         }
-        let l = cache.appendingPathComponent("bridge.log").path
-        if !fm.fileExists(atPath: l) { fm.createFile(atPath: l, contents: nil) }
-        let (p, o) = (Process(), FileHandle(forWritingAtPath: l))
-        o?.seekToEndOfFile()
-        (p.executableURL, p.standardOutput, p.standardError) = (s, o, o)
-        try? p.run()
-        bot = p
+        b.start()
+        bot = b
     }
 
     func quit() { NSApp.terminate(nil) }

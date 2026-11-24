@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+# the bridge against a stub of telegram and of the server, in a temporary
+# home: mac/test (after swift build -c release --package-path mac). checks
+# an answer, a send that fails once, an id not allowed, /new, a file from
+# mac/send, a message that is not text, /stop, and no second run of a
+# message after a restart
+import http.server, json, os, subprocess, tempfile, threading, time
+
+here = os.path.dirname(os.path.abspath(__file__))
+msg = lambda i, f, **m: {"update_id": i, "message": {"chat": {"id": 7},
+                                                     "from": {"id": f}, **m}}
+ups = [msg(1, 7, text="hi"), msg(2, 9, text="x"), msg(3, 7, text="/new"),
+       msg(4, 7, text="file"), msg(5, 7, sticker={}), msg(6, 7, text="sleep")]
+late, sent, fail, t0 = msg(7, 7, text="/stop"), [], [1], time.time()
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(*a): pass
+    def out(s, c, j):
+        s.send_response(c); s.end_headers(); s.wfile.write(json.dumps(j).encode())
+    def do_GET(s): s.out(200, {})
+    def do_POST(s):
+        b = s.rfile.read(int(s.headers["content-length"]))
+        m = s.path.split("/")[-1]
+        if m == "getUpdates":
+            o = json.loads(b)["offset"]
+            if time.time() - t0 > 12 and late not in ups: ups.append(late)
+            r = [u for u in ups if u["update_id"] >= o]
+            r or time.sleep(.3)
+            return s.out(200, {"ok": True, "result": r})
+        if m == "sendMessage" and fail:
+            return s.out(500, {"ok": False, "error_code": fail.pop() * 500})
+        if m == "sendMessage": sent.append(json.loads(b)["text"])
+        if m == "sendDocument":
+            sent.append("doc " + str(b"f.txt" in b and b"data" in b
+                                     and b"cap" in b))
+        s.out(200, {"ok": True, "result": True})
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+url = "http://127.0.0.1:%d" % srv.server_port
+with tempfile.TemporaryDirectory() as h:
+    os.makedirs(h + "/.config/gall"); os.makedirs(h + "/.cache/gall")
+    open(h + "/.config/gall/bridge", "w").write(f"""TELEGRAM_BOT_TOKEN=t
+TELEGRAM_ALLOWED_USERS=7
+TELEGRAM_API={url}
+GALL_URL={url}/v1
+BOT_DIR={h}/w
+AGENT=read x; case $x in file) echo data >f.txt; send f.txt cap >/dev/null;; sleep) sleep 60;; esac; echo $x | tr a-z A-Z
+""")
+    env = {**os.environ, "CFFIXED_USER_HOME": h, "HOME": h,
+           "PATH": here + ":" + os.environ["PATH"]}
+    run = lambda: subprocess.Popen([here + "/.build/release/GallMenu",
+                                    "bridge"], env=env)
+    # what the poller answers itself goes out before the agent's answers
+    want = ["new conversation", "only text and photos can be read", "HI",
+            "doc True", "FILE", "stopped"]
+    p = run()
+    while sent != want and time.time() - t0 < 40: time.sleep(.2)
+    p.kill(); p = run(); time.sleep(3); p.kill()
+    print(open(h + "/.cache/gall/bridge.log").read(), end="")
+print("ok" if sent == want else "FAILED: %s" % sent,
+      "in %.0f s" % (time.time() - t0))
+exit(sent != want)

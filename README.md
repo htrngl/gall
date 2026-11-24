@@ -138,13 +138,20 @@ A run stops after `TIMEOUT` seconds
 (default 1800). The log is `~/.cache/gall/bridge.log`.
 
 - Any message continues the same conversation. `/new` starts a new one.
-- A message that you send during a run stops it, and then runs. The
-  conversation keeps the completed work.
+- A message that you send during a run waits for it. `/stop` stops the
+  run; the conversation keeps the completed work.
+- The model can send you a file: it runs `send FILE [caption]`. An image
+  of less than 10 MB arrives as a photo, any other file as a document.
+- Messages and answers are kept on disk until they are done, so a quit
+  or a lost network loses none. An answer that Telegram does not take
+  is sent again.
 - A draft at the foot of the chat shows the tool that hax ran last, or
   "working" for another agent.
 - A photo is saved in `img/`, and the model looks at it.
-- `AGENTS.md` in the folder tells the model to reply without markdown.
-  Edit it to give the model other rules.
+- `AGENTS.md` in the folder tells the model to reply without markdown
+  and how to send a file. Edit it to give the model other rules.
+- `~/.config/gall/bridge` holds `KEY=value` lines, one each. It is not
+  a shell script.
 
 To use another coding agent, set `AGENT` in the file to a command. The
 command reads the message on standard input and writes the answer on

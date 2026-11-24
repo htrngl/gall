@@ -8,7 +8,7 @@ func copy(_ s: String) {
     NSPasteboard.general.setString(s, forType: .string)
 }
 
-@main struct GallApp: App {
+struct GallApp: App {
     @StateObject var m = Gall()
 
     var body: some Scene {

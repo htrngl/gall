@@ -1,0 +1,9 @@
+#!/bin/sh
+# send FILE [caption]: a file to the telegram chat of the message that
+# runs. the agent calls it; the bridge in the app uploads what it files in
+# $GALL_OUT (a chat id, a path and a caption) and tries again if it must
+[ -f "$1" ] && [ "$GALL_OUT" ] || { echo "usage: send FILE [caption]" >&2
+  exit 1; }
+f=$(cd "$(dirname "$1")" && pwd)/${1##*/} t=$GALL_OUT/$(date +%s)-$$
+printf '%s\n%s\n%s' "$GALL_CHAT" "$f" "$2" >"$t.tmp" && mv "$t.tmp" "$t.file" &&
+  echo "sent ${1##*/}"

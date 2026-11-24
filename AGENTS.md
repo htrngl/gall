@@ -17,7 +17,7 @@ Parallel agents divide the work by area. Two agents do not edit one file.
 | --- | --- |
 | Engine and server | `src/serve.rs`, `src/up.rs` (and the other `src/` files) |
 | Menu bar app (Swift) | `mac/Package.swift`, `mac/Sources/Gall/*.swift` |
-| Bundle and release | `mac/build`, `mac/bridge`, `mac/Info.plist`, `mac/gall.entitlements`, `.gitignore` |
+| Bundle and release | `mac/build`, `mac/send`, `mac/test`, `mac/Info.plist`, `mac/gall.entitlements`, `.gitignore` |
 | Documentation | `README.md`, `AGENTS.md`, `docs/`, `tools/README.md` |
 
 The app runs its bundled `gall` (`up`, `down`, `model`) and reads
@@ -48,11 +48,17 @@ Gall is for a person at their own Mac. The app runs as the user, with no
 root and no daemons. Server use (always on, no login, no sleep) belongs in
 a separate wrapper script that runs `gall up` or `gall serve`.
 
-The Telegram bridge is `mac/bridge`, a shell script in
-`Contents/Resources`. The app runs it while the `bridge` setting is on
-and kills its process group when the setting goes off or the app quits.
-It reads `~/.config/gall/bridge` and pipes each message through
-`AGENT` (`sh -c`), by default hax as a llama.cpp client of the server.
+The Telegram bridge is `mac/Sources/Gall/Bridge.swift`, in the app
+while the `bridge` setting is on; `GallMenu bridge` runs it alone. A
+poller files each message in `~/.cache/gall/bridge/in`, a worker pipes
+them through `AGENT` (`sh -c`, in its own process group), by default hax
+as a llama.cpp client of the server, and a sender drains `out` and
+tries again until Telegram takes an entry. The update offset is saved
+before a message is filed, so a message runs at most once. The agent
+sends a file with `mac/send` (in `Contents/Resources`, on its `PATH`),
+which files an entry in `out`; the bot token is not in the agent's
+environment. `mac/test` runs the bridge against a stub of Telegram
+(`TELEGRAM_API`) and of the server (`GALL_URL`) in a temporary home.
 While the bridge runs, the app holds a `PreventUserIdleSystemSleep`
 assertion (the system drops it if the app dies) and sets the root
 domain's clamshell-sleep-disable bit (`kPMSetClamshellSleepState`, no
@@ -67,10 +73,9 @@ the `com.apple.powermanagement.systempowerstate` notification reports
 sudoers rule in `/etc/sudoers.d/gall`, installed with an administrator
 prompt, allows only that command. On a dark wake, the app sets the
 clamshell bit, declares user activity (a full wake: on battery no
-assertion holds a dark wake) and kills the stale long poll. It clears
+assertion holds a dark wake) and cancels the stale long poll. It clears
 the bit, and the Mac sleeps, 30 s after a wake or 2 minutes after a
-message. The bridge keeps `~/.cache/gall/bridge.run` while a message
-runs.
+message (`Bridge.busy`).
 
 ## Model lock
 
