@@ -470,13 +470,15 @@ impl Model {
         // an ops.metal kernel
         macro_rules! k {
             ($n:expr, $g:expr, $th:expr, $($p:expr),*) => {{
-                let mut p = [0u32; 32];
+                let mut p = [0u32; 33];
                 let v = [$($p as u32),*];
                 p[..v.len()].copy_from_slice(&v);
-                p[23] = self.rs() as u32;
-                p[24..].copy_from_slice(&tz);
+                (p[23], p[32]) = (self.rs() as u32, nz as u32);
+                p[24..32].copy_from_slice(&tz);
                 let (pipe, mut g): (_, [usize; 3]) = (&pz[$n], $g);
-                g[2] = nz;
+                // these take every row in one threadgroup (ops.metal ZR)
+                let one = ["low", "ctl", "rows", "post"].contains(&$n);
+                g[2] = if one { 1 } else { nz };
                 ops.push(($n, vi, Box::new(move |e: &Enc| {
                     let b = [&self.a, &self.s, &self.kv, &self.cs, &self.id, &self.sh,
                         &self.k8];
@@ -585,17 +587,14 @@ impl Model {
             let ((idx, nk, tau), nkm) = (at(pos), at(pos + nz - 1).1);
             (0..nz).for_each(|z| tz[z] = at(pos + z).2.to_bits());
             let (cs, kv) = (slot * CS, self.kvo[slot]);
-            // ZR: the cache row follows from the ring size, and a first
-            // run only stores the conv inputs
+            // ZR: the cache row follows from the ring size
             let (kw, ring) = match nz {
                 1 => (kv + idx * 2048, 0),
                 _ => (kv, if l.swa { SW } else { 0 }),
             };
-            for so in [2, 0].into_iter().skip((nz == 1) as usize) {
-                k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd,
-                    l.vd, cs, kw, f32::to_bits(tau), self.hp[0].to_bits(),
-                    self.hp[1].to_bits(), pos, VR, nx, X, IS, l.sink, SK, so, ring);
-            }
+            k!("post", [24, 1, 1], 576, Q, K, R, l.qc, l.rc, l.kc, l.vc, l.kd, l.vd,
+                cs, kw, f32::to_bits(tau), self.hp[0].to_bits(), self.hp[1].to_bits(),
+                pos, VR, nx, X, IS, l.sink, SK, ring);
             let ng = nkm.div_ceil(128);
             let nm = self.n_ctx.max(1024) + 256;
             let (mx, gm, pa) = (PT + 24 * nm, PT + 27 * nm, PT + 27 * nm + 48);

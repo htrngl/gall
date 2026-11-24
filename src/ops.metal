@@ -32,28 +32,31 @@ typedef const device uint *U;
 typedef device float *A;
 typedef const device float *S;
 typedef const device half *SH; // the larger small matrices, f16
-// ZR: the rows of a batched pass (dr.rs) on grid z. row z has its
+// ZR: the rows of a batched pass (dr.rs) on grid z, row z. row z has its
 // activations p[23] floats after row 0's, its ids 16 after, position + z.
-// a conv input is in the ring before any row reads it (stor, and post
-// run twice: p[21] set only stores)
+// a conv input is in the ring before any row reads it (stor; post stores
+// first). low, ctl, rows and post take every row (p[32]) in one
+// threadgroup, so a weight is read once for all
 #ifdef ZR
-#define ZA a += gp.z * p[23]
+#define ZA uint z = gp.z; a += z * p[23]
 #define ZI id += gp.z * 16
-#define PZ(i) (p[i] + gp.z)
-#define NK (p[6] ? min(p[4] + gp.z, 1024u) : p[4] + gp.z)
-#define SO p[21]
+#define PZ(i) (p[i] + z)
+#define NK (p[6] ? min(p[4] + z, 1024u) : p[4] + z)
 #define ST false
-#define TAU F(24 + gp.z)
-#define KW (p[10] + (p[22] ? PZ(14) % p[22] : PZ(14)) * 2048)
+#define TAU F(24 + z)
+#define KW (p[10] + (p[21] ? PZ(14) % p[21] : PZ(14)) * 2048)
+#define NZ p[32]
+#define NZM 8
 #else
 #define ZA
 #define ZI
 #define PZ(i) p[i]
 #define NK p[4]
-#define SO 0
 #define ST true
 #define TAU F(11)
 #define KW p[10]
+#define NZ 1
+#define NZM 1
 #endif
 
 // sum of v over a threadgroup of T; r is its scratch, one per sum
@@ -138,18 +141,23 @@ kernel void elem(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
 // p: 0 v, 1 msg, 2 ctl, 3 g
 kernel void low(U p [[buffer(0)]], A a [[buffer(1)]],
                 SH s [[buffer(6)]], TG) {
-  threadgroup float r[NS], q[NS];
-  ZA;
-  float4 v = L(a + p[0] + gp.y * N, t), m = L(a + p[1] + gp.y * N, t);
+  threadgroup float r[NZM][NS], q[NZM][NS];
   SH w = s + p[2] + gp.y * 256 * N + gp.x * 2 * N;
   bool n = gp.x > 63;
-  float x = simd_sum(dot(m, n ? m : LH(w, T + t)));
-  if (!ln) q[sg] = x;
-  x = red(dot(v, n ? v : LH(w, t)), r, sg, ln);
-  if (t) return;
-  A g = a + p[3] + gp.y * 130 + (n ? 128 : gp.x);
-  g[0] = x;
-  for (uint i = x = 0; i < NS; i++) x += q[i];
+  float4 wv = LH(w, t), wm = LH(w, T + t);
+  for (uint z = 0; z < NZ; z++) {
+    A b = a + z * p[23];
+    float4 v = L(b + p[0] + gp.y * N, t), m = L(b + p[1] + gp.y * N, t);
+    float x = simd_sum(dot(m, n ? m : wm)), y = simd_sum(dot(v, n ? v : wv));
+    if (!ln) q[z][sg] = x, r[z][sg] = y;
+  }
+  BAR;
+  if (t >= NZ) return;
+  float x = 0, y = 0;
+  for (uint i = 0; i < NS; i++) y += r[t][i];
+  for (uint i = 0; i < NS; i++) x += q[t][i];
+  A g = a + t * p[23] + p[3] + gp.y * 130 + (n ? 128 : gp.x);
+  g[0] = y;
   g[n ? 1 : 64] = x;
 }
 
@@ -159,73 +167,96 @@ kernel void low(U p [[buffer(0)]], A a [[buffer(1)]],
 // p: 0 v, 1 msg, 2 ctl, 3 g, 4 x, 5.. w
 kernel void ctl(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                 SH sh [[buffer(6)]], GP) {
-  ZA;
   uint e = gp.x * 2 + ln / 16, k = ln % 16;
-  S g = a + p[3] + gp.y * 130;
   SH w = sh + p[2] + gp.y * 256 * N + 128 * N + e * 64;
-  float2 n = rsqrt(float2(g[128], g[129]) / N + 1e-6);
-  float4 x = n.x * L(g, k) + n.y * L(g, 16 + k);
-  float o = dot(x, LH(w, k)), f = dot(x, LH(w, 16 * N + k));
-  for (uint d = 8; d; d /= 2)
-    o += simd_shuffle_xor(o, d), f += simd_shuffle_xor(f, d);
-  if (k) return;
-  A v = a + p[0] + gp.y * N + e;
-  *v += tanh(o) * a[p[1] + gp.y * N + e] - tanh(f) * *v;
-  a[p[4] + gp.y * N + e] = *v * s[p[5 + gp.y] + e];
+  float4 wo = LH(w, k), wf = LH(w, 16 * N + k);
+  for (uint z = 0; z < NZ; z++) {
+    A b = a + z * p[23];
+    S g = b + p[3] + gp.y * 130;
+    float2 n = rsqrt(float2(g[128], g[129]) / N + 1e-6);
+    float4 x = n.x * L(g, k) + n.y * L(g, 16 + k);
+    float o = dot(x, wo), f = dot(x, wf);
+    for (uint d = 8; d; d /= 2)
+      o += simd_shuffle_xor(o, d), f += simd_shuffle_xor(f, d);
+    if (k) continue;
+    A v = b + p[0] + gp.y * N + e;
+    *v += tanh(o) * b[p[1] + gp.y * N + e] - tanh(f) * *v;
+    b[p[4] + gp.y * N + e] = *v * s[p[5 + gp.y] + e];
+  }
 }
 
 // router logits y[r] = W[r] . x, one threadgroup per row; row 128 is
 // v . v, for the rms scale of x. p: 0 x, 1 W, 2 y, 3 v
 kernel void rows(U p [[buffer(0)]], A a [[buffer(1)]],
                  SH s [[buffer(6)]], TG) {
-  threadgroup float r[NS];
-  ZA;
-  float4 x = L(a + p[gp.x < 128 ? 0 : 3], t);
-  float o = red(dot(gp.x < 128 ? LH(s + p[1] + gp.x * N, t) : x, x), r, sg, ln);
-  if (!t) a[p[2] + gp.x] = o;
+  threadgroup float r[NZM][NS];
+  float4 w = gp.x < 128 ? LH(s + p[1] + gp.x * N, t) : 0;
+  for (uint z = 0; z < NZ; z++) {
+    float4 x = L(a + z * p[23] + p[gp.x < 128 ? 0 : 3], t);
+    float o = simd_sum(dot(gp.x < 128 ? w : x, x));
+    if (!ln) r[z][sg] = o;
+  }
+  BAR;
+  if (t >= NZ) return;
+  float o = 0;
+  for (uint i = 0; i < NS; i++) o += r[t][i];
+  a[t * p[23] + p[2] + gp.x] = o;
 }
 
 // after the projections, one threadgroup per q head: rms scales of the
 // inputs v, sink, clips, conv on k and v (v follows k in a), rms; stores
-// k, v. the scales and rows are sums over T, the head work is simdgroup 0
+// k, v. the scales and rows are sums over T, the head work of row z is
+// simdgroup z
 // p: 0 q, 1 k, 2 rel, 3 q clip, 4 rel clip, 5 k conv, 6 v conv,
 // 7 k taps, 8 v taps (0: none), 9 conv state, 10 kv write (halfs), 11 tau,
 // 12 qk clip, 13 rel clip, 14 pos, 15 v, 16 nx, 17 x, 18 q scale out,
-// 19 sink w, 20 sink out
+// 19 sink w, 20 sink out, 21 ring
 kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                  device half *kv [[buffer(3)]], A cs [[buffer(4)]],
                  SH sh [[buffer(6)]], TG) {
-  threadgroup float r[12 * NS];
-  ZA;
-  uint h = gp.x, i = h * 128 + ln * 4, nx = p[16];
+  threadgroup float r[NZM * 12 * NS];
+  uint h = gp.x, i = h * 128 + ln * 4, nx = p[16], z = sg;
   bool dy = p[7] && h < 8;
   float o[12];
-  for (uint j = 0; j < (h < 8 ? 3 : 1); j++) {
-    float4 v = L(a + p[15] + min(j, nx - 1) * N, t);
-    o[j] = dot(v, v);
-  }
-  o[3] = dot(LH(sh + p[19] + h * N, t), L(a + p[17], t));
+  float4 w[9];
+  w[0] = LH(sh + p[19] + h * N, t);
   for (uint k = 0; k < 8 && dy; k++)
-    o[4 + k] = dot(LH(sh + p[7 + k / 4] + (h * 4 + 3 - k % 4) * N, t),
-                   L(a + p[17] + (1 + k / 4) * N, t));
-  for (uint k = 0; k < (dy ? 12 : 4); k++) {
-    o[k] = simd_sum(o[k]);
-    if (!ln) r[k * NS + sg] = o[k];
+    w[1 + k] = LH(sh + p[7 + k / 4] + (h * 4 + 3 - k % 4) * N, t);
+  for (uint z = 0; z < NZ; z++) {
+    A b = a + z * p[23];
+    for (uint j = 0; j < (h < 8 ? 3 : 1); j++) {
+      float4 v = L(b + p[15] + min(j, nx - 1) * N, t);
+      o[j] = dot(v, v);
+    }
+    o[3] = dot(w[0], L(b + p[17], t));
+    for (uint k = 0; k < 8 && dy; k++)
+      o[4 + k] = dot(w[1 + k], L(b + p[17] + (1 + k / 4) * N, t));
+    for (uint k = 0; k < (dy ? 12 : 4); k++) {
+      o[k] = simd_sum(o[k]);
+      if (!ln) r[(z * 12 + k) * NS + sg] = o[k];
+    }
   }
   BAR;
-  if (sg) return;
-  for (uint k = 0; k < (dy ? 12 : 4); k++)
-    for (uint j = o[k] = 0; j < NS; j++) o[k] += r[k * NS + j];
+  a += z * p[23];
+  for (uint k = 0; k < (dy ? 12 : 4) && z < NZ; k++)
+    for (uint j = o[k] = 0; j < NS; j++) o[k] += r[(z * 12 + k) * NS + j];
   float3 is = rsqrt(float3(o[0], o[1], o[2]) / N + 1e-6);
+#ifdef ZR
+  for (uint j = 0; j < 2 && h < 8 && z < NZ; j++)
+    W(cs + p[9] + i + j * 1024 + PZ(14) % CR * CH, 0) =
+        L(a + p[1] + i + j * 1024, 0) * is[1 + j];
+  threadgroup_barrier(mem_flags::mem_device);
+#endif
+  if (z >= NZ) return;
   if (!ln) a[p[20] + h] = o[3] * is.x;
   if (!h && !ln) a[p[18]] = is.x;
   float4 x = L(a + p[0] + i, 0) * L(s + p[3] + i, 0) * is.x;
   x *= TAU / max(1., (sqrt(simd_sum(dot(x, x))) + 1e-6) / F(12));
-  if (!SO) W(a + p[0] + i, 0) = x;
+  W(a + p[0] + i, 0) = x;
   float y = ln < 16 ? a[p[2] + h * 16 + ln] * s[p[4] + h * 16 + ln] : 0;
   y *= is.x;
   y *= TAU / max(1., (sqrt(simd_sum(y * y)) + 1e-6) / F(13));
-  if (ln < 16 && !SO) a[p[2] + h * 16 + ln] = y;
+  if (ln < 16) a[p[2] + h * 16 + ln] = y;
   if (h > 7) return;
   for (uint j = 0; j < 2; j++) {
     float4 d = 0;
@@ -233,8 +264,7 @@ kernel void post(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                        o[7 + j * 4]) * is[1 + j];
     uint c = i + j * 1024;
     x = conv(L(a + p[1] + c, 0) * is[1 + j], cs + p[9] + c,
-             s + p[5 + j] + i * 4, PZ(14), d, SO || ST);
-    if (SO) continue;
+             s + p[5 + j] + i * 4, PZ(14), d, ST);
     y = simd_sum(dot(x, x));
     x *= j ? rsqrt(y / 128 + 1e-6) : 1 / max(1., (sqrt(y) + 1e-6) / F(12));
     W(a + p[1] + c, 0) = x;
