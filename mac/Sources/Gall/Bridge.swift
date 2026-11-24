@@ -291,8 +291,12 @@ func json(_ s: (any StringProtocol)?) -> [String: Any] {
         if pid == 0 { why = "could not start the agent in \(work.path)" }
         let s = pid == 0 ? 0 : await wait(pid)
         w.cancel()
+        // a run that did not start leaves the conversation as it was
+        if pid != 0 {
+            try? chat.write(to: at("cont"), atomically: true,
+                            encoding: .utf8)
+        }
         pid = 0
-        try? chat.write(to: at("cont"), atomically: true, encoding: .utf8)
         say(chat, why ?? (s == 0 ? text(at("ans")) : text(at("ans"))
             + text(at("err")).split(separator: "\n")
             .filter { !$0.hasPrefix("resume with") }.suffix(4)
