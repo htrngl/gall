@@ -52,11 +52,18 @@ static inline float2 k4(W sc, uint j) {
 #define DOTU(v) DOT8(as_type<uchar4>(v.x), as_type<uchar4>(v.y))
 #define SX (dot(xa, 1) + dot(xb, 1))
 
+// the bytes of a word as subnormal halves: their values 2^-24
+#define HU(v) hd4(as_type<half2>((v) & 0x00ff00ff), \
+                  as_type<half2>((v) >> 8 & 0x00ff00ff))
+static inline float4 hd4(half2 a, half2 b) {
+    return float4(a.x, b.x, a.y, b.y);
+}
+
 UNIT(q4_k) {
     uint j = e/4;
     float2 d = D2*k4(b + 4, j);
     uint2 q = (U2(b + 16 + 32*(j/2) + 8*(e%4)) >> 4*(j & 1)) & 0x0f0f0f0f;
-    return d.x*DOTU(q) - d.y*SX;
+    return d.x*0x1p24f*DOT8(HU(q.x), HU(q.y)) - d.y*SX;
 }
 
 UNIT(q5_k) {
@@ -65,13 +72,6 @@ UNIT(q5_k) {
     uint2 q = ((U2(b + 48 + 32*(j/2) + o) >> 4*(j & 1)) & 0x0f0f0f0f) |
               (((U2(b + 16 + o) >> j) & 0x01010101) << 4);
     return d.x*DOTU(q) - d.y*SX;
-}
-
-// the bytes of a word as subnormal halves: their values 2^-24
-#define HU(v) hd4(as_type<half2>((v) & 0x00ff00ff), \
-                  as_type<half2>((v) >> 8 & 0x00ff00ff))
-static inline float4 hd4(half2 a, half2 b) {
-    return float4(a.x, b.x, a.y, b.y);
 }
 
 // q5_k mat-vecs: units 2j, 2j + 1, inputs x0..x3, one scale decode for
