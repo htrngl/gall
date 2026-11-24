@@ -118,52 +118,57 @@ UNIT(nvfp4) {
     return d*DOT8(LUT4(k_fp4, v0), LUT4(k_fp4, v1));
 }
 
-// 8 grid magnitudes with 8 sign bits, times x
-#define SGN(v, sg, m) select(float4(v), -float4(v), (uint4(sg) & m) != 0)
-#define M0 uint4(1, 2, 4, 8)
-#define M1 uint4(16, 32, 64, 128)
-#define GDOT(g0, g1, sg) \
-    DOT8(SGN(as_type<uchar4>(uint(g0)), sg, M0), SGN(as_type<uchar4>(uint(g1)), sg, M1))
+// 8 grid magnitudes with 8 sign bits, times x 2^-24. as a subnormal half
+// a byte b is b 2^-24, exactly, and a sign is bit 15: a word of the grid
+// gives the halves of its bytes 0, 2 and 1, 3, and one multiply spreads
+// sign bit i to bits 10 + i and 24 + i. the 2^24 is in the scales
+static inline float4 hd4(half2 a, half2 b) {
+    return float4(a.x, b.x, a.y, b.y);
+}
+#define HB(g, t, c) \
+    as_type<half2>(((g) & 0x00ff00ff) | ((t) << (c) & 0x80008000))
+#define H4(g, t, c, d) hd4(HB(g, t, c), HB((g) >> 8, t, d))
+#define GDOT(g0, g1, sg) DOT8(H4(uint(g0), (sg)*0x01000400, 5, 4), \
+                              H4(uint(g1), (sg)*0x01000400, 1, 0))
 
-// the iq2 grids are tables of 8-byte rows, which run slowly from the
-// constant cache: G is the table, and the mat-vecs below use a copy in
-// threadgroup memory (tgg), with 4 simdgroups per threadgroup
+// the grids run slowly from the constant cache: G is the table, and the
+// mat-vecs below use a copy in threadgroup memory (tgg), with 4
+// simdgroups per threadgroup
 #define IQ2XXS(G) \
     uint ib = e/4, l = e%4; \
     H a = (H)(b + 2 + 8*ib); \
     uint aux = a[2] | (uint(a[3]) << 16); \
     ulong g = G[b[2 + 8*ib + l]]; \
     uint sg = ksigns_iq2xs[(aux >> 7*l) & 127]; \
-    return F16(b)*(0.5f + (aux >> 28))*0.25f*GDOT(g, g >> 32, sg);
+    return F16(b)*(0.5f + (aux >> 28))*0x1p22f*GDOT(g, g >> 32, sg);
 #define IQ2XS(G) \
     uint q = ((H)(b + 2))[e]; \
     ulong g = G[q & 511]; \
     uint sg = ksigns_iq2xs[q >> 9]; \
     float ls = (b[66 + e/4] >> 4*((e%4)/2)) & 15; \
-    return F16(b)*(0.5f + ls)*0.25f*GDOT(g, g >> 32, sg);
+    return F16(b)*(0.5f + ls)*0x1p22f*GDOT(g, g >> 32, sg);
 #define IQ2S(G) \
     ulong g = G[b[2 + e] | (((b[66 + e/4] >> 2*(e%4)) & 3) << 8)]; \
     uint sg = b[34 + e]; \
     float ls = (b[74 + e/4] >> 4*((e%4)/2)) & 15; \
-    return F16(b)*(0.5f + ls)*0.25f*GDOT(g, g >> 32, sg);
-#define IQ2(F, B, T) UNIT(F) { B(T) } \
+    return F16(b)*(0.5f + ls)*0x1p22f*GDOT(g, g >> 32, sg);
+#define IQ3XXS(G) \
+    uint ib = e/4, l = e%4; \
+    H a = (H)(b + 66 + 4*ib); \
+    uint aux = a[0] | (uint(a[1]) << 16), q = ((H)b)[1 + e]; \
+    uint sg = ksigns_iq2xs[(aux >> 7*l) & 127]; \
+    return F16(b)*(0.5f + (aux >> 28))*0x1p23f* \
+           GDOT(G[q & 255], G[q >> 8], sg);
+#define GR(F, B, T, ty) UNIT(F) { B(T) } \
     static inline float t_##F(W b, uint e, float4 xa, float4 xb, \
-        threadgroup const ulong *G) { B(G) }
-IQ2(iq2_xxs, IQ2XXS, iq2xxs_grid)
-IQ2(iq2_xs, IQ2XS, iq2xs_grid)
-IQ2(iq2_s, IQ2S, iq2s_grid)
-#define TGG(T, N) threadgroup ulong tgg[N]; \
+        threadgroup const ty *G) { B(G) }
+GR(iq2_xxs, IQ2XXS, iq2xxs_grid, ulong)
+GR(iq2_xs, IQ2XS, iq2xs_grid, ulong)
+GR(iq2_s, IQ2S, iq2s_grid, ulong)
+GR(iq3_xxs, IQ3XXS, iq3xxs_grid, uint)
+#define TGG(T, N, ty) threadgroup ty tgg[N]; \
     for (uint i = ti; i < N; i += tn) tgg[i] = T[i]; \
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-UNIT(iq3_xxs) {
-    uint ib = e/4, l = e%4;
-    H a = (H)(b + 66 + 4*ib);
-    uint aux = a[0] | (uint(a[1]) << 16), q = ((H)b)[1 + e];
-    uint sg = ksigns_iq2xs[(aux >> 7*l) & 127];
-    return F16(b)*(0.5f + (aux >> 28))*0.5f*
-           GDOT(iq3xxs_grid[q & 255], iq3xxs_grid[q >> 8], sg);
-}
 
 // both nibbles of 4 bytes: xa and xb are the inputs of the low and the
 // high nibbles, at elements xo_<fmt>(e) and that + NH of the group
@@ -178,12 +183,17 @@ NIB(iq4_nl) {
 }
 
 static inline uint xo_nvfp4(uint e) { return 8*(e & ~1u) + 4*(e & 1); }
+// an e2m1 nibble as the bits 9-11 and 15 of a half is its value 2^-14
+// (the 2^14 is in the scale): F4(q, s) is nibble s/4 of bytes 0 and 2
+#define F4(q, s) as_type<half2>((((q) >> (s)) << 9 & 0x0e000e00) | \
+                                (((q) >> (s)) << 12 & 0x80008000))
 NIB(nvfp4) {
     W a = b + (e/8)*36;
-    uint c = a[e%8/2];
-    uint4 q = uint4(*(Q)(a + 4 + 4*(e%8)));
-    float d = c == 127 ? 0 : (float)as_type<half>((ushort)((c & 127) << 7))*256;
-    return d*NDOT(k_fp4, q);
+    uint c = a[e%8/2], q = *(device const uint *)(a + 4 + 4*(e%8));
+    float d = c == 127 ? 0 :
+        (float)as_type<half>((ushort)((c & 127) << 7))*0x1p22f;
+    return d*(dot(hd4(F4(q, 0), F4(q, 8)), xa) +
+              dot(hd4(F4(q, 4), F4(q, 12)), xb));
 }
 
 #define ACCN(F, NH, R, w0, x) \
@@ -292,13 +302,15 @@ KERNELS(q6_k, R(2))
 #define u_iq2_xxs(b, e, xa, xb) t_iq2_xxs(b, e, xa, xb, tgg)
 #define u_iq2_xs(b, e, xa, xb) t_iq2_xs(b, e, xa, xb, tgg)
 #define u_iq2_s(b, e, xa, xb) t_iq2_s(b, e, xa, xb, tgg)
-KERNELS_(iq2_xxs, R(8), ACC, TGG(iq2xxs_grid, 256))
-KERNELS_(iq2_xs, R(4), ACC, TGG(iq2xs_grid, 512))
-KERNELS_(iq2_s, R(8), ACC, TGG(iq2s_grid, 1024))
+#define u_iq3_xxs(b, e, xa, xb) t_iq3_xxs(b, e, xa, xb, tgg)
+KERNELS_(iq2_xxs, R(8), ACC, TGG(iq2xxs_grid, 256, ulong))
+KERNELS_(iq2_xs, R(4), ACC, TGG(iq2xs_grid, 512, ulong))
+KERNELS_(iq2_s, R(8), ACC, TGG(iq2s_grid, 1024, ulong))
+KERNELS_(iq3_xxs, R(8), ACC, TGG(iq3xxs_grid, 256, uint))
 #undef u_iq2_xxs
 #undef u_iq2_xs
 #undef u_iq2_s
-KERNELS(iq3_xxs, R(8))
+#undef u_iq3_xxs
 KERNELS_(iq4_nl, R(2), ACC16, )
 KERNELS_(nvfp4, R(2), ACC8, )
 

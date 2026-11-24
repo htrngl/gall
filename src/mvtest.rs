@@ -90,6 +90,9 @@ pub fn main() {
             nrm = nrm.max(v.abs());
         }
         let nan = ys[..n_y].iter().filter(|v| v.is_nan()).count();
+        // a hash of the output bits: equal hashes, identical results
+        let h = ys[..n_y].iter().fold(0u64, |h, v| (h ^ v.to_bits() as u64)
+            .wrapping_mul(0x100000001b3));
         // time over every tensor of this type and shape, expert sets cycling
         let all: Vec<_> = g.t.values().filter(|o| o.ty == t.ty && o.dims == t.dims).collect();
         let reps = (1.5e9 / (rows * rb) as f64).ceil().max(64.) as usize;
@@ -118,7 +121,7 @@ pub fn main() {
         let s = run().min(run()) / reps as f64;
         let kind = ["", "", "mv", if up { "up" } else { "down" }][t.dims.len()];
         println!(
-            "{:8} {kind:4} {n_in:5}x{n_out:<6} {:6.1} MB {:7.3} ms {:5.1} GB/s {:5.1} G w/s  err {:.1e}{}  {}",
+            "{:8} {kind:4} {n_in:5}x{n_out:<6} {:6.1} MB {:7.3} ms {:5.1} GB/s {:5.1} G w/s  err {:.1e}{} {h:016x}  {}",
             mv::name(t.ty),
             (rows * rb) as f64 / 1e6,
             s * 1e3,

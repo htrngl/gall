@@ -23,7 +23,7 @@ pub const SRC: &str = concat!(
 struct P(u32, u32, u32, u32); // n_in, n_out, row bytes, experts
 
 // (type, name, rows per simdgroup as in mv.metal, simdgroups per
-// threadgroup: 4 for the iq2 formats, which copy their grids to
+// threadgroup: 4 for the grid formats, which copy their grids to
 // threadgroup memory)
 const TY: [(u32, &str, usize, usize); 12] = [
     (0, "f32", 2, 1),
@@ -35,7 +35,7 @@ const TY: [(u32, &str, usize, usize); 12] = [
     (16, "iq2_xxs", 8, 4),
     (17, "iq2_xs", 4, 4),
     (22, "iq2_s", 8, 4),
-    (18, "iq3_xxs", 8, 1),
+    (18, "iq3_xxs", 8, 4),
     (20, "iq4_nl", 2, 1),
     (40, "nvfp4", 2, 1),
 ];
