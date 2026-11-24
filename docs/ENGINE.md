@@ -204,6 +204,69 @@ Prefill uses half-precision matrix tiles, as the reference llama.cpp build
 does. The `HT` setting in `pfm.metal` selects float precision at about 80%
 of that speed.
 
+### Prefill floor
+
+`PROF=1 gall pp MODEL TOKENS` runs each prefill dispatch in its own
+command buffer. It prints GPU ms, weight bytes, tile multiply-adds (MACs)
+and real MACs by kind. The table is from one such run on 24 November
+2026: the first 2,048 tokens of `ref/2k`, 4 passes of 512 rows, on a
+warm machine shared with other jobs. The dispatches sum to 9.25 ms a
+token; plain `pp` runs at that time gave 8–10 ms a token (100–133
+tokens/s). The byte floor is the distinct weight bytes of each pass at
+87 GB/s. The arithmetic floor is the real MACs at 1.79 T MAC/s (10 cores
+x 128 lanes at 1.4 GHz).
+
+| Part of a token | GPU ms | Bytes floor | Arithmetic floor |
+| --- | ---: | ---: | ---: |
+| IQ3_XXS experts | 1.80 | 0.14 | 0.69 |
+| NVFP4 experts | 1.53 | 0.16 | 0.52 |
+| IQ2_S experts | 1.05 | 0.08 | 0.40 |
+| IQ4_NL, IQ2_XS and IQ2_XXS experts | 0.26 | 0.02 | 0.10 |
+| All experts | 4.65 | 0.40 | 1.71 |
+| Q8_0 attention | 1.22 | 0.03 | 0.58 |
+| Q4_K, Q5_K and Q6_K | 0.49 | 0.004 | 0.14 |
+| Small f16 matrices | 0.21 | 0.003 | 0.04 |
+| Attention scores (`attn`) | 0.98 | | |
+| Relative bias (`relb`) | 0.23 | | |
+| Other small kernels | 1.48 | | |
+
+The other small kernels are, in ms a token: prep 0.56, mid 0.28, ctl
+0.22, msg 0.16, act 0.08, dsum 0.05, top 0.05, post 0.03, fin 0.03, end
+0.01. Prefill is limited by arithmetic, not by memory: the weight
+kernels run at 40–55% of the FMA rate, and bytes are under 10% of the
+time. Padding adds 10% to the expert MACs.
+
+Expert rows in the same run: 110.6 distinct experts a visit, 37 rows an
+expert, 0.91 of the 8-column tiles and 0.66 of the 32-column tiles
+filled. The CPU sorts the (token, k) pairs by expert after each visit,
+as `uni` does on the GPU for passes.
+
+`gall mmb` times the tile kernels on random bytes, with no model. With
+constant weights in place of the decode, a 32-column tile ran Q8_0 at
+1,058 against 996 G MAC/s, IQ3_XXS at 1,044 against 922 and NVFP4 at
+1,041 against 838. So the decode takes 6–20% of a tile, and the
+multiply, at 59% of the FMA rate, takes the rest.
+
+These changes kept the output bits (`gall check` on `ref/2k` and
+`ref/8k.b256` with `-ub 1`: no greedy mismatch, kl 1.09e-3 and 1.30e-3,
+equal to the present kernels) but were dropped:
+
+- 64-column tiles, so a weight tile is decoded once for 64 rows of the
+  batch, not 32. Interleaved in one process, on a 512-column Q8_0
+  matrix: 1,129 to 1,197 G MAC/s; IQ3_XXS gate_up on 110 slabs of 40
+  columns: 688 to 827; NVFP4 down: 596 to 690; a 128-row f16 matrix:
+  723 to 661. In `pp` on 2,048 tokens, interleaved, the present kernels
+  gave 133.1, 125.1 and 99.7 tokens/s and the 64-column tiles 118.3,
+  126.6 and 105.8 (median 125.1 against 118.3), so no gain was shown.
+  128-column tiles leave the registers (14–20 G MAC/s).
+- the last visit for only the rows that feed the conv ring (the last 19
+  rows, to a tile), without a drafter tap. With 64-column tiles: 115.6,
+  120.1 and 107.0 tokens/s in the same series.
+- batch size: with 64-column tiles, two interleaved rounds gave 123.6
+  and 108.0 tokens/s at `ub` 256, 131.8 and 115.2 at 512, 128.9 and
+  130.2 at 1024. This does not separate 512 from 1024, so `ub` stays
+  512.
+
 ## Long-context attention
 
 At longer contexts, KV reads limit performance at about 85 GB/s. The eight
