@@ -102,6 +102,34 @@ decode rates by format, G weights/s before and after: IQ3_XXS 142 ->
 - the small-kernel chain runs about 3 ms over its floor.
 - cooling: throughput falls 10% after 2.5 minutes; a thermal pad to the
   case or a cooled stand keeps the cool rate.
+- long copies at prefill cost: verify 32-64 copied tokens in one
+  prefill-shaped batch (9.25 ms a row against 16.9 in an 8-row pass). on
+  a code edit 82.6% of output tokens are in copy runs of 16+ and 59.4%
+  in runs of 64+ (`tools/runs.py`); on a quote rewrite 22.5% and none.
+- drafts under sampling: proposals are argmax, so a sampled request
+  keeps few. gumbel noise shared by the sampler and the drafter would
+  keep them and leave the sample the model's own. hax sends no sampler
+  fields (the model file's temperature 1.0 applies), so its provider is
+  set to temperature 0 in `~/.config/hax/config.json`.
+- `tools/long.py` (10 tool turns to 52.6k tokens) has run on the dummy
+  server only. the hold after `tool_calls` and the first step after a
+  restore (463-533 ms against 52-60, the int8 rebuild under a quarter of
+  it) are not measured on it.
+- drafter context is not saved, so acceptance just after a restore is
+  that of a short context; acceptance against context length is not
+  measured.
+- passes run far over their byte floors (8 rows 141 ms against 67:
+  IQ2_S 25.9 against 9.1, IQ3_XXS 31.1 against 17.0, small ops 19.8),
+  and prefill is arithmetic-bound (experts 4.65 ms a token against 1.71).
+  64-column prefill tiles were faster by kernel (Q8_0 1,129 -> 1,197 G
+  MAC/s, IQ3_XXS 688 -> 827) and not shown faster end to end on a loaded
+  mac; dense Q8_0 and Q6_K as dots at 3 rows (branch `dots3`, 86.0 ->
+  83.5 ms in one process, not shown between processes) likewise. both
+  want a quiet machine.
+- long context: a step gains 19 ms by 29.9k and is unmeasured at 60k;
+  an 8-row pass costs 4.3 steps at 30k against 3.3 at short context.
+- lossy and untried: dropping chosen experts of small gate weight,
+  attention below Q8_0, a two-stage head.
 
 ## ruled out
 
@@ -122,6 +150,15 @@ decode rates by format, G weights/s before and after: IQ3_XXS 142 ->
 - a tree on the second choice: right at the break 0.33 code, 0.38
   maths, 0.24 prose; a branch row returns at most 0.27 tokens against a
   cost of 0.23-0.55, under 0.5% net.
+- snapshot rungs every 4,096 tokens (a rung is 188 MB against 134 MB of
+  rows) and saved int8 rows (553 MB more to read at 30k against a 90 ms
+  rebuild).
+- a cost table by context length: 17.3 tokens/s against 17.7 with the
+  fixed table at 31.5k, one run each.
+- prefill: batches of 256 and 1,024 against 512 (no difference), and
+  the last visit for the last 19 rows only (115.6 against 125.1
+  tokens/s).
+- Q8_0 at 2 rows is at 1.15 reads already (14.4 ms against 12.5).
 - more rows: the conv ring caps a pass at 13 rows; a 13-row build gave
   18.6 ms a token against 19.0 at 8 (2%), dropped.
 - fewer dispatches: fusing dots and elem, rows and top8, or score and
