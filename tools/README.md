@@ -14,7 +14,7 @@ B=llama/src-mix/build/bin
 mkdir -p scratch
 clang++ -std=c++17 -O2 -w -Illama/src-mix/include \
   -Illama/src-mix/ggml/include tools/refdump.cpp -o scratch/refdump \
-  -L$B -lllama -lggml -lggml-base -Wl,-rpath,$PWD/$B
+  -L$B -lllama -lggml -lggml-base -Wl,-rpath,@executable_path/../$B
 M=$(gall model)
 lockf /tmp/gall.lock scratch/refdump "$M" PROMPT.txt OUTDIR \
   [n_gen=64] [n_batch=256] [n_dump=2] [n_logits=65]
