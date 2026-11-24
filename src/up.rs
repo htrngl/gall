@@ -57,8 +57,8 @@ fn sys(k: &str) -> i32 {
 
 // one model fits on the gpu: open the machine lock, park at memory
 // pressure (warn) that lasts 30 s (a load raises it for a moment), and
-// leave when memory stays short for 3 s (a load takes the free level
-// from 79 to 9 for 2 s)
+// leave at 3 s of critical pressure. the free level is no sign: the
+// weights and a long context hold it near 5 at normal pressure
 static FD: AtomicI32 = AtomicI32::new(-1);
 pub fn guard(park: impl Fn() + Send + 'static) {
     let f = fs::File::create("/tmp/gall.lock").unwrap();
@@ -74,7 +74,7 @@ pub fn guard(park: impl Fn() + Send + 'static) {
         }
         thread::sleep(Duration::from_secs(1));
         let f = |c, k| if c { k + 1 } else { 0 };
-        (f(l >= 2, n), f(l >= 4 || free < 6, s))
+        (f(l >= 2, n), f(l >= 4, s))
     }));
 }
 
