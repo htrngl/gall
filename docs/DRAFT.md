@@ -186,6 +186,39 @@ Pass times on 24 November 2026, medians of interleaved runs:
 The convolution ring caps a pass at 13 rows. A 13-row build gave 18.6 ms
 a token against 19.0 ms at 8 rows (2%), and was not kept.
 
+### Floors of a pass
+
+`PROF=1 gall dr ... --tv R` runs each dispatch of a pass in its own
+command buffer and prints its GPU time by kernel, beside a floor: the
+bytes it reads at 87 GB/s. A dense matrix counts once; an expert slab
+counts once for each slab that `uni` placed in the kernel's class. The
+small operations read f16 weights and the cache, which the floor does
+not count. The kernels in their own command buffers sum to within 1.2 ms
+under and 4.4 ms over the pass times that `--tv` gave in the same hour.
+
+GPU ms against the floor, by row count, on 24 November 2026 (medians of 7
+passes of `ref/short`, at about 34 tokens of context). A pass of one row
+is a serial step ([limits](LIMITS.md)).
+
+| Kernels | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q8_0 | 14.4 / 12.5 | 17.3 / 12.5 | 18.3 / 12.5 | 18.2 / 12.5 | 17.7 / 12.5 | 18.2 / 12.5 | 18.8 / 12.5 |
+| Q4_K, Q5_K, Q6_K | 8.7 / 5.7 | 11.7 / 5.7 | 12.1 / 5.7 | 12.4 / 5.7 | 12.8 / 5.7 | 13.2 / 5.7 | 13.7 / 5.7 |
+| IQ3_XXS | 12.2 / 8.6 | 17.0 / 10.9 | 20.1 / 12.4 | 23.3 / 14.6 | 25.4 / 14.7 | 28.0 / 16.4 | 31.1 / 17.0 |
+| NVFP4 | 10.8 / 9.7 | 14.8 / 12.6 | 18.2 / 14.3 | 21.2 / 17.5 | 21.9 / 17.6 | 24.5 / 19.7 | 26.8 / 19.9 |
+| IQ2_S | 8.7 / 4.3 | 12.6 / 5.7 | 15.7 / 6.5 | 19.0 / 8.0 | 20.9 / 8.1 | 23.8 / 9.2 | 25.9 / 9.1 |
+| IQ4_NL | 1.0 / 0.9 | 1.3 / 1.1 | 1.7 / 1.4 | 1.8 / 1.4 | 1.8 / 1.4 | 2.1 / 1.8 | 2.4 / 1.8 |
+| IQ2_XS, IQ2_XXS | 0.9 / 0.4 | 1.2 / 0.6 | 1.5 / 0.8 | 1.8 / 0.9 | 2.1 / 0.9 | 2.5 / 1.2 | 2.7 / 1.2 |
+| Small operations | 8.8 | 10.2 | 11.1 | 12.9 | 15.0 | 16.9 | 19.8 |
+| All | 65.5 / 42.3 | 86.0 / 49.2 | 98.6 / 53.6 | 110.6 / 60.7 | 117.6 / 61.1 | 129.2 / 66.6 | 141.1 / 67.4 |
+
+The largest gaps at 8 rows are the small operations (19.8 ms), IQ2_S
+(16.8 ms over its floor), IQ3_XXS (14.1 ms), the k-quants (8.0 ms, most of
+it the Q5_K head), NVFP4 (6.9 ms) and Q8_0 (6.3 ms). At 2 rows the gaps
+are 1–4 ms a class. Q8_0 at 2 rows costs 1.15 times one read, not twice.
+Load from other programs on the Mac doubled some of these times in an
+earlier run, so compare only runs taken back to back.
+
 ## Choosing when to draft
 
 `Spec` holds the acceptance of a proposed row in 12 probability bins, in

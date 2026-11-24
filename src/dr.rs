@@ -318,7 +318,8 @@ impl Dr {
             let b = [(&m.a, 4 * r * rs), (&self.b, 0)];
             ("tap", Box::new(move |e: &Enc| call(e, &self.pipes["tap"], &p, &b, [72, 1, 1], 32)))
         };
-        let mut gu = 0;
+        // for PROF: q index, bytes of the matrix or of a slab, use class
+        let (mut gu, mut fl) = (0, vec![]);
         for o in &ops {
             let Some((mode, w, x, y)) = o.3.filter(|_| t > 1) else {
                 q.push((o.0, Box::new(move |e: &Enc| o.2(e))));
@@ -338,10 +339,12 @@ impl Dr {
             let b = [m.gpu.w(w), (&m.a, 4 * x), (&m.a, 4 * yy)];
             if mode == "mv" {
                 let n = self.xp[&(w.ty, t.min(3))].2;
+                fl.push((q.len(), w.len, 0));
                 q.push((n, Box::new(move |e: &Enc| self.x(e, w.ty, t, &p, b, None))));
             }
             for k in (1..4).filter(|_| mode != "mv") {
                 let n = self.xp[&(w.ty, k)].2;
+                fl.push((q.len(), w.len / 128, k));
                 q.push((n, Box::new(move |e: &Enc| self.x(e, w.ty, k, &p, b, Some(&self.ui)))));
             }
             if mode == "down" {
@@ -357,13 +360,26 @@ impl Dr {
         }
         inj.iter().for_each(|o| q.push((o.0, Box::new(move |e: &Enc| o.2(e)))));
         if std::env::var("PROF").is_ok_and(|_| t > 1) {
-            // every dispatch in its own command buffer: read as shares
-            let mut by = std::collections::BTreeMap::<_, (usize, f64)>::new();
-            for o in &q {
+            // every dispatch in its own command buffer: read as shares. the
+            // floor: its bytes at 87 GB/s, slabs as uni counted them
+            let mut by = std::collections::BTreeMap::<_, [f64; 3]>::new();
+            let (mut u, mut f) = ([1; 4], fl.iter().peekable());
+            for (i, o) in q.iter().enumerate() {
+                let t = m.gpu.run(|e| o.1(e));
+                if o.0 == "uni" {
+                    let s = slice::<u32>(&self.ut);
+                    for k in 1..4 {
+                        let n = |j| s[(65 * k - 65 + j) * 10 + 1] > 0;
+                        u[k] = (0..65).take_while(|&j| n(j)).count();
+                    }
+                }
+                let b = f.next_if(|x| x.0 == i).map_or(0, |x| x.1 * u[x.2]);
                 let e = by.entry(o.0).or_default();
-                *e = (e.0 + 1, e.1 + m.gpu.run(|e| o.1(e)));
+                *e = [e[0] + 1., e[1] + 1e3 * t, e[2] + b as f64 / 87e6];
             }
-            by.iter().for_each(|(k, (c, t))| eprintln!("{k:8} {c:5} {:7.2} ms", 1e3 * t));
+            for (k, [c, t, b]) in by {
+                eprintln!("{k:12} {c:5} {t:7.2} ms {b:7.2} floor");
+            }
         }
         // several command buffers: the gpu starts while the rest encodes
         objc2::rc::autoreleasepool(|_| {
