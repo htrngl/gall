@@ -67,6 +67,13 @@ UNIT(q5_k) {
     return d.x*DOTU(q) - d.y*SX;
 }
 
+// the bytes of a word as subnormal halves: their values 2^-24
+#define HU(v) hd4(as_type<half2>((v) & 0x00ff00ff), \
+                  as_type<half2>((v) >> 8 & 0x00ff00ff))
+static inline float4 hd4(half2 a, half2 b) {
+    return float4(a.x, b.x, a.y, b.y);
+}
+
 // q5_k mat-vecs: units 2j, 2j + 1, inputs x0..x3, one scale decode for
 // both (the decode limits the one-unit kernel)
 static inline float w_q5_k(W b, uint j, float4 x0, float4 x1, float4 x2,
@@ -76,10 +83,8 @@ static inline float w_q5_k(W b, uint j, float4 x0, float4 x1, float4 x2,
     device const uint4 *qp = (device const uint4 *)(b + 48 + 32*(sb/2) + o);
     uint4 q = (*qp >> 4*(sb & 1)) & 0x0f0f0f0f;
     q |= ((*(device const uint4 *)(b + 16 + o) >> sb) & 0x01010101) << 4;
-    return d.x*(dot(float4(as_type<uchar4>(q.x)), x0) +
-                dot(float4(as_type<uchar4>(q.y)), x1) +
-                dot(float4(as_type<uchar4>(q.z)), x2) +
-                dot(float4(as_type<uchar4>(q.w)), x3)) -
+    return d.x*0x1p24f*(dot(HU(q.x), x0) + dot(HU(q.y), x1) +
+                        dot(HU(q.z), x2) + dot(HU(q.w), x3)) -
            d.y*dot(x0 + x1 + x2 + x3, 1);
 }
 
@@ -122,9 +127,6 @@ UNIT(nvfp4) {
 // a byte b is b 2^-24, exactly, and a sign is bit 15: a word of the grid
 // gives the halves of its bytes 0, 2 and 1, 3, and one multiply spreads
 // sign bit i to bits 10 + i and 24 + i. the 2^24 is in the scales
-static inline float4 hd4(half2 a, half2 b) {
-    return float4(a.x, b.x, a.y, b.y);
-}
 #define HB(g, t, c) \
     as_type<half2>(((g) & 0x00ff00ff) | ((t) << (c) & 0x80008000))
 #define H4(g, t, c, d) hd4(HB(g, t, c), HB((g) >> 8, t, d))
