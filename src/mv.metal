@@ -172,6 +172,39 @@ GR(iq2_xxs, IQ2XXS, iq2xxs_grid, ulong)
 GR(iq2_xs, IQ2XS, iq2xs_grid, ulong)
 GR(iq2_s, IQ2S, iq2s_grid, ulong)
 GR(iq3_xxs, IQ3XXS, iq3xxs_grid, uint)
+// iq2_s: units 2j, 2j + 1 (inputs x0..x3) with the loads of both at
+// once, each unit's arithmetic as in IQ2S (gd is GDOT)
+static inline float gd(ulong g, uint sg, float4 xa, float4 xb) {
+    return GDOT(g, g >> 32, sg);
+}
+static inline float2 p_iq2_s(W b, uint j, float4 x0, float4 x1, float4 x2,
+        float4 x3, threadgroup const ulong *G) {
+    uint q = ((H)(b + 2))[j], sg = ((H)(b + 34))[j], c = 4*(j & 1),
+         h = b[66 + j/2] >> c;
+    float d = F16(b)*(0.5f + ((b[74 + j/2] >> c) & 15))*0x1p22f;
+    return float2(d*gd(G[(q & 255) | (h & 3) << 8], sg & 255, x0, x1),
+                  d*gd(G[(q >> 8) | (h & 12) << 6], sg >> 8, x2, x3));
+}
+// as ACC on 8 rows, half the weight loads: a lane takes units 2j, 2j + 1
+// (j = l%16) of rows 4(l/16).. of every group. the shuffles give lane u
+// unit u's sums, so simd_sum adds what ACC's lanes held: the same bits
+#define ACC2(F, R, w0, x) \
+    for (uint k = 0, j = l%16; 32*k + 2*j < U; k++) { \
+        device const packed_float4 *xp = \
+            (device const packed_float4 *)((x) + 256*k + 16*j); \
+        float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3]; \
+        for (uint i = 0; i < 4; i++) { \
+            float2 v = p_##F((w0) + (i + l/16*4)*p.rb + k*gb, j, x0, x1, \
+                             x2, x3, tgg); \
+            s[2*i] += v.x, s[2*i + 1] += v.y; \
+        } \
+    }
+#define TAIL2(R) for (uint i = 0; i < 4; i++) { \
+        float2 a = simd_shuffle(float2(s[2*i], s[2*i + 1]), l/2), \
+               b = simd_shuffle(float2(s[2*i], s[2*i + 1]), 16 + l/2); \
+        float u = simd_sum(a[l%2]), v = simd_sum(b[l%2]); \
+        if (l == 0) y[r0 + i] = u, y[r0 + 4 + i] = v; \
+    }
 #define TGG(T, N, ty) threadgroup ty tgg[N]; \
     for (uint i = ti; i < N; i += tn) tgg[i] = T[i]; \
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -268,7 +301,8 @@ NIB(nvfp4) {
 #define WR(r) (r)
 #endif
 #define KERNELS(F, R) KERNELS_(F, R, ACC, )
-#define KERNELS_(F, R, ACC, PRE) \
+#define KERNELS_(F, R, ACC, PRE) KERNELS3(F, R, ACC, PRE, TAIL)
+#define KERNELS3(F, R, ACC, PRE, TAIL) \
 kernel void mv_##F(ARGS) { \
     HEAD(R); \
     PRE \
@@ -319,7 +353,7 @@ KERNELS(q6_k, R(2))
 #define u_iq3_xxs(b, e, xa, xb) t_iq3_xxs(b, e, xa, xb, tgg)
 KERNELS_(iq2_xxs, R(8), ACC, TGG(iq2xxs_grid, 256, ulong))
 KERNELS_(iq2_xs, R(4), ACC, TGG(iq2xs_grid, 512, ulong))
-KERNELS_(iq2_s, R(8), ACC, TGG(iq2s_grid, 1024, ulong))
+KERNELS3(iq2_s, 8, ACC2, TGG(iq2s_grid, 1024, ulong), TAIL2)
 KERNELS_(iq3_xxs, R(8), ACC, TGG(iq3xxs_grid, 256, uint))
 #undef u_iq2_xxs
 #undef u_iq2_xs
