@@ -6,11 +6,11 @@
 //   let row = d.next(&mut m, &mut spec, tok);  // all of it: feed tok;
 //   m.logits_row(row) and id[16 row + 8] are what follows it
 //   d.generate(&mut m, next, &mut Spec::new(), |tok| more);  // greedy loop
-// gall dr MODEL DRAFTER REFDIR [-n 64] [-c 4096] [--ub] [--tv 2,4,8]
-//   [--cmp R [-o O]] [--drift 1,2,8 [-o O]]:
-// teacher-forced acceptance; --tv: ms of a pass by rows; --cmp: a pass
-// against stepping; --drift: histories by passes against steps and the
-// reference
+// gall dr MODEL DRAFTER REFDIR [-n 64] [-c 4096] [--ub] [--tv 2,4,8
+//   [--at N,..]] [--cmp R [-o O]] [--drift 1,2,8 [-o O]]:
+// teacher-forced acceptance; --tv: ms of a draft and of a pass by rows
+// (at N tokens of context); --cmp: a pass against stepping; --drift:
+// histories by passes against steps and the reference
 // gall run MODEL --tokens FILE --draft DRAFTER [--block B] [-n 64] [-c 4096]
 use crate::gguf::{self, Gguf, Tensor};
 use crate::gpu::*;
@@ -716,19 +716,36 @@ pub fn main(a: &[String]) {
     let (mut run, mut hit, mut td) = ([0usize; 8], [0usize; 7], 0.);
     let mut cal = [[0usize; 2]; 10]; // by probability: drafts, hits
     if let Some(i) = a.iter().position(|x| x == "--tv") {
-        // ms of a pass by rows (best, mean of 6), on the reference text
-        dr.feed(&mut m, &all[..np]);
-        let mut i0 = np;
-        for r in a[i + 1].split(',').map(|v| v.parse::<usize>().unwrap()) {
-            let ts: Vec<f64> = (0..6).map(|_| {
+        // ms of a draft of 7 and of a pass by rows, medians of 7, at each
+        // context length of --at N,.. (the prompt's first N tokens; all of
+        // it by default), with the same rows of gen.txt at each
+        let at = a.iter().position(|x| x == "--at").map_or(vec![np], |j| {
+            a[j + 1].split(',').map(|v| v.parse().unwrap()).collect()
+        });
+        let md = |f: &mut dyn FnMut()| {
+            let mut v: Vec<f64> = (0..7).map(|_| {
                 let t0 = Instant::now();
-                dr.pass(&m, &all[i0..i0 + r]);
-                dr.commit(&mut m, r, r - 1);
-                i0 += r;
+                f();
                 1e3 * t0.elapsed().as_secs_f64()
             }).collect();
-            let b = ts.iter().fold(1e9f64, |a, &b| a.min(b));
-            println!("t({r}) {b:.1} ms best, {:.1} mean", ts.iter().sum::<f64>() / 6.);
+            v.sort_by(f64::total_cmp);
+            v[3]
+        };
+        let mut k = 0;
+        for n in at {
+            dr.feed(&mut m, &all[k..n.clamp(k + 1, np)]);
+            k = n.clamp(k + 1, np);
+            let mut i0 = np;
+            let d = md(&mut || drop(dr.draft(&m, all[np], 7)));
+            print!("at {}: d(7) {d:.1}", m.pos);
+            for r in a[i + 1].split(',').map(|v| v.parse::<usize>().unwrap()) {
+                print!(" t({r}) {:.1}", md(&mut || {
+                    dr.pass(&m, &all[i0..i0 + r]);
+                    dr.commit(&mut m, r, r - 1);
+                    i0 += r;
+                }));
+            }
+            println!();
         }
         return;
     }

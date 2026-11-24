@@ -73,8 +73,8 @@ target/release/gall dr "$(gall model)" DRAFTER ref/short.400 --drift 1,2,8 -o 40
 
 `--drift` also prints a hash of each history’s logit bits, so a kernel
 change can be shown to keep them. `--cmp R` compares one pass of `R` rows
-with stepping (logit difference and margin), and `--tv` times passes by
-row count.
+with stepping (logit difference and margin), and `--tv` times drafts and
+passes by row count, at the context lengths of `--at`.
 
 ## Drafter architecture
 
@@ -252,6 +252,50 @@ tokens late, cut first-position acceptance from 0.89 to 0.48 for code,
 drafter’s second choice was right at the first break 0.33 (code), 0.38
 (maths) and 0.24 (prose) of the time; a branch row returned at most 0.27
 tokens against a cost of 0.23–0.55, under 0.5% net.
+
+### Costs by context length
+
+`--tv` with `--at` measures the same costs after the first `N` tokens of
+a prompt. Each entry fits `a + w min(n / 1024, 1) + b n / 1000` ms, where
+`n` is the context length, `w` is what the sliding-window layers add as
+their 1,024 rows fill, and `b` is the growth of the full-attention
+layers:
+
+| Entry | `a` | `w` | `b` |
+| --- | ---: | ---: | ---: |
+| Step | 41.2 | 4.9 | 0.20 |
+| Pass of 2 rows | 62.6 | 9.5 | 0.25 |
+| 3 rows | 85.0 | 15.4 | 0.35 |
+| 4 rows | 97.6 | 20.5 | 0.53 |
+| 5 rows | 111.8 | 25.0 | 0.63 |
+| 6 rows | 118.1 | 34.0 | 0.82 |
+| 7 rows | 127.9 | 42.2 | 1.05 |
+| 8 rows | 137.4 | 46.2 | 1.29 |
+| Draft of 7 tokens | 7.6 | 0.9 | 0.28 |
+
+`a` is the median under 100 tokens, `b` the slope through the points at
+2,000 tokens and beyond, and `w` that line's intercept less `a`: medians
+of 7 at 1, 2,252, 10,504, 20,756 and 32,565 tokens of a 31,557-token
+prompt (three runs), and at `ref/2k` and `ref/8k.b256` (one run each),
+before the 3-row dots. The points lie up to 5.4 ms from the line for a
+step and up to 44 ms for 7 and 8 rows (r² 0.3–0.6; 0.99 for the draft).
+Load from other programs raised the times of a fourth run, which is not
+used.
+
+```sh
+target/release/gall dr "$(gall model)" DRAFTER DIR -c 34000 \
+  --tv 1,2,3,4,5,6,7,8 --at 0,2000,10000,20000,31557
+```
+
+At 30,000 tokens a step costs 52 ms and a pass of 8 rows 222 ms: 4.3
+steps, against 3.3 at short context. Extra rows cost more against a step
+at long context, not less. Most of it is attention: the window term of
+an 8-row pass is 9 times that of a step.
+
+`Spec` with these `w` and `b` added to the fixed table was not kept. On the
+31,557-token prompt, 400 tokens of `gall run`: serial decode 16.6
+tokens/s, drafted with the fixed table 17.7 (1.07 of serial), with the
+table by context 17.3 (1.04), one run each in that order.
 
 ## Prefill, snapshots and reload
 
