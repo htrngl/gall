@@ -1,12 +1,15 @@
 // prefix snapshots on disk, so a known prompt prefix is not fed again.
 //   let mut s = Snaps::new(path, &m);      // index of ~/.cache/gall/*.snap
 //   let (k, r) = s.prime(&mut m, &p, k, sys); // m holds p[..k], r restored
-// a file: tag line, n, n token ids, the ring rows past n that a batched
-// pass took (Model::top), the conv rings, the last ROWS rows of each
-// sliding window ring, rows [0, n) of each full-attention slot.
+// a file: tag line, n, the ring rows past n that a batched pass took
+// (Model::top), grow (a session's: write() extends it in place), the conv
+// rings, the last ROWS rows of each sliding window ring, the rows of the
+// full-attention slots token by token, the n token ids. the tag is zeros
+// while a write is under way
 use super::*;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::{fs, ops::Range, time::SystemTime};
 
@@ -17,8 +20,10 @@ const KEEP: usize = 8; // files, least recently used goes first
 pub struct Snaps {
     dir: PathBuf,
     tag: String,
-    ix: Vec<(PathBuf, Vec<u32>)>,
+    at: [u64; 2], // bytes before the full-attention rows, and per token
+    ix: Vec<(PathBuf, Toks, bool)>,
 }
+type Toks = Vec<u32>;
 
 fn u32s(r: &mut impl Read, n: usize) -> Option<Vec<u32>> {
     let mut b = vec![0; 4 * n];
@@ -27,39 +32,26 @@ fn u32s(r: &mut impl Read, n: usize) -> Option<Vec<u32>> {
     Some(b.chunks(4).map(le).collect())
 }
 
-// the tag and tokens of a file, with the reader at the state
-fn head(p: &PathBuf, tag: &str) -> Option<(BufReader<fs::File>, Vec<u32>)> {
-    let mut r = BufReader::with_capacity(1 << 20, fs::File::open(p).ok()?);
-    let mut t = vec![0; tag.len()];
-    r.read_exact(&mut t).ok().filter(|_| t == tag.as_bytes())?;
-    let n = u32s(&mut r, 1)?[0] as usize;
-    let toks = u32s(&mut r, n)?;
-    Some((r, toks))
-}
-
 fn common(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(a, b)| a == b).count()
 }
 
-impl Model {
-    // halfs per key of a full-attention slot
-    fn snap_row(&self) -> usize {
-        (self.kvo[6] - self.kvo[5]) / self.n_ctx
-    }
+fn le(v: &[u32]) -> Vec<u8> {
+    v.iter().flat_map(|t| t.to_le_bytes()).collect()
+}
 
-    // the cache rows a snapshot at n holds, in halfs
-    fn snap_rows(&self, n: usize) -> Vec<Range<usize>> {
-        let mut by_slot = visits();
-        by_slot.sort_by_key(|v| (v.0 % 6 == 5, v.1));
-        let rows = |(i, slot, _): (usize, usize, usize)| {
-            let o = self.kvo[slot];
-            if i % 6 == 5 {
-                return vec![o..o + n * self.snap_row()];
-            }
-            let r = n.saturating_sub(ROWS)..n;
-            r.map(|p| o + p % SW * 2048..o + (p % SW + 1) * 2048).collect()
+impl Model {
+    // the cache rows of a snapshot at n, in halfs: the last ROWS of each
+    // window ring, and token by token the full-attention rows of [a, n)
+    fn snap_rows(&self, n: usize, a: usize) -> [Vec<Range<usize>>; 2] {
+        let v = visits().into_iter().map(|v| (v.0 % 6 == 5, self.kvo[v.1]));
+        let (f, w): (Vec<_>, Vec<_>) = v.partition(|v| v.0);
+        let row = |o: usize, p: usize| o + p * 2048..o + (p + 1) * 2048;
+        let ring = |&(_, o)| {
+            (n + SW - ROWS..n + SW).map(move |p| row(o, p % SW))
         };
-        by_slot.into_iter().flat_map(rows).collect()
+        let full = |p| f.iter().map(move |&(_, o)| row(o, p));
+        [w.iter().flat_map(ring).collect(), (a..n).flat_map(full).collect()]
     }
 }
 
@@ -68,43 +60,81 @@ impl Snaps {
     pub fn new(path: &str, m: &Model) -> Snaps {
         let (md, home) = (fs::metadata(path).unwrap(), std::env::var("HOME"));
         let at = md.modified().unwrap().duration_since(SystemTime::UNIX_EPOCH);
-        let tag = format!("gall snap 2 row {} sw {SW} cs {CS} model {} {}\n",
-            m.snap_row(), md.len(), at.unwrap().as_secs());
+        let tag = format!("gall snap 3 sw {SW} cs {CS} model {} {}\n",
+            md.len(), at.unwrap().as_secs());
+        let b = |n| m.snap_rows(n, 0).concat().into_iter().map(|r| 2 * r.len());
+        let (w, f): (usize, usize) = (b(0).sum(), b(1).sum());
+        let c = tag.len() + 12 + slice::<u8>(&m.cs).len();
+        let at = [c + w, f - w].map(|x| x as u64);
         let dir = PathBuf::from(home.unwrap()).join(".cache/gall");
         fs::create_dir_all(&dir).unwrap();
-        let ls = fs::read_dir(&dir).unwrap().flatten().map(|e| e.path());
+        let mut s = Snaps { dir, tag, at, ix: vec![] };
+        let ls = fs::read_dir(&s.dir).unwrap().flatten().map(|e| e.path());
         let ls = ls.filter(|p| p.extension().is_some_and(|x| x == "snap"));
-        let ix: Vec<_> = ls
-            .filter_map(|p| head(&p, &tag).map(|h| (p, h.1)))
-            .collect();
-        eprintln!("gall: {} snapshots in {}", ix.len(), dir.display());
-        Snaps { dir, tag, ix }
+        let ix = ls.filter_map(|p| s.head(&p).map(|h| (p, h.2, h.1[2] > 0)));
+        s.ix = ix.collect();
+        eprintln!("gall: {} snapshots in {}", s.ix.len(), s.dir.display());
+        s
     }
 
-    // write the state of m, which holds toks
-    pub fn write(&mut self, m: &Model, toks: &[u32]) -> std::io::Result<()> {
+    // the head ([n, top, grow]) and tokens of a file, the reader at the
+    // conv rings
+    fn head(&self, p: &PathBuf) -> Option<(BufReader<fs::File>, Toks, Toks)> {
+        let f = fs::File::open(p).ok()?;
+        let len = f.metadata().ok()?.len();
+        let mut r = BufReader::with_capacity(1 << 20, f);
+        let mut t = vec![0; self.tag.len()];
+        r.read_exact(&mut t).ok().filter(|_| t == self.tag.as_bytes())?;
+        let h = u32s(&mut r, 3)?;
+        let end = self.at[0] + h[0] as u64 * self.at[1];
+        (len == end + 4 * h[0] as u64).then_some(())?;
+        r.seek(SeekFrom::Start(end)).ok()?;
+        let toks = u32s(&mut r, h[0] as usize)?;
+        r.seek(SeekFrom::Start(self.tag.len() as u64 + 12)).ok()?;
+        Some((r, h, toks))
+    }
+
+    // write the state of m, which holds toks, as a session's
+    pub fn write(&mut self, m: &Model, toks: &[u32]) -> io::Result<()> {
+        self.put(m, toks, true)
+    }
+
+    // a session's file that toks extend takes only the rows past its end
+    fn put(&mut self, m: &Model, toks: &[u32], grow: bool) -> io::Result<()> {
         let mut h = DefaultHasher::new();
         (&self.tag, toks).hash(&mut h);
         let p = self.dir.join(format!("{:016x}.snap", h.finish()));
-        let tmp = p.with_extension("tmp");
-        let mut w = BufWriter::with_capacity(1 << 20, fs::File::create(&tmp)?);
-        w.write_all(self.tag.as_bytes())?;
-        let top = Some(m.top.wrapping_sub(m.pos) as u32).filter(|a| *a <= 8);
-        for t in [toks.len() as u32].iter().chain(toks).chain(&[top.unwrap_or(0)]) {
-            w.write_all(&t.to_le_bytes())?;
+        let ex = |e: &&(_, Toks, bool)| grow && e.2 && toks.starts_with(&e.1);
+        let old = self.ix.iter().filter(ex).max_by_key(|e| e.1.len());
+        let (o, a) = old.map_or((p.clone(), 0), |e| (e.0.clone(), e.1.len()));
+        if o != p {
+            fs::rename(&o, &p)?;
         }
+        let f = fs::OpenOptions::new().create(true).write(true).open(&p)?;
+        let mut w = BufWriter::with_capacity(1 << 20, f);
+        w.write_all(&vec![0; self.tag.len()])?;
+        let top = Some(m.top.wrapping_sub(m.pos) as u32).filter(|a| *a <= 8);
+        w.write_all(&le(&[toks.len() as u32, top.unwrap_or(0), grow as u32]))?;
         w.write_all(slice::<u8>(&m.cs))?;
-        let kv = slice::<u8>(&m.kv);
-        for r in m.snap_rows(toks.len()) {
+        let (kv, n) = (slice::<u8>(&m.kv), toks.len());
+        let [ring, full] = m.snap_rows(n, a);
+        for r in ring {
             w.write_all(&kv[2 * r.start..2 * r.end])?;
         }
-        w.into_inner()?.sync_data()?;
-        fs::rename(&tmp, &p)?;
-        self.ix.retain(|e| e.0 != p);
-        self.ix.push((p, toks.to_vec()));
+        w.seek(SeekFrom::Start(self.at[0] + a as u64 * self.at[1]))?;
+        for r in full {
+            w.write_all(&kv[2 * r.start..2 * r.end])?;
+        }
+        w.write_all(&le(toks))?;
+        let f = w.into_inner()?;
+        f.set_len(self.at[0] + n as u64 * (self.at[1] + 4))?;
+        f.sync_data()?;
+        f.write_all_at(self.tag.as_bytes(), 0)?;
+        self.ix.retain(|e| e.0 != p && e.0 != o);
+        self.ix.push((p, toks.to_vec(), grow));
         // drop the least recently used
-        let age = |e: &(PathBuf, _)| fs::metadata(&e.0).and_then(|m| m.modified()).ok();
-        self.ix.sort_by_key(|e| std::cmp::Reverse(age(e)));
+        let age = |e: &(PathBuf, _, _)| fs::metadata(&e.0)?.modified();
+        self.ix.sort_by_key(|e| std::cmp::Reverse(age(e).ok()));
         for e in self.ix.drain(KEEP.min(self.ix.len())..) {
             fs::remove_file(e.0)?;
         }
@@ -113,12 +143,12 @@ impl Snaps {
 
     // read snapshot i into m
     fn read(&self, m: &mut Model, i: usize) -> Option<()> {
-        let (p, toks) = &self.ix[i];
-        let mut r = head(p, &self.tag)?.0;
-        m.top = toks.len() + u32s(&mut r, 1)?[0] as usize;
+        let (p, toks, _) = &self.ix[i];
+        let (mut r, h, _) = self.head(p).filter(|h| h.2 == *toks)?;
+        m.top = toks.len() + h[1] as usize;
         r.read_exact(slice::<u8>(&m.cs)).ok()?;
         let kv = slice::<u8>(&m.kv);
-        for x in m.snap_rows(toks.len()) {
+        for x in m.snap_rows(toks.len(), 0).concat() {
             r.read_exact(&mut kv[2 * x.start..2 * x.end]).ok()?;
         }
         let f = fs::OpenOptions::new().append(true).open(p).ok()?;
@@ -127,7 +157,6 @@ impl Snaps {
         m.stale(0);
         Some(())
     }
-
     // m holds p[..k]. restore the longest stored prefix of p past k (or a
     // file that parts from p in its last 12 tokens, truncated), then feed
     // up to and store: the longest prefix p shares with a stored
@@ -161,7 +190,7 @@ impl Snaps {
             m.feed(&p[k..n]);
             k = n;
             let t = std::time::Instant::now();
-            match self.write(m, &p[..n]) {
+            match self.put(m, &p[..n], false) {
                 Ok(()) => eprintln!("gall: snap {n} written in {:.2} s",
                     t.elapsed().as_secs_f64()),
                 Err(e) => eprintln!("gall: snap {n}: {e}"),
