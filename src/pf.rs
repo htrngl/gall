@@ -55,6 +55,8 @@ pub struct Pf {
     rt: Buf,  // relative bias by token, q head, distance
     k: HashMap<&'static str, Pipe>,
     mm: HashMap<u32, Pipe>,
+    // PROF=1: by kind, gpu seconds, weight bytes, tile and real macs
+    pt: std::cell::RefCell<std::collections::BTreeMap<String, [f64; 4]>>,
 }
 
 impl Pf {
@@ -76,6 +78,7 @@ impl Pf {
             rt: g.buf(4 * tb * 24 * 1024),
             k: ks.map(|k| (k, g.pipe(OPS, &d, k))).into(),
             mm: ty.map(|t| (t, g.pipe(MM, &d, &f(t)))).into(),
+            pt: Default::default(),
         }
     }
 }
@@ -105,6 +108,12 @@ impl Model {
             }
             (self.pf, self.pos, toks) = (Some(pf), self.pos + n, &toks[n..]);
         }
+        if let Some(p) = self.pf.as_ref().filter(|_| prof()) {
+            for (k, [s, b, m, r]) in p.pt.take() {
+                let [s, b, m, r] = [1e3 * s, b / 1e9, m / 1e9, r / 1e9];
+                eprintln!("{k:8} {s:8.1} ms {b:6.2} GB {m:7.0} {r:7.0} GMAC");
+            }
+        }
         toks
     }
 
@@ -122,12 +131,24 @@ impl Model {
         }
         let bufs =
             [&pf.a, &self.s, &self.kv, &self.cs, &pf.id, &pf.pe, &pf.col, &pf.rt];
+        // PROF: each dispatch in a command buffer of its own
+        let go = |e: &Enc, k: String, w: [usize; 3], f: &dyn Fn(&Enc)| {
+            if !prof() {
+                return f(e);
+            }
+            let s = self.gpu.run(f);
+            let mut pt = pf.pt.borrow_mut();
+            let a = pt.entry(k).or_default();
+            a[0] += s;
+            (0..3).for_each(|i| a[i + 1] += w[i] as f64);
+        };
         macro_rules! k {
             ($e:expr, $n:expr, $g:expr, $th:expr, $($p:expr),*) => {{
                 let mut p = [0u32; 24];
                 let v = [$($p as u32),*];
                 p[..v.len()].copy_from_slice(&v);
-                call($e, &pf.k[$n], &p, &bufs.map(|b| (b, 0)), $g, $th)
+                go($e, $n.into(), [0; 3],
+                    &|e| call(e, &pf.k[$n], &p, &bufs.map(|b| (b, 0)), $g, $th))
             }};
         }
         // y = W x over the tiles tl[t0..][..nt]; o = [ls, xo, xs, yo, ys]
@@ -137,7 +158,24 @@ impl Model {
             let rb = if ty == 1 { 2 * ni } else { ni / blk(ty).0 * blk(ty).1 };
             let p = [ni, no, rb, o[0], o[1], o[2], o[3], o[4]].map(|v| v as u32);
             let b = [w, (x, 0), (y, 0), (&pf.col, 0), (&pf.tl, 12 * t0)];
-            call(e, &pf.mm[&ty], &p, &b, [no.div_ceil(64), nt, 1], 128)
+            let (g, xp) = ([no.div_ceil(64), nt, 1], t0 >= nd);
+            // PROF: bytes of the distinct slabs, tile and real macs
+            let mut wk = [0; 3];
+            if prof() {
+                let tl = &slice::<u32>(&pf.tl)[3 * t0..][..3 * nt];
+                let (col, tl) = (slice::<u32>(&pf.col), tl.chunks(3));
+                let tb = tb as u32;
+                let mut ex: Vec<_> = tl.clone().map(|c| c[0]).collect();
+                ex.dedup();
+                let cs = tl.flat_map(|c| c[1] as usize..(c[1] + c[2]) as usize);
+                let real = |&i: &usize| [i < t, col[i] != tb][xp as usize];
+                let rc = cs.clone().filter(real).count();
+                wk = [ex.len() * no * rb, g[0] * 64 * ni * cs.count(),
+                    no * ni * rc];
+            }
+            let f = if ty == 1 { "f16" } else { name(ty) };
+            let k = [["", "x "][xp as usize], f].concat();
+            go(e, k, wk, &|e| call(e, &pf.mm[&ty], &p, &b, g, 128))
         };
         let dense = |e: &Enc, w: &Tensor, x: usize, y: usize, ni, no| {
             let o = [0, x, STR, y, STR];
@@ -234,20 +272,22 @@ impl Model {
                 k!(e, "msg", g1, 32, BK + 2 * N, H, self.mq, MSG);
             }
         };
-        let (mut np, mut ne, mut gpu) = (0, 0, 0.);
+        let em = |e: &Enc, x, y| go(e, "embd".into(), [0; 3], &|e| {
+            self.embd(e, x, y)
+        });
+        let (mut np, mut ne, mut gpu, mut oc) = (0, 0, 0., [0; 4]);
         for v in 0..=vs.len() {
             gpu += self.gpu.run(|e| {
                 if v == 0 {
                     for (i, &x) in toks.iter().enumerate() {
-                        let y = (&pf.a, 4 * (i * STR + H));
-                        self.embd(e, x, y);
+                        em(e, x, (&pf.a, 4 * (i * STR + H)));
                     }
                     k!(e, "prep", g1, 32, H, BK, 0, 0, 0, H, 1, 0, 0, 0, self.tn, 0,
                         0, VT);
                     // an image row is the stream as it is: no norm
                     for (i, &x) in toks.iter().enumerate() {
                         if x >= super::IMG {
-                            self.embd(e, x, (&pf.a, 4 * (i * STR + H)));
+                            em(e, x, (&pf.a, 4 * (i * STR + H)));
                         }
                     }
                 } else {
@@ -289,9 +329,23 @@ impl Model {
                 }
                 np += n;
             }
+            if v < vs.len() {
+                let nx = by.iter().filter(|c| !c.is_empty()).count();
+                oc = [oc[0] + nx, oc[1] + np, oc[2] + 32 * ne, oc[3] + 1];
+            }
+        }
+        if prof() {
+            let [x, p, q, n] = oc.map(|v| v as f64);
+            let r = 8. * t as f64 * n;
+            eprintln!("{t} rows: {:.1} experts a visit, {:.1} rows an expert, \
+                {:.2} of 8-wide, {:.2} of 32-wide", x / n, r / x, r / p, r / q);
         }
         gpu
     }
+}
+
+fn prof() -> bool {
+    std::env::var("PROF").is_ok()
 }
 
 // time the mat-mat on random bytes: no model
