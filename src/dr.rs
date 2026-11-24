@@ -445,6 +445,7 @@ impl Dr {
             st.drop();
         }
         let hit = st.d.get(st.r - 1).copied().is_some_and(|d| st.see(d.1, d.0 == tok));
+        st.s = (st.s + 1) * hit as usize;
         if hit && st.r <= st.j {
             let ops = self.inject(m.pos, st.r);
             m.gpu.go(|e| ops.iter().for_each(|o| o.2(e)));
@@ -467,7 +468,7 @@ impl Dr {
             st.fresh(&d, on);
         }
         let room = self.n_ctx - 1 - m.pos;
-        let j = (st.plan(&d).0 * (on || cp) as usize).min(room);
+        let j = (st.plan(&d, st.s).0 * (on || cp) as usize).min(room);
         if j == 0 {
             self.step(m, tok);
         } else {
@@ -563,7 +564,8 @@ impl Dr {
 // the output does not change from run to run
 pub struct Spec {
     pub block: Option<usize>, // a fixed count of drafts per round; 0: none
-    pub q: [f64; 12],         // acceptance of a draft by its probability
+    pub q: [[f64; 12]; 2],    // acceptance of a draft by its probability,
+                              // after < 3 or >= 3 tokens foretold in a row
     pub e: [f64; 2],          // tokens and seconds to expect of a draft
     pub tv: [f64; 9],         // a pass by rows
     pub td: [f64; 8],         // a draft by length
@@ -576,6 +578,7 @@ pub struct Spec {
     j: usize,           // its first j are verified: rows 1..=j of the pass
     r: usize,           // d[r - 1] is the draft of the token to come
     pos: usize,         // the model's position then
+    s: usize,           // tokens in a row the drafts in hand foretold
     due: [usize; 2],       // off: the next draft is at n = due[0]; the gap
     hits: [f64; 2],        // of this draft, and their mean
 }
@@ -586,7 +589,10 @@ impl Spec {
         let tv = [40.2, 63., 85., 97., 107., 117., 126., 136.];
         Spec {
             block: None,
-            q: std::array::from_fn(|i| 0.9 / (1. + (1.75 - i as f64 / 2.).exp())),
+            // as measured over 13 workloads of 400 tokens
+            q: [[5., 11., 13., 26., 29., 41., 47., 55., 62., 68., 72., 91.],
+                [5., 19., 22., 29., 35., 45., 54., 65., 69., 76., 80., 96.]]
+                .map(|q| q.map(|v| v / 100.)),
             e: [1., 0.055],
             tv: std::array::from_fn(|i| 1e-3 * tv[i.max(1) - 1]),
             td: ms([0., 6.3, 6.8, 7.4, 7.7, 8.1, 8.4, 8.8]),
@@ -599,6 +605,7 @@ impl Spec {
             j: 0,
             r: 1,
             pos: 0,
+            s: 0,
             due: [0; 2],
             hits: [0., 2.],
         }
@@ -615,8 +622,13 @@ impl Spec {
         self.d.clear();
     }
 
+    // the chance that a draft of probability p holds, s held before it
+    fn q(&self, s: usize, p: f32) -> f64 {
+        self.q[(s >= 3) as usize][Spec::bin(p)]
+    }
+
     fn see(&mut self, p: f32, hit: bool) -> bool {
-        let q = &mut self.q[Spec::bin(p)];
+        let q = &mut self.q[(self.s >= 3) as usize][Spec::bin(p)];
         *q += 0.05 * (hit as u8 as f64 - *q);
         self.hits[0] += hit as u8 as f64;
         hit
@@ -635,11 +647,11 @@ impl Spec {
     // the drafts to verify, and the tokens to expect of the round: a draft
     // is taken while its chance to be kept pays for its row at the rate
     // in hand
-    fn plan(&self, d: &[(u32, f32)]) -> (usize, f64) {
+    fn plan(&self, d: &[(u32, f32)], s: usize) -> (usize, f64) {
         let (mut p, mut e) = (1., 1.);
         let rate = (self.e[0] / self.e[1]).max(1. / self.tv[1]);
         for (j, x) in d.iter().take(7).enumerate() {
-            p *= self.q[Spec::bin(x.1)];
+            p *= self.q(s + j, x.1);
             if self.block.is_none() && p < rate * (self.tv[j + 2] - self.tv[j + 1]) {
                 return (j, e);
             }
@@ -650,21 +662,22 @@ impl Spec {
 
     // a new draft: the tokens and seconds to expect of it over its
     // rounds, each reached if the drafts before it hold, go into e. off,
-    // the next draft is 8 tokens on if this one would have paid, else 32,
-    // 64, 128
+    // the next draft is 8 tokens on if this one would have paid, else 16,
+    // then 32
     fn fresh(&mut self, d: &[(u32, f32)], on: bool) {
         let (mut i, mut s, mut x) = (0, 1., [0., self.td[d.len()]]);
         while i == 0 || i < d.len() {
-            let (j, e) = self.plan(&d[i..]);
+            let (j, e) = self.plan(&d[i..], self.s + i);
             x = [x[0] + s * e, x[1] + s * self.tv[j + 1]];
-            let held = &d[i..d.len().min(i + j + 1)];
-            s *= held.iter().map(|v| self.q[Spec::bin(v.1)]).product::<f64>();
+            let held = i..d.len().min(i + j + 1);
+            s *= held.map(|k| self.q(self.s + k, d[k].1)).product::<f64>();
             i += j + 1;
         }
         let w = if on { 0.1 } else { 0.3 };
         (0..2).for_each(|i| self.e[i] += w * (x[i] - self.e[i]));
         self.hits = [0., self.hits[1] + 0.2 * (self.hits[0] - self.hits[1])];
-        let gap = if x[0] * self.tv[1] > x[1] { 8 } else { (2 * self.due[1]).clamp(32, 128) };
+        let off = (2 * self.due[1]).clamp(16, 32);
+        let gap = if x[0] * self.tv[1] > x[1] { 8 } else { off };
         self.due = [self.n + gap, gap];
         self.drafts += 1;
     }
