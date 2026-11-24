@@ -132,6 +132,10 @@ UNIT(nvfp4) {
 #define H4(g, t, c, d) hd4(HB(g, t, c), HB((g) >> 8, t, d))
 #define GDOT(g0, g1, sg) DOT8(H4(uint(g0), (sg)*0x01000400, 5, 4), \
                               H4(uint(g1), (sg)*0x01000400, 1, 0))
+// 4 grid magnitudes with their sign bits m of sg (drm.metal)
+#define SGN(v, sg, m) select(float4(v), -float4(v), (uint4(sg) & m) != 0)
+#define M0 uint4(1, 2, 4, 8)
+#define M1 uint4(16, 32, 64, 128)
 
 // the grids run slowly from the constant cache: G is the table, and the
 // mat-vecs below use a copy in threadgroup memory (tgg), with 4
