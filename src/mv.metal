@@ -173,14 +173,22 @@ GR(iq3_xxs, IQ3XXS, iq3xxs_grid, uint)
 // both nibbles of 4 bytes: xa and xb are the inputs of the low and the
 // high nibbles, at elements xo_<fmt>(e) and that + NH of the group
 #define NIB(F) static inline float n_##F(W b, uint e, float4 xa, float4 xb)
-#define NDOT(t, q) (dot(LUT4(t, (q & 15)), xa) + dot(LUT4(t, (q >> 4)), xb))
 
 static inline uint xo_iq4_nl(uint e) { return 32*(e/4) + 4*(e%4); }
-NIB(iq4_nl) {
+// mat-vecs: G[byte] is the halves of its low and high nibbles' values
+static inline float t_iq4_nl(W b, uint e, float4 xa, float4 xb,
+        threadgroup const half2 *G) {
     W c = b + (e/4)*18;
     uint4 q = uint4(*(Q)(c + 2 + 4*(e%4)));
-    return F16(c)*NDOT(k_iq4nl, q);
+    half2 v0 = G[q.x], v1 = G[q.y], v2 = G[q.z], v3 = G[q.w];
+    return F16(c)*(dot(float4(v0.x, v1.x, v2.x, v3.x), xa) +
+                   dot(float4(v0.y, v1.y, v2.y, v3.y), xb));
 }
+#define n_iq4_nl(b, e, xa, xb) t_iq4_nl(b, e, xa, xb, tgg)
+#define T4 threadgroup half2 tgg[256]; \
+    for (uint i = ti; i < 256; i += tn) \
+        tgg[i] = half2(k_iq4nl[i & 15], k_iq4nl[i >> 4]); \
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
 static inline uint xo_nvfp4(uint e) { return 8*(e & ~1u) + 4*(e & 1); }
 // an e2m1 nibble as the bits 9-11 and 15 of a half is its value 2^-14
@@ -311,7 +319,7 @@ KERNELS_(iq3_xxs, R(8), ACC, TGG(iq3xxs_grid, 256, uint))
 #undef u_iq2_xs
 #undef u_iq2_s
 #undef u_iq3_xxs
-KERNELS_(iq4_nl, R(2), ACC16, )
+KERNELS_(iq4_nl, R(2), ACC16, T4)
 KERNELS_(nvfp4, R(2), ACC8, )
 
 // device bandwidth ceiling: every thread sums a run of p.n_in words, of
