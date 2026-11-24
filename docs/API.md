@@ -54,7 +54,7 @@ before. The app starts the server again after a panic.
 | `--ctx N` | Sets the context length in tokens (default 102,400). |
 | `--alias NAME` | Sets the model name that the API reports. |
 | `--effort LEVEL` | Sets the reasoning effort for requests that give none (default `none`). |
-| `--api-key-file F` | Requires `Authorization: Bearer KEY` with the case-sensitive key in `F`, on every request except `/health`. |
+| `--api-key-file F` | Requires `Authorization: Bearer KEY` or `x-api-key: KEY` with the case-sensitive key in `F`, on every request except `/health`. |
 | `--idle-unload N` | Unloads after `N` idle seconds. `1` matches the app’s Instant setting; `0` disables the timer (the CLI default). |
 | `--no-draft` | Disables the drafter. |
 
@@ -66,6 +66,8 @@ that base URL. The server supports these endpoints:
 
 - `/v1/chat/completions`, with streaming, tools, reasoning, images, and
   JSON `response_format`.
+- `/v1/messages`, the Anthropic Messages API, with streaming, tools,
+  thinking, images, and `stop_sequences`. See below.
 - `/v1/models`.
 - `/health`, with `loaded`, `busy` (a chat runs), and `last` (the
   `timings` of the last chat, or `null`). It needs no key.
@@ -94,6 +96,30 @@ answer once a near-tie occurs, typically after 100–300 tokens. Sampled
 answers with the same seed can differ likewise. `--no-draft` gives serial
 output. See [drafter notes](DRAFT.md#exactness).
 
+
+### Anthropic Messages API
+
+`/v1/messages` translates each request to a chat completion and the
+answer back, so both APIs share the prompt cache and saved state. To use
+it with Bricolage, set `BRIC_URL=http://127.0.0.1:9940/v1/messages` and
+`BRIC_MODEL=inkling-2-mini`. The server maps these fields:
+
+- `system`, a string or text blocks.
+- `text`, `image` (base64 or url), `tool_use`, `tool_result` and
+  `thinking` blocks. Other block types give a 400 error.
+- `tools` with an `input_schema`. Server tools, such as `web_search`,
+  are left out.
+- `thinking` of type `disabled` sets the reasoning effort to `none`.
+  `output_config.effort` sets it otherwise.
+- `output_config.format` or `output_format` of type `json_schema`, as
+  for `response_format`.
+- `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences` and
+  `stream`.
+
+`tool_choice`, `metadata` and `cache_control` are ignored. A thinking
+block has an empty `signature`. `usage.input_tokens` counts the whole
+prompt, including the cached part. `/v1/messages/count_tokens` is not
+supported.
 
 ## Unloading and saved state
 

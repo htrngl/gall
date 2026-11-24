@@ -24,6 +24,8 @@ struct GallApp: App {
 
 struct Menu: View {
     @ObservedObject var m: Gall
+    // the api that Copy endpoint gives; the server answers both
+    @AppStorage("api") var api = "openai"
 
     // a setting in UserDefaults; a change restarts the server
     func pick<T>(_ k: String, _ v: T) -> Binding<T> {
@@ -46,7 +48,9 @@ struct Menu: View {
         }
         if let l = m.last { Text(l) }
         Divider()
-        Button("Copy endpoint") { copy(endpoint + "/v1") }
+        Button("Copy endpoint") { 
+            copy(endpoint + (api == "anthropic" ? "/v1/messages" : "/v1"))
+        }
         if m.net {
             Button("Copy key") {
                 copy((try? String(contentsOf: key, encoding: .utf8))?
@@ -72,6 +76,10 @@ struct Menu: View {
             Picker("Context", selection: pick("ctx", 102400)) {
                 Text("32k").tag(32768)
                 Text("100k").tag(102400)
+            }
+            Picker("API", selection: $api) {
+                Text("OpenAI").tag("openai")
+                Text("Anthropic").tag("anthropic")
             }
             Toggle("Start at login", isOn: login)
             Toggle("Allow other devices on the network",

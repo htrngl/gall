@@ -1,11 +1,13 @@
-// openai-compatible chat server over one model: chats queue, one at a time.
+// openai- and anthropic-compatible chat server over one model: chats
+// queue, one at a time.
 //   gall serve <gguf> [--port 9940] [--host 127.0.0.1] [--ctx 102400]
 //             [--effort none] [--alias inkling-2-mini] [--api-key-file F]
 //             [--idle-unload SECONDS] [--no-draft] [--dummy [answer]]
-// POST /v1/chat/completions (stream or not), GET /v1/models, POST /park,
-// GET /health ({status, loaded, busy, last: the timings of the last chat}).
-// with a key, all but /health need "authorization: bearer KEY"; a host
-// other than loopback needs a key. a park puts the model to disk (a
+// POST /v1/chat/completions or /v1/messages (anthropic, see anth()), stream
+// or not, GET /v1/models, POST /park, GET /health ({status, loaded, busy,
+// last: the timings of the last chat}). with a key, all but /health need
+// "authorization: bearer KEY" or "x-api-key: KEY"; a host other than
+// loopback needs a key. a park puts the model to disk (a
 // snapshot of the last conversation) and out of memory, until the next
 // chat request: after --idle-unload seconds idle (longer after tool_calls),
 // on POST /park, at memory pressure (warn) and, before an exit, on SIGTERM;
@@ -517,6 +519,136 @@ fn prompt(r: &J, eff: &J) -> Result<Prompt, String> {
     Ok((o, n, urls))
 }
 
+// an anthropic messages request as a chat completions one: tool_result
+// blocks are tool messages, the other blocks of a user turn follow them;
+// tools without an input_schema (server tools) are left out
+fn anth(a: &J) -> J {
+    let txt = |c: &J| match c {
+        J::Str(s) => s.clone(),
+        c => c.a().iter().filter(|b| b["type"].s() == Some("text"))
+            .filter_map(|b| b["text"].s()).collect::<Vec<_>>().join("\n"),
+    };
+    let part = |b: &J| {
+        let (s, ty) = (&b["source"], b["type"].s());
+        let u = match s["type"].s() {
+            Some("url") => s["url"].clone(),
+            _ => format!("data:{};base64,{}", s["media_type"].s()
+                .unwrap_or(""), s["data"].s().unwrap_or("")).into(),
+        };
+        let i = obj!["type" => "image_url", "image_url" => u];
+        if ty == Some("image") { i } else { b.clone() }
+    };
+    let fun = |n: &J, k: &str, v: &J, d: Option<&J>| {
+        let mut f = vec![("name".into(), n.clone()), (k.into(), v.clone())];
+        f.extend(d.map(|d| ("description".into(), d.or("".into()))));
+        obj!["type" => "function", "function" => J::Obj(f)]
+    };
+    let mut m = vec![];
+    if a["system"] != NULL {
+        m.push(obj!["role" => "system", "content" => txt(&a["system"])]);
+    }
+    for x in a["messages"].a() {
+        let (role, c) = (x["role"].s().unwrap_or(""), &x["content"]);
+        let ty = |t| c.a().iter().filter(move |b| b["type"].s() == Some(t));
+        if let J::Str(_) = c {
+            m.push(obj!["role" => role, "content" => c.clone()]);
+        } else if role == "assistant" {
+            let calls = ty("tool_use").map(|b| {
+                let J::Obj(mut f) = fun(&b["name"], "arguments", &b["input"],
+                    None) else { unreachable!() };
+                f.push(("id".into(), b["id"].clone()));
+                J::Obj(f)
+            });
+            let rc = ty("thinking").filter_map(|b| b["thinking"].s());
+            m.push(obj!["role" => role, "content" => txt(c),
+                "reasoning_content" => rc.collect::<String>(),
+                "tool_calls" => calls.collect::<Vec<_>>()]);
+        } else {
+            for b in ty("tool_result") {
+                let r = match &b["content"] {
+                    J::Str(s) => vec![obj!["type" => "text", "text" => &**s]],
+                    r => r.a().iter().map(part).collect(),
+                };
+                let e = vec![obj!["type" => "text", "text" => ""]];
+                m.push(obj!["role" => "tool", "tool_call_id" =>
+                    b["tool_use_id"].clone(),
+                    "content" => if r.is_empty() { e } else { r }]);
+            }
+            let p: Vec<_> = c.a().iter()
+                .filter(|b| b["type"].s() != Some("tool_result"))
+                .map(part).collect();
+            if !p.is_empty() {
+                m.push(obj!["role" => role, "content" => p]);
+            }
+        }
+    }
+    let tools = a["tools"].a().iter().filter(|t| t["input_schema"] != NULL)
+        .map(|t| fun(&t["name"], "parameters", &t["input_schema"],
+            Some(&t["description"])));
+    let (oc, off) = (&a["output_config"], a["thinking"]["type"].s());
+    let f = [&oc["format"], &a["output_format"]].into_iter()
+        .find(|f| f["type"].s() == Some("json_schema"));
+    let rf = f.map_or(NULL.clone(), |f| obj!["type" => "json_schema",
+        "json_schema" => obj!["schema" => f["schema"].clone()]]);
+    let e = if off == Some("disabled") { "none".into() }
+        else { oc["effort"].clone() };
+    let mut o = obj!["messages" => m, "tools" => tools.collect::<Vec<_>>(),
+        "stop" => a["stop_sequences"].clone(), "reasoning_effort" => e,
+        "response_format" => rf];
+    let J::Obj(kv) = &mut o else { unreachable!() };
+    for k in ["max_tokens", "temperature", "top_p", "top_k", "stream"] {
+        kv.push((k.into(), a[k].clone()));
+    }
+    o
+}
+
+// anthropic events. a block opens at the first delta of its type and
+// closes at another type, at a tool call or at the end (b: null)
+fn ev(w: &mut impl Write, e: &str, j: J) -> io::Result<()> {
+    write!(w, "event: {e}\ndata: {j}\n\n")?;
+    w.flush()
+}
+struct Ev(usize, Option<String>); // blocks opened, the type of the open one
+impl Ev {
+    fn to(&mut self, w: &mut impl Write, b: J) -> io::Result<()> {
+        let k = b["type"].s().map(String::from);
+        let tool = k.as_deref() == Some("tool_use");
+        if self.1.is_some() && (self.1 != k || tool) {
+            ev(w, "content_block_stop", obj!["type" => "content_block_stop",
+                "index" => self.0 - 1])?;
+            self.1 = None;
+        }
+        if k.is_some() && self.1.is_none() {
+            ev(w, "content_block_start", obj!["type" => "content_block_start",
+                "index" => self.0, "content_block" => b])?;
+            (self.0, self.1) = (self.0 + 1, k);
+        }
+        Ok(())
+    }
+    fn delta(&mut self, w: &mut impl Write, b: J, d: J) -> io::Result<()> {
+        self.to(w, b)?;
+        ev(w, "content_block_delta", obj!["type" => "content_block_delta",
+            "index" => self.0 - 1, "delta" => d])
+    }
+}
+// a block of thinking (0) or text (1) that holds s, and its delta
+fn blk(i: usize, s: &str) -> (J, J) {
+    let k = ["thinking", "text"][i];
+    let mut b = vec![("type".into(), k.into()), (k.into(), s.into())];
+    if i == 0 {
+        b.push(("signature".into(), "".into()));
+    }
+    let d = format!("{k}_delta");
+    (J::Obj(b), J::Obj(vec![("type".into(), d.into()), (k.into(), s.into())]))
+}
+fn tool_use(c: &J) -> J {
+    let (f, id) = (&c["function"], c["id"].clone());
+    let a = J::parse(f["arguments"].s().unwrap_or("").as_bytes());
+    let a = a.filter(|a| matches!(a, J::Obj(_))).unwrap_or(obj![]);
+    obj!["type" => "tool_use", "id" => id, "name" => f["name"].clone(),
+        "input" => a]
+}
+
 // ---- sampling: top_k, top_p, min_p, temperature, in llama.cpp's order
 
 struct Sp {
@@ -805,7 +937,8 @@ fn sse(w: &mut impl Write, j: &J) -> io::Result<()> {
 }
 
 fn err(m: &str) -> J {
-    obj!["error" => obj!["message" => m, "type" => "invalid_request_error"]]
+    obj!["type" => "error",
+        "error" => obj!["message" => m, "type" => "invalid_request_error"]]
 }
 
 // method, path, body, authorization
@@ -823,6 +956,8 @@ fn request(c: &TcpStream) -> Option<(String, String, Vec<u8>, String)> {
             break;
         } else if let Some(v) = h.strip_prefix("content-length:") {
             n = v.trim().parse().ok()?;
+        } else if h.starts_with("x-api-key:") {
+            auth = format!("bearer {}", l.trim()[10..].trim());
         } else if h.starts_with("authorization:") {
             // the scheme is case-insensitive, the key is not
             let (s, k) = l.trim()[14..].trim().split_once(' ').unwrap_or_default();
@@ -861,7 +996,11 @@ struct Srv {
 }
 
 impl Srv {
-    fn chat(&mut self, r: &J, w: &mut TcpStream) -> io::Result<()> {
+    // ant: r is an anthropic messages request, and so is the answer
+    fn chat(&mut self, r: &J, w: &mut TcpStream, ant: bool)
+            -> io::Result<()> {
+        let a;
+        let r = if ant { a = anth(r); &a } else { r };
         let (mut o, n, urls) = match prompt(r, &self.effort) {
             Ok(p) => p,
             Err(e) => return reply(w, 400, &err(&e)),
@@ -933,16 +1072,29 @@ impl Srv {
         let hold = stops.iter().map(|s| s.len()).max().unwrap_or(1) - 1;
         let stream = r["stream"].t();
 
-        let (id, name) = (format!("chatcmpl-{}", now.as_nanos()), &self.name);
+        let id = if ant { "msg_" } else { "chatcmpl-" };
+        let id = format!("{id}{}", now.as_nanos());
+        let name = &self.name;
         let chunk = |delta: J, fin: J| {
             obj!["id" => id.as_str(), "object" => "chat.completion.chunk",
                 "created" => now.as_secs() as usize, "model" => name.as_str(),
                 "choices" => vec![obj!["index" => 0, "delta" => delta,
                     "finish_reason" => fin]]]
         };
+        let mut e = Ev(0, None);
+        let msg = |c: J, fin: J, sq: J, u: J| obj!["id" => id.as_str(),
+            "type" => "message", "role" => "assistant", "model" => &**name,
+            "content" => c, "stop_reason" => fin, "stop_sequence" => sq,
+            "usage" => u];
         if stream {
             head(w, 200, "text/event-stream", "Cache-Control: no-cache\r\n")?;
-            sse(w, &chunk(obj!["role" => "assistant"], J::Null))?;
+            match ant {
+                true => ev(w, "message_start", obj!["type" => "message_start",
+                    "message" => msg(J::Arr(vec![]), J::Null, J::Null,
+                        obj!["input_tokens" => p.len(),
+                            "output_tokens" => 0])])?,
+                _ => sse(w, &chunk(obj!["role" => "assistant"], J::Null))?,
+            }
         }
 
         let t0 = Instant::now();
@@ -966,7 +1118,7 @@ impl Srv {
         let t1 = Instant::now();
 
         let [model, think, text, tool, end] = self.t;
-        let (mut st, mut n, mut sent) = (0, 0, [0; 2]);
+        let (mut st, mut n, mut sent, mut sq) = (0, 0, [0; 2], J::Null);
         let mut b = [vec![], vec![], vec![], vec![]]; // thinking, text, name, tool
         let mut calls = vec![];
         let mut cp = Cp(HashMap::new());
@@ -1026,9 +1178,17 @@ impl Srv {
                         "arguments" => if *args == NULL { raw }
                             else { args.to_string() }]]);
                 b[3].clear();
-                if stream {
-                    let c = calls[calls.len() - 1..].to_vec();
-                    sse(w, &chunk(obj!["tool_calls" => c], J::Null))?;
+                let c = &calls[calls.len() - 1];
+                if stream && ant {
+                    let a = c["function"]["arguments"].clone();
+                    let mut u = tool_use(c);
+                    let J::Obj(kv) = &mut u else { unreachable!() };
+                    kv[3].1 = obj![];
+                    e.delta(w, u, obj!["type" => "input_json_delta",
+                        "partial_json" => a])?;
+                } else if stream {
+                    let c = obj!["tool_calls" => vec![c.clone()]];
+                    sse(w, &chunk(c, J::Null))?;
                 }
             }
             if self.tok.ctl[t as usize] {
@@ -1041,8 +1201,11 @@ impl Srv {
                 b[i.unwrap_or(1)].extend(&self.tok.txt[t as usize]);
             }
             let find = |s: &&[u8]| b[1][sent[1]..].windows(s.len()).position(|w| w == *s);
-            if let Some(i) = stops.iter().filter_map(find).min() {
+            let hit = stops.iter().filter_map(|s| Some((find(s)?, *s)));
+            let hit = hit.min();
+            if let Some((i, s)) = hit {
                 b[1].truncate(sent[1] + i);
+                sq = String::from_utf8_lossy(s).into_owned().into();
                 break "stop";
             }
             for (i, key) in ["reasoning_content", "content"].iter().enumerate() {
@@ -1050,7 +1213,10 @@ impl Srv {
                     break;
                 }
                 if let Some(s) = part(&b[i], &mut sent[i], hold * i) {
-                    sse(w, &chunk(obj![key => s], J::Null))?;
+                    match ant {
+                        true => e.delta(w, blk(i, "").0, blk(i, &s).1)?,
+                        _ => sse(w, &chunk(obj![key => s], J::Null))?,
+                    }
                 }
             }
             self.fed.push(t);
@@ -1090,6 +1256,36 @@ impl Srv {
             "predicted_n" => n, "predicted_ms" => ms(dg),
             "predicted_per_second" => rate(n, dg)];
         *LAST.lock().unwrap() = timings.clone();
+        let why = match fin {
+            "length" => "max_tokens",
+            "tool_calls" => "tool_use",
+            _ if sq != NULL => "stop_sequence",
+            _ => "end_turn",
+        };
+        let au = || obj!["input_tokens" => p.len(), "output_tokens" => n];
+        if stream && ant {
+            for i in 0..2 {
+                if let Some(s) = part(&b[i], &mut sent[i], 0) {
+                    e.delta(w, blk(i, "").0, blk(i, &s).1)?;
+                }
+            }
+            e.to(w, J::Null)?;
+            ev(w, "message_delta", obj!["type" => "message_delta",
+                "delta" => obj!["stop_reason" => why, "stop_sequence" => sq],
+                "usage" => au()])?;
+            return ev(w, "message_stop", obj!["type" => "message_stop"]);
+        }
+        let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        if ant {
+            let mut c = vec![];
+            for i in 0..2 {
+                if !b[i].is_empty() {
+                    c.push(blk(i, &s(&b[i])).0);
+                }
+            }
+            c.extend(calls.iter().map(tool_use));
+            return reply(w, 200, &msg(c.into(), why.into(), sq, au()));
+        }
         if stream {
             for (i, key) in ["reasoning_content", "content"].iter().enumerate() {
                 if let Some(s) = part(&b[i], &mut sent[i], 0) {
@@ -1107,7 +1303,6 @@ impl Srv {
             }
             return w.write_all(b"data: [DONE]\n\n");
         }
-        let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
         let mut m = vec![("role".to_string(), "assistant".into())];
         m.push(("content".into(), s(&b[1]).into()));
         if !b[0].is_empty() {
@@ -1127,7 +1322,7 @@ impl Srv {
 // turn on the queue q for the one model, as does a park (then an exit if
 // the bool is set; an answer to the stream if there is one)
 enum Q {
-    Chat(J, TcpStream),
+    Chat(J, TcpStream, bool), // anthropic
     Park(Option<TcpStream>, bool),
 }
 // loaded, a chat running, a park queued, the timings of the last chat
@@ -1154,8 +1349,8 @@ fn conn(mut c: TcpStream, name: &str, auth: &Option<String>, q: &Sender<Q>)
             let m = obj!["id" => name, "object" => "model", "owned_by" => "gall"];
             reply(&mut c, 200, &obj!["object" => "list", "data" => vec![m]])
         }
-        ("POST", "/chat/completions") => match J::parse(&body) {
-            Some(r) => Ok(q.send(Q::Chat(r, c)).unwrap()),
+        ("POST", "/chat/completions" | "/messages") => match J::parse(&body) {
+            Some(r) => Ok(q.send(Q::Chat(r, c, p == "/messages")).unwrap()),
             None => reply(&mut c, 400, &err("the body is not json")),
         },
         ("POST", "/park") => Ok(q.send(Q::Park(Some(c), false)).unwrap()),
@@ -1427,12 +1622,13 @@ pub fn main(a: &[String]) {
             _ => rx.recv().ok(),
         };
         match r.unwrap_or(Q::Park(None, false)) {
-            Q::Chat(r, mut c) => {
+            Q::Chat(r, mut c, ant) => {
                 if TC.swap(false, Relaxed) {
                     gaps.push(t.elapsed());
                 }
                 BUSY.store(true, Relaxed);
-                if let Err(e) = objc2::rc::autoreleasepool(|_| s.chat(&r, &mut c)) {
+                let e = objc2::rc::autoreleasepool(|_| s.chat(&r, &mut c, ant));
+                if let Err(e) = e {
                     eprintln!("gall: {e}");
                 }
                 BUSY.store(false, Relaxed);
@@ -1451,4 +1647,26 @@ pub fn main(a: &[String]) {
             }
         }
     }
+}
+
+#[test]
+fn anthropic_requests_render_as_chat_completions() {
+    let p = |s: &str| prompt(&J::parse(s.as_bytes()).unwrap(), &NULL).unwrap();
+    let a = r#"{"system":[{"type":"text","text":"s"}],"thinking":{"type":
+        "disabled"},"tools":[{"name":"sh","description":"d","input_schema":
+        {"type":"object"}},{"type":"web_search_20250305","name":"w"}],
+        "messages":[{"role":"user","content":"hi"},{"role":"assistant",
+        "content":[{"type":"thinking","thinking":"t"},{"type":"tool_use",
+        "id":"t1","name":"sh","input":{"c":"ls"}}]},{"role":"user","content":
+        [{"type":"tool_result","tool_use_id":"t1","content":"a"},
+        {"type":"text","text":"go"}]}]}"#;
+    let o = r#"{"reasoning_effort":"none","tools":[{"type":"function",
+        "function":{"name":"sh","description":"d","parameters":{"type":
+        "object"}}}],"messages":[{"role":"system","content":"s"},{"role":
+        "user","content":"hi"},{"role":"assistant","content":"",
+        "reasoning_content":"t","tool_calls":[{"id":"t1","function":{"name":
+        "sh","arguments":"{\"c\":\"ls\"}"}}]},{"role":"tool","tool_call_id":
+        "t1","content":"a"},{"role":"user","content":"go"}]}"#;
+    let a = anth(&J::parse(a.as_bytes()).unwrap()).to_string();
+    assert_eq!(p(&a), p(o));
 }

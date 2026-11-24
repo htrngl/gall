@@ -6,7 +6,7 @@
 > 2. Bold and impudent behaviour.
 
 Gall runs Thinking Machines' Inkling-2-Mini on an Apple silicon Mac with
-24 GB of memory and serves it as an OpenAI-compatible API on your own
+24 GB of memory and serves it as an OpenAI- and Anthropic-compatible API on your own
 machine. The model is a mixture of experts (MoE) with 26 billion
 parameters, of which 3.4 billion are active for each token. Gall supports
 text, images, tool calls and structured JSON output.
@@ -38,14 +38,17 @@ been tested.
 4. Let Gall download the model files (12.7 GB). Progress appears in the
    menu bar.
 5. Select **Copy endpoint** and paste it into a client that supports an
-   OpenAI-compatible API. Use `inkling-2-mini` as the model name.
+   OpenAI-compatible API. Use `inkling-2-mini` as the model name. For a
+   client of the Anthropic Messages API, such as Bricolage, first set
+   **Settings** > **API** to **Anthropic**.
 
 To skip step 3 from a terminal, run
 `xattr -dr com.apple.quarantine /Applications/Gall.app` before you open
 the app. Compare the download with `Gall.dmg.sha256` from the same release
 if you want to check it.
 
-The endpoint is `http://127.0.0.1:9940/v1`. Gall supplies the model server;
+The endpoint is `http://127.0.0.1:9940/v1` (OpenAI) or
+`http://127.0.0.1:9940/v1/messages` (Anthropic). Gall supplies the model server;
 you use your own chat or coding client. **Ready** and **Unloaded** both
 mean it can accept a request. An unloaded model loads automatically.
 
