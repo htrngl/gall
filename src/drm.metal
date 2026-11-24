@@ -1,8 +1,12 @@
 // d_<fmt>: the 8 weights of unit e of the group at b, dequantized once,
 // and their common scale; their inputs are the float4s at xo_<fmt>(e) and
-// NH_<fmt> after it
+// NH_<fmt> after it. as in mv.metal, bytes and grid magnitudes come as
+// subnormal halves (b 2^-24) and nvfp4 nibbles as e2m1 2^-14, with the
+// powers of two in the scale: the products are those of the plain decode,
+// bit for bit (q8_0 stays a convert: the half form ran slower). G: the
+// format's table in threadgroup memory (TG_<fmt>)
 #define DQ(F) static inline float d_##F(W b, uint e, thread float4 &va, \
-                                        thread float4 &vb)
+    thread float4 &vb, threadgroup const ulong *G)
 #define XO(F) static inline uint xo_##F(uint e) { return 8*e; }
 #define NH_q8_0 4
 #define NH_q4_k 4
@@ -16,7 +20,26 @@
 #define NH_nvfp4 8
 XO(q8_0) XO(q4_k) XO(q5_k) XO(q6_k) XO(iq2_xxs) XO(iq2_xs) XO(iq2_s)
 XO(iq3_xxs)
+// the table of a format: ulongs, and their fill by the 32 lanes
+#define TF(T, n, ty) for (uint i = l; i < n; i += 32) \
+    ((threadgroup ty *)tgg)[i] = T[i];
+#define TG_q8_0 1,
+#define TG_q4_k 1,
+#define TG_q5_k 1,
+#define TG_q6_k 1,
+#define TG_nvfp4 1,
+#define TG_iq2_xxs 256, TF(iq2xxs_grid, 256, ulong)
+#define TG_iq2_xs 512, TF(iq2xs_grid, 512, ulong)
+#define TG_iq2_s 1, // 8 KB: a copy a threadgroup costs more than it saves
+#define TG_iq3_xxs 128, TF(iq3xxs_grid, 256, uint)
+#define TG_iq4_nl 128, for (uint i = l; i < 256; i += 32) \
+    ((threadgroup half2 *)tgg)[i] = half2(k_iq4nl[i & 15], k_iq4nl[i >> 4]);
+#define TGA(n, ...) threadgroup ulong tgg[n]; __VA_ARGS__ \
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#define TGX(...) TGA(__VA_ARGS__)
+#define W4(p) (*(device const uint *)(p))
 
+// a signed byte b as the half of b + 128, less 128 2^-24
 DQ(q8_0) {
     W c = b + (e/4)*34;
     device const packed_char4 *q =
@@ -28,82 +51,85 @@ DQ(q8_0) {
 DQ(q4_k) {
     uint j = e/4, sh = 4*(j & 1);
     float2 d = D2*k4(b + 4, j);
-    Q q = (Q)(b + 16 + 32*(j/2) + 8*(e%4));
-    va = d.x*float4((uint4(q[0]) >> sh) & 15) - d.y;
-    vb = d.x*float4((uint4(q[1]) >> sh) & 15) - d.y;
+    W q = b + 16 + 32*(j/2) + 8*(e%4);
+    va = d.x*0x1p24f*HU(W4(q) >> sh & 0x0f0f0f0f) - d.y;
+    vb = d.x*0x1p24f*HU(W4(q + 4) >> sh & 0x0f0f0f0f) - d.y;
     return 1;
 }
 
 DQ(q5_k) {
     uint j = e/4, sh = 4*(j & 1), o = 8*(e%4);
     float2 d = D2*k4(b + 4, j);
-    Q h = (Q)(b + 16 + o), q = (Q)(b + 48 + 32*(j/2) + o);
-    va = d.x*float4(((uint4(q[0]) >> sh) & 15) +
-                    (((uint4(h[0]) >> j) & 1) << 4)) - d.y;
-    vb = d.x*float4(((uint4(q[1]) >> sh) & 15) +
-                    (((uint4(h[1]) >> j) & 1) << 4)) - d.y;
+    W h = b + 16 + o, q = b + 48 + 32*(j/2) + o;
+    va = d.x*0x1p24f*HU((W4(q) >> sh & 0x0f0f0f0f) |
+                        (W4(h) >> j & 0x01010101) << 4) - d.y;
+    vb = d.x*0x1p24f*HU((W4(q + 4) >> sh & 0x0f0f0f0f) |
+                        (W4(h + 4) >> j & 0x01010101) << 4) - d.y;
     return 1;
 }
 
+// the k-quant's 6-bit values less 32
 DQ(q6_k) {
     uint n = e/16, g = (e/4)%4, o = 8*(e%4), sh = 4*(g/2);
-    Q q = (Q)(b + 64*n + 32*(g & 1) + o), h = (Q)(b + 128 + 32*n + o);
-    va = float4(int4(((uint4(q[0]) >> sh) & 15) |
-                     (((uint4(h[0]) >> 2*g) & 3) << 4)) - 32);
-    vb = float4(int4(((uint4(q[1]) >> sh) & 15) |
-                     (((uint4(h[1]) >> 2*g) & 3) << 4)) - 32);
-    return F16(b + 208)*
+    uint2 q = (h2(b + 64*n + 32*(g & 1) + o) >> sh & 0x0f0f0f0f) |
+              (h2(b + 128 + 32*n + o) >> 2*g & 0x03030303) << 4;
+    va = HU(q.x) - 0x1p-19f, vb = HU(q.y) - 0x1p-19f;
+    return F16(b + 208)*0x1p24f*
         (float)((device const char *)b)[192 + 8*n + 2*g + o/16];
 }
 
+// both nibbles of a byte, as halves, from G
 DQ(iq4_nl) {
     W c = b + (e/4)*18;
     uint4 q = uint4(*(Q)(c + 2 + 4*(e%4)));
-    va = LUT4(k_iq4nl, (q & 15)), vb = LUT4(k_iq4nl, (q >> 4));
+    threadgroup const half2 *t = (threadgroup const half2 *)G;
+    half2 v0 = t[q.x], v1 = t[q.y], v2 = t[q.z], v3 = t[q.w];
+    va = float4(v0.x, v1.x, v2.x, v3.x), vb = float4(v0.y, v1.y, v2.y, v3.y);
     return F16(c);
 }
 
 DQ(nvfp4) {
     W a = b + (e/8)*36;
-    uint c = a[e%8/2];
-    uint4 q = uint4(*(Q)(a + 4 + 4*(e%8)));
-    va = LUT4(k_fp4, (q & 15)), vb = LUT4(k_fp4, (q >> 4));
-    return c == 127 ? 0 : (float)as_type<half>((ushort)((c & 127) << 7))*256;
+    uint c = a[e%8/2], q = W4(a + 4 + 4*(e%8));
+    va = hd4(F4(q, 0), F4(q, 8)), vb = hd4(F4(q, 4), F4(q, 12));
+    return c == 127 ? 0 :
+        (float)as_type<half>((ushort)((c & 127) << 7))*0x1p22f;
 }
 
 #define GRID(d, g0, g1, sg) \
-    va = SGN(as_type<uchar4>(uint(g0)), sg, M0); \
-    vb = SGN(as_type<uchar4>(uint(g1)), sg, M1); \
+    va = H4(uint(g0), uint(sg)*0x01000400, 5, 4); \
+    vb = H4(uint(g1), uint(sg)*0x01000400, 1, 0); \
     return d
 
 DQ(iq2_xxs) {
     uint ib = e/4, l = e%4;
     H a = (H)(b + 2 + 8*ib);
     uint aux = a[2] | (uint(a[3]) << 16);
-    ulong g = iq2xxs_grid[b[2 + 8*ib + l]];
-    GRID(F16(b)*(0.5f + (aux >> 28))*0.25f, g, g >> 32,
+    ulong g = G[b[2 + 8*ib + l]];
+    GRID(F16(b)*(0.5f + (aux >> 28))*0x1p22f, g, g >> 32,
          ksigns_iq2xs[(aux >> 7*l) & 127]);
 }
 
 DQ(iq2_xs) {
     uint q = ((H)(b + 2))[e];
-    ulong g = iq2xs_grid[q & 511];
+    ulong g = G[q & 511];
     float ls = (b[66 + e/4] >> 4*((e%4)/2)) & 15;
-    GRID(F16(b)*(0.5f + ls)*0.25f, g, g >> 32, ksigns_iq2xs[q >> 9]);
+    GRID(F16(b)*(0.5f + ls)*0x1p22f, g, g >> 32, ksigns_iq2xs[q >> 9]);
 }
 
 DQ(iq2_s) {
     ulong g = iq2s_grid[b[2 + e] | (((b[66 + e/4] >> 2*(e%4)) & 3) << 8)];
     float ls = (b[74 + e/4] >> 4*((e%4)/2)) & 15;
-    GRID(F16(b)*(0.5f + ls)*0.25f, g, g >> 32, b[34 + e]);
+    GRID(F16(b)*(0.5f + ls)*0x1p22f, g, g >> 32, b[34 + e]);
 }
 
 DQ(iq3_xxs) {
     uint ib = e/4, l = e%4;
     H a = (H)(b + 66 + 4*ib);
     uint aux = a[0] | (uint(a[1]) << 16);
-    GRID(F16(b)*(0.5f + (aux >> 28))*0.5f, iq3xxs_grid[b[2 + 2*e]],
-         iq3xxs_grid[b[3 + 2*e]], ksigns_iq2xs[(aux >> 7*l) & 127]);
+    threadgroup const uint *t = (threadgroup const uint *)G;
+    GRID(F16(b)*(0.5f + (aux >> 28))*0x1p23f, t[b[2 + 2*e]],
+         t[b[3 + 2*e]], ksigns_iq2xs[(aux >> 7*l) & 127]);
 }
 
 // up to 8 activation rows against one read of an expert slab (or of a
@@ -126,6 +152,7 @@ typedef device const packed_float4 *X4;
 kernel void x_##F##_##C(ARG) { \
     device const uint *u = tab + (65*(C - 1) + tg.y)*10; \
     if (!u[1]) return; \
+    TGX(TG_##F) \
     uint U = p.n_in/8, gb = p.rb*256/p.n_in, r0 = tg.x*R; \
     W w0 = w + ((ulong)u[0]*p.n_out + r0)*p.rb; \
     X4 xp[C]; \
@@ -137,7 +164,7 @@ kernel void x_##F##_##C(ARG) { \
             xa[j] = xp[j][64*k], xb[j] = xp[j][64*k + NH_##F/4]; \
         for (uint i = 0; i < R; i++) { \
             float4 a, b; \
-            float d = d_##F(w0 + i*p.rb + k*gb, l, a, b); \
+            float d = d_##F(w0 + i*p.rb + k*gb, l, a, b, tgg); \
             for (uint j = 0; j < C; j++) \
                 s[i][j] += d*(dot(a, xa[j]) + dot(b, xb[j])); \
         } \
@@ -163,6 +190,7 @@ kernel void x_##F(ARG) { \
          gb = p.rb*256/p.n_in, r0 = tg.x*16 + m, \
          e0 = u[2 + min(n, c - 1)], e1 = u[2 + min(n + 1, c - 1)]; \
     if (!c) return; \
+    TGX(TG_##F) \
     W w0 = w + ((ulong)u[0]*p.n_out + r0)*p.rb; \
     X x0 = XU(e0) + (m & 1)*NH_##F, x1 = XU(e1) + (m & 1)*NH_##F; \
     simdgroup_float8x8 a, b[4], s[2][4]; \
@@ -174,7 +202,7 @@ kernel void x_##F(ARG) { \
         for (uint i = 0; i < 4; i++) TE(b[i]) = float2(xa[i], xb[i]); \
         for (uint j = 0; j < 2; j++) { \
             float4 va, vb; \
-            float d = d_##F(w0 + 8*j*p.rb + g*gb, 4*q + n/2, va, vb); \
+            float d = d_##F(w0 + 8*j*p.rb + g*gb, 4*q + n/2, va, vb, tgg); \
             va *= d, vb *= d; \
             for (uint i = 0; i < 4; i++) { \
                 TE(a) = float2(va[i], vb[i]); \
