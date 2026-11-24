@@ -56,8 +56,8 @@ pub trait Lm {
     fn image(&mut self, _url: &str) -> Result<Range<u32>, String> {
         Err("this server has no vision model".into())
     }
-    // drafting for the steps to come, on or off; what it did, for the log
-    fn draft(&mut self, _on: bool) -> String {
+    // drafting since the last call, for the log
+    fn draft(&mut self) -> String {
         String::new()
     }
 }
@@ -112,8 +112,8 @@ impl Lm for Lazy {
     fn image(&mut self, u: &str) -> Result<Range<u32>, String> {
         self.get().image(u)
     }
-    fn draft(&mut self, on: bool) -> String {
-        self.get().draft(on)
+    fn draft(&mut self) -> String {
+        self.get().draft()
     }
 }
 
@@ -917,8 +917,7 @@ impl Srv {
         let k = k.max(snap); // not fed for this request
         self.fed.clear();
         self.fed.extend(&p);
-        // a constrained answer takes tokens the drafter does not foresee
-        self.lm.draft(js.is_none());
+        self.lm.draft();
         let mut lg = self.lm.feed(&p[at..]);
         let t1 = Instant::now();
 
@@ -1021,7 +1020,7 @@ impl Srv {
             rate(np, dp),
             dp.as_secs_f64(),
             rate(n, dg),
-            self.lm.draft(true)
+            self.lm.draft()
         );
         let usage = obj!["prompt_tokens" => p.len(), "completion_tokens" => n,
             "total_tokens" => p.len() + n];
@@ -1137,7 +1136,7 @@ struct Ink(crate::model::Model, Vec<f32>, crate::model::snap::Snaps,
 
 impl Lm for Ink {
     fn reset(&mut self) {
-        self.draft(true);
+        self.draft();
         self.0.reset()
     }
     // a row verified ahead answers without a pass (Dr::next)
@@ -1156,7 +1155,7 @@ impl Lm for Ink {
         self.0.pos
     }
     fn truncate(&mut self, n: usize) -> bool {
-        self.draft(true);
+        self.draft();
         self.0.truncate(n)
     }
     // the checkpoint is before the last token: the same prompt again
@@ -1180,10 +1179,9 @@ impl Lm for Ink {
         r
     }
     // also drops the rows verified ahead: the model is about to move
-    fn draft(&mut self, on: bool) -> String {
+    fn draft(&mut self) -> String {
         let Some((_, s, c)) = &mut self.5 else { return String::new() };
         s.drop();
-        s.block = (!on).then_some(0);
         let n = [s.drafts, s.rows[0], s.rows[1]];
         let d = [0, 1, 2].map(|i| n[i] - c[i]);
         *c = n;
