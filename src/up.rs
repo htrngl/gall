@@ -57,21 +57,24 @@ fn sys(k: &str) -> i32 {
 
 // one model fits on the gpu: open the machine lock, park at memory
 // pressure (warn) that lasts 30 s (a load raises it for a moment), and
-// leave before memory runs out
+// leave when memory stays short for 3 s (a load takes the free level
+// from 79 to 9 for 2 s)
 static FD: AtomicI32 = AtomicI32::new(-1);
 pub fn guard(park: impl Fn() + Send + 'static) {
     let f = fs::File::create("/tmp/gall.lock").unwrap();
     FD.store(f.into_raw_fd(), Relaxed);
-    thread::spawn(move || (0..).fold(0, |n, _| {
+    thread::spawn(move || (0..).fold((0, 0), |(n, s), _| {
         let l = sys("kern.memorystatus_vm_pressure_level");
-        if l >= 4 || sys("kern.memorystatus_level") < 6 {
-            eprintln!("gall: memory is short, leaving");
+        let free = sys("kern.memorystatus_level");
+        if s >= 3 {
+            eprintln!("gall: memory is short ({l}, {free}% free), leaving");
             exit(1)
         } else if n >= 30 {
             park()
         }
         thread::sleep(Duration::from_secs(1));
-        if l >= 2 { n + 1 } else { 0 }
+        let f = |c, k| if c { k + 1 } else { 0 };
+        (f(l >= 2, n), f(l >= 4 || free < 6, s))
     }));
 }
 
