@@ -1,33 +1,47 @@
 # limits and next steps
 
-a review of the proposed kernel rewrite, with measurements made on 23
-November 2026 on the 24 GB M2 MacBook Air (warm, the app's server idle
-beside it: rates are about 20% under the cool figures in ENGINE.md).
+the limit model and the outcome of each proposal from the review of 23
+November 2026, measured to 24 November 2026 on the 24 GB M2 MacBook Air
+(warm, interleaved medians: rates are about 20% under the cool figures
+in ENGINE.md).
 
 ## the limit model
 
 a token multiplies 4.8 G weights: 3.06 G expert (63.7 M per visit),
-1.29 G attention, 0.46 G head. it reads 2.9 GB.
+1.29 G attention, 0.46 G head. it reads 2.9 GB. at 87 GB/s that is 33
+ms, so serial decode cannot pass 30 tokens/s while a token reads every
+byte once. it now takes 39.5-39.8 ms of GPU time (about 25 tokens/s).
 
-- memory: 2.9 GB at 87 GB/s is 33 ms. no kernel work passes 30 tokens/s
-  while a token reads every byte once.
-- arithmetic: every 2-4.5 bit format decodes at 140-170 G weights/s
-  (IQ3_XXS 149, IQ4_NL 142, NVFP4 142, IQ2_S 150), whatever its decode.
-  3.06 G expert weights at 150 is 20 ms, which is the measured 22 ms.
-- prefill runs 130 tokens/s, 624 G weight uses/s: the tile path does 4
-  times the multiplies of the mat-vec path. the cap is per weight
-  decoded, not per multiply.
+the earlier "150 G weights/s cap" was not a cap. it was conversion and
+sign work per weight: bytes read as subnormal halves (byte b is b 2^-24)
+convert for free, the power of two goes into the block scale, and the
+results are bit-identical. from a cached 64 KB slab Q8_0 runs 195-199 G
+weights/s.
 
-so serial decode has about 13 ms between today (46 ms) and its floor
-(33 ms), and every gain past the floor needs more than one token per
-read of the weights.
+where a token goes now, against the floor of its bytes at 87 GB/s:
+
+| part | ms | floor, ms |
+| --- | ---: | ---: |
+| IQ3_XXS experts | 5.95 | 5.4 (arithmetic-bound) |
+| NVFP4 experts | 5.86 | 6.0 |
+| IQ2_S experts | 3.37 | 2.7 |
+| IQ4_NL, IQ2_XS, IQ2_XXS experts | 0.92 | 0.82 |
+| experts, total | ~16.1 | 14.9 |
+| Q8_0 attention | 12.9 | 12.8 |
+| Q5_K head and attention | 4.26 | 4.2 |
+| Q6_K, Q4_K attention | 1.68 | 1.6 |
+| small-kernel chain | ~4.7 | ~1.6 |
+
+decode rates by format, G weights/s before and after: IQ3_XXS 142 ->
+204, IQ2_S 147 -> 194, IQ2_XXS 166 -> 241, IQ2_XS 141 -> 183, NVFP4 141
+-> 157, IQ4_NL 143 -> 158, Q4_K 110 -> 133.
 
 ## measured here
 
 - Q8_0 attention is incompressible. over blocks 0, 7, 12, 20: entropy
   7.56-7.68 bits per weight, 29.5 distinct values per block of 32, every
   block's maximum 127. a lossless smaller format saves at most 4%, so
-  the 1.11 GB stays (the lossy RQ path was already removed).
+  the 1.11 GB stays.
 - expert overlap, 96 greedy tokens after `tests/short` and after
   `ref/2k`, all 48 visits:
 
@@ -36,111 +50,87 @@ read of the weights.
   | distinct experts per visit | 8 | 12.6 | 16.3 | 19.4 | 22.2 | 24.8 | 27.2 | 29.5 |
 
   consecutive tokens share 42-44% (22% in visit 0, 73% in visit 17);
-  tokens 4 apart share 35%. the same layer on consecutive passes of one
-  token shares 58%, which nothing can use: the passes are sequential.
-- the bus has room only beside a compute-bound kernel. the `bw` kernel
-  alone: 69 GB/s. with 4 CPU threads streaming 16 GB/s: `bw` 62, total
-  78. the slower `bw` shapes (49 and 17 GB/s) lost nothing to the CPU.
-- `bw` falls from 70 to 49 to 17 GB/s as a thread's run grows from 1 KB
-  to 16 KB to 256 KB: the bytes in flight per threadgroup set the rate,
-  so 87 GB/s is the ceiling of one access shape, not of the bus (102.4
-  GB/s nominal).
+  tokens 4 apart share 35%.
+- the bus: no `bw` shape (4-1024 words per thread, lanes adjacent or
+  not) and no anonymous buffer beat the Q8_0 mat-vec, so 87 GB/s stays
+  the floor. one 7.5 MB tensor read again runs 117-119 GB/s against 88
+  cold: that is the system cache, not the bus.
+- barriers: removing all of them saves 3.4-4 ms. the cost is each small
+  kernel's own latency, not the barrier (a barrier and a launch cost 1-2
+  us). ms per token by kind: dots 0.38, elem 0.56, low 0.84, ctl 0.79,
+  rows 0.54, top8 0.04, post 0.51, score 0.41, gather 0.50, merge 0.05,
+  act 0.21.
+- the model is sensitive to single-ulp changes through near-tied
+  experts, so kernel work is held to bit-identity: `gall mvtest` and
+  `gall dr --drift` print hashes of the output bits.
 
-## the proposals reviewed
+## the proposals and their outcomes
 
-1. IQ3_XXS as 4-bit codes: no gain. the 4-bit kernels run at 142 G
-   weights/s, IQ3_XXS at 149. the same weights would decode no faster
-   and read 33% more bytes, for 7.5 GB of memory.
-2. a sub-block per thread: tried twice, worth 1 ms at best. skip.
-3. int8 activations: not exact, and the multiply is not the limit.
-4. the batched verify rewrite: right, and the overlap above sizes it.
-   an extra row's floor is its unshared experts (13 ms for row 2, 6 ms
-   for row 8, at today's decode rate) plus 3-5 ms. today it costs
-   20-54 ms. expected pass times against today's:
+1. batched verify on tiles: done. slabs of 3+ uses and dense matrices
+   in passes of 3+ rows go through `simdgroup_matrix` tiles; 1-2 uses
+   stay dots. pass ms for 1-8 rows: 47 67 93 114 150 181 235 244 -> 41.5
+   61 84 96 105 115 125 135 (the estimate was 47-140).
+2. drafts that cost nothing: copy drafts done (96-97% of copied rows
+   kept on a code edit, about 6 rows a pass); drafting now runs under
+   `response_format`. forced tokens: ruled out (below).
+3. a cheap head for the drafter: done. a shortlist of 32,768 tokens; a
+   7-token draft 23.7 -> 8 ms, tokens a pass at block 7 code 5.51 ->
+   5.23, maths 3.71 -> 3.70, prose 2.52 -> 2.51.
+4. draft while verifying: ruled out (below).
+5. a tree, not a chain: ruled out (below).
+6. sixteen rows: ruled out (below).
+7. fewer dispatches: ruled out (below). the dispatches are not where
+   the time is; see barriers above.
+8. what capped decode at 150 G weights/s: found. it was conversion and
+   sign work (the limit model above). decode 45.2 -> 39.5-39.8 ms.
+9. the CPU beside the expert kernels: ruled out (below).
+10. commit the next token before the wait: done (`Model.greedy`), 0.4-0.5
+    ms a token, in `gall run` and in the server for temperature 0
+    requests without `response_format` and without the drafter.
+11. the true bus ceiling: measured, 87 GB/s holds (above).
+12. cooling: open.
 
-   | rows | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
-   | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-   | today, ms | 47 | 67 | 93 | 114 | 150 | 181 | 235 | 244 |
-   | tiles, ms | 47 | 66 | 81 | 95 | 107 | 119 | 130 | 140 |
+## still open
 
-   two rows gain nothing; the gain is in long accepted runs.
-
-## suggestions, by expected gain
-
-### more than one token per read
-
-1. batched verify on tiles (as 4 above): slabs sorted by expert, a slab
-   decoded once to halves in threadgroup memory, rows through
-   `simdgroup_matrix`; attention, the head and the small ops likewise.
-   eight accepted rows then cost 17.5 ms a token (57 tokens/s).
-2. drafts that cost nothing. the drafter takes 15-31 ms a block; these
-   take none, and the existing controller gates them the same way:
-   - forced tokens: under `response_format`, tool-call wrappers and the
-     chat template, a grammar that allows one token needs no logits.
-     run such runs through prefill (130 tokens/s), no head, no verify.
-     today these requests have drafting off.
-   - context copy: propose the continuation of the longest suffix match
-     in the prompt and the answer so far (code edits, quoted text, JSON
-     keys, identifiers). use dspark only where no match exists.
-3. a cheap head for the drafter. proposals need not be exact: score a
-   shortlist (tokens in context plus the frequent ones, about 16 k rows
-   of `P`) in place of 200 k rows, 7 times a block.
-4. draft while verifying. the drafter waits for the verified features
-   of its last block. test acceptance with its context one block late;
-   if it holds, the draft overlaps the verify pass and leaves the
-   cycle, and the drafter can move to the CPU (Accelerate) or the
-   Neural Engine, which share no cores with the GPU.
-5. a tree, not a chain. with a row at 10 ms, verify the drafter's second
-   choice at the first uncertain position when its probability passes
-   rate x row cost (0.2 at 21 tokens/s).
-6. sixteen rows on confident runs: row 8 already shares 71% of its
-   experts.
-
-with 1-3, code and mathematics should run at 30-37 tokens/s and copied
-or forced spans at 50 or more. prose gains little: a first proposal
-accepted 40% of the time breaks even at a 10 ms row.
-
-### serial decode, 46 ms towards 33
-
-7. fewer dispatches. 1,071 dispatches and their barriers cost about
-   5 ms (42 ms with no barriers). per visit, 22 dispatches can be 7:
-   - q, k, v, rel, gate as one dispatch over 8,576 rows with a row table;
-   - a chain on one 2,304-vector (dots, elem, low, ctl; then dots, elem,
-     low, ctl, rows, top8) as one threadgroup with threadgroup barriers;
-   - post, score, gather, merge as one or two;
-   - act inside `up`: a threadgroup takes row r and row r + 1152.
-   expect 2-4 ms. the far end is one dispatch per token that takes
-   work from an atomic counter; register pressure makes it a risk.
-8. find what caps decode at 150 G weights/s before more kernel work.
-   run each kernel on one 64 KB slab again and again, so memory is out:
-   if Q8_0 also stops near 150, the cap is the convert, multiply and
-   `simd_sum` skeleton or the thread launch rate (a thread does 144-576
-   weights), and no format or decode change helps.
-9. the CPU beside the expert kernels. they leave 30 GB/s of the bus
-   unused and the CPU's traffic cost them nothing above. four P cores
-   decode perhaps 15-20 G weights/s, 2 ms a token, if a split dispatch
-   can wait for them (`MTLSharedEvent`, or the CPU polling a flag the
-   GPU writes). measure the cost of 96 command buffer joins first.
-10. sample on the GPU and commit the next token before the wait: the
-    GPU never idles between tokens (0.4 ms a token; exact at
-    temperature 0).
-11. the true bus ceiling: `bw` at 8-32 words per thread, and one tensor
-    copied to an anonymous buffer against the file mapping. if either
-    passes 87 GB/s, the floor moves below 33 ms.
-
-with 7-10 serial decode should reach 38-41 ms (24-26 tokens/s).
-
-### outside the code
-
-12. cooling. throughput falls 10% after 2.5 minutes; a thermal pad to
-    the case or a cooled stand keeps the cool rate.
+- drafted prose is about level with serial decode (0.97-1.05 of its
+  rate). the controller must keep it at or above serial; that work is
+  not done.
+- a grammar for tool calls built from the request's `tools` with the
+  existing schema matcher, for validity. forced runs would also need a
+  canonical form.
+- IQ3_XXS and IQ2_S run about 1.2 ms over their floors together.
+- the small-kernel chain runs about 3 ms over its floor.
+- cooling: throughput falls 10% after 2.5 minutes; a thermal pad to the
+  case or a cooled stand keeps the cool rate.
 
 ## ruled out
 
 - a smaller exact Q8_0 (entropy above).
+- IQ3_XXS as 4-bit codes, a sub-block per thread, int8 activations.
 - tables of partial dots for the grid formats: 16 KB per input
   position, and a thread has registers only.
 - exact pruning of the head: a norm bound on 2,304 dimensions is about
   45 times the typical logit, so it excludes nothing.
 - reuse across the three passes of the core layers: each pass needs the
   one before.
+- forced tokens: 0 of 201 constrained positions allow exactly one token
+  (whitespace and alternative tokenisations always fit). tool-call
+  wrappers and the chat template have no grammar.
+- draft while verifying: with its context 4 tokens late, first-slot
+  acceptance falls 0.89 -> 0.48 code, 0.77 -> 0.34 maths, 0.61 -> 0.22
+  prose.
+- a tree on the second choice: right at the break 0.33 code, 0.38
+  maths, 0.24 prose; a branch row returns at most 0.27 tokens against a
+  cost of 0.23-0.55, under 0.5% net.
+- more rows: the conv ring caps a pass at 13 rows; a 13-row build gave
+  18.6 ms a token against 19.0 at 8 (2%), dropped.
+- fewer dispatches: fusing dots and elem, rows and top8, or score and
+  gather was each slower. resource barriers, gate rows in barrier
+  shadows and a split post gave no gain or were slower. act inside `up`
+  cannot be bit-identical under fast math (about half the outputs 1 ulp
+  off); `contract(off)` moves ref/short kl to 1.31e-3 and gives 2
+  mismatches on ref/2k.
+- the CPU beside the GPU: 96 encoder splits cost 3.7 ms, 19 ms with the
+  event waits.
+- Q8_0 staged through threadgroup memory in verify: 12 ms slower.
+  threadgroup tables pay at 1-2 KB, not at IQ2_S's 8 KB.

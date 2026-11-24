@@ -34,6 +34,7 @@ inputs; use each dump’s `prompt.txt` to reproduce it.
 | --- | --- | --- | --- |
 | `ref/short` | 34 tokens | one token per graph | 2000 |
 | `ref/short.b256` | same | one batch | 2000 |
+| `ref/short.400` | same | one token per graph, 401 logit rows | 400 |
 | `ref/2k` | 2331 tokens, head of `docs/build.md` | one token per graph | 256 |
 | `ref/2k.b256` | same | batches of 256 | 256 |
 | `ref/8k.b256` | 10504 tokens, head of `tools/server/README.md` | batches of 256 | 64 |

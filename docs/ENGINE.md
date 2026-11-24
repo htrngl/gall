@@ -123,56 +123,82 @@ sliding-window and full attention, short convolutions, cross-pass
 messages and 128 experts with 8 selected per visit.
 
 Gall encodes one command buffer per decoded token while the previous
-token runs. A measured short-context token used 1,071 dispatches and
-48.2 ms of GPU time; wall time was about 0.4 ms higher. Weight processing
-accounted for 44.2 ms, with small kernels measured at about 4.9 ms.
+token runs. Decode uses a concurrent encoder with a barrier before each
+dispatch, except among the q, k, v, rel and gate projections, which read
+the same input. On 23–24 November 2026, warm and in interleaved runs, a
+short-context token took 39.5–39.8 ms of GPU time (about 25 tokens/s),
+down from 45.2 ms.
 
-Expert kernels took about 23 ms per token and were limited by arithmetic.
-Three tuning passes produced no further improvement. On 23 November 2026,
-two rows per threadgroup raised the NVFP4 and IQ4_NL down kernels from
-62–75 GB/s to about 80 GB/s, and one 16-bit load of the two IQ3_XXS grid
-indices raised that kernel from 54 to 57 GB/s. Decode uses a concurrent
-encoder with a barrier before each dispatch, except among the q, k, v,
-rel and gate projections, which read the same input. Back to back, the
-short-context rate went from 20.0 to 20.9 tokens/s (49.4 to 47.5 ms of
-GPU time per token).
+With greedy decoding, Gall commits the next token before it waits for the
+current one, using the GPU’s greedy token ID (`Model.greedy`). The head of
+the next token waits on a shared event, so the logits and ID stay readable
+until then. This saves 0.4–0.5 ms of wall time a token, so wall time equals
+GPU time. `gall run` uses it, and so does the server for temperature 0
+requests without `response_format` when no drafter is loaded.
 
 The weight bytes read per token are about 2.9 GB: 1.30 GB of experts,
 1.11 GB of Q8_0 attention, 0.32 GB of output head and 0.18 GB of other
 attention. At the Q8_0 rate of about 87 GB/s that is 33 ms, or 30
-tokens/s, with no time for small kernels. The IQ kernels remain at
-39–57 GB/s. Tests that removed parts of the IQ3_XXS unit showed that
-the loads alone ran at about 87 GB/s; the scale and sign work took the
-rest. Integer sign masks, sign-mask tables, threadgroup copies of the
-IQ3_XXS tables, half-precision dots, two units per lane, larger
-threadgroups for IQ3_XXS and a fixed loop count did not help. Tables
-with 16-byte rows were slow from constant and threadgroup memory, and a
-16 KB pre-signed IQ3_XXS grid fell to 22 GB/s.
+tokens/s. No `bw` access shape and no anonymous copy of a tensor read
+faster than the Q8_0 mat-vec. A 7.5 MB tensor read again ran at 117–119
+GB/s, against 88 GB/s cold, from the system cache.
 
-The IQ2 grids have 8-byte rows (2, 4 and 8 KB), which read slowly from
-the constant cache. Their mat-vecs copy the grid to threadgroup memory
-and run four simdgroups per threadgroup: IQ2_XXS went from 39 to 43 GB/s,
-IQ2_XS from 39 to 41 and IQ2_S from 43 to 47. Prefill and batched
-verification keep the constant tables. Back to back, decode went from
-21.2 to 21.4 tokens/s (46.6 to 46.2 ms of GPU time). In weights per second, the grid
-formats and NVFP4 all reach about 140–150 billion, which suggests a
-per-weight instruction limit rather than a memory limit.
+| Part of a token | GPU ms | Floor at 87 GB/s |
+| --- | ---: | ---: |
+| IQ3_XXS experts | 5.95 | 5.4 |
+| NVFP4 experts | 5.86 | 6.0 |
+| IQ2_S experts | 3.37 | 2.7 |
+| IQ4_NL, IQ2_XS and IQ2_XXS experts | 0.92 | 0.82 |
+| All experts | about 16.1 | 14.9 |
+| Q8_0 attention | 12.9 | 12.8 |
+| Q5_K head and attention | 4.26 | 4.2 |
+| Q6_K and Q4_K attention | 1.68 | 1.6 |
+| Small kernels | about 4.7 | about 1.6 |
 
-With no barriers at all (incorrect results), a token took 42 ms, which
-bounds the gain from more concurrency at about 5 ms. Most of that is in
-the weight kernels: skipping the barrier before a single kind of small
-kernel saved 0.7 ms at most (the attention softmax, gather and merge),
-and skipping small kernels outright saved nothing measurable. The loop
-controllers (`low`, `ctl`) and the router (`rows`) read about 0.2 GB of
-f16 weights per token at 75–100 GB/s. The f16 attention path finds the
-head maxima in `gather`, so it has no `smax` dispatch.
+IQ3_XXS is limited by arithmetic, not by memory. The other weight kernels
+are within 0.7 ms of their floors.
 
-The k-quant kernels unpack four bytes as a word. The Q5_K decode of the
-scales limits the head: without it the head read at 82–87 GB/s. A lane
-now takes two units of a sub-block, one scale decode for both, which
-raised the head from 73 to 75 GB/s (4.3 ms). Both nibbles per lane, a
-whole sub-block per lane, word loads and simdgroup shuffles of the
-scales were slower. Q6_K reads at 87 GB/s.
+The grid and k-quant kernels read weight bytes as subnormal halves: byte
+`b` is `b * 2^-24`, which converts at no cost, and the power of two goes
+into the block scale. Grid signs are set by one multiply and shifts. NVFP4
+nibbles become half bits 9–11 and 15 (an e2m1 value times 2^-14). Results
+are bit-identical to the previous kernels. The IQ3_XXS and IQ2 grids are
+in threadgroup memory; IQ4_NL looks up a byte in a threadgroup table of
+the halves of both nibbles. IQ2_S and IQ2_XS lanes take two units each,
+loaded together, with 8 rows split between the half-simdgroups.
+
+| Format | Before, G weights/s | Now, G weights/s |
+| --- | ---: | ---: |
+| IQ3_XXS | 142 | 204 |
+| IQ2_S | 147 | 194 |
+| IQ2_XXS | 166 | 241 |
+| IQ2_XS | 141 | 183 |
+| NVFP4 | 141 | 157 |
+| IQ4_NL | 143 | 158 |
+| Q4_K | 110 | 133 |
+
+From a cached 64 KB slab, Q8_0 runs at 195–199 G weights/s. The IQ2_S
+change to two units a lane raised it from 62.7 to 68.7 GB/s. The Q5_K
+head went from 4.23 to 3.64 ms (75 to 87.5 GB/s). Q6_K reads at 87 GB/s.
+
+The loop controller `ctl` takes 16 lanes per element, each lane 4 of its
+64 taps, and sums by shuffles; this saved 0.26–0.36 ms per token. With no
+barriers at all (incorrect results), a token is 3.4–4 ms faster. That cost
+is the latency of each small kernel, not the barrier: a barrier and a
+launch cost 1–2 µs. By kind, small kernels take these ms per token: dots
+0.38, elem 0.56, low 0.84, ctl 0.79, rows 0.54, top8 0.04, post 0.51,
+score 0.41, gather 0.50, merge 0.05, act 0.21. Fusing dots with elem,
+rows with top8, or score with gather was slower each time. Computing act
+inside `up` cannot be bit-identical under fast math. The f16 attention
+path finds the head maxima in `gather`, so it has no `smax` dispatch.
+
+The model is sensitive to single-ulp changes through near-tied experts,
+so kernel changes must keep the output bits. `gall mvtest` checks each
+weight kernel against a scalar reference and prints its rate and a hash
+of its output bits. `DEFS='#define SLAB 65536'` runs every kernel on one
+64 KB slab, so memory is not the limit; `ANON=1` times copies in anonymous
+buffers in place of the file mapping; `gall mvtest bw` times bus access
+shapes. `gall dr --drift` prints a hash of each verify history’s logits.
 
 Prefill uses half-precision matrix tiles, as the reference llama.cpp build
 does. The `HT` setting in `pfm.metal` selects float precision at about 80%
@@ -208,9 +234,11 @@ the 32 newest images on disk.
 
 ## Measurements and validation
 
-Results here and in the README are individual runs on 21–22 November
-2026. The MacBook Air has no fan; throughput fell roughly 10% after about
-2.5 minutes of load. Compare changes back to back and record run order.
+Memory, long-context and vision results here and in the README are
+individual runs on 21–22 November 2026; decode and kernel rates are
+interleaved medians on a warm machine, 23–24 November 2026. The MacBook
+Air has no fan; throughput fell roughly 10% after about 2.5 minutes of
+load. Compare changes back to back and record run order.
 
 The comparison baseline is **patched llama.cpp b12600 + Unsloth pins**,
 including our local Metal patches, measured on 21–22 November 2026. Its
@@ -218,8 +246,10 @@ short-context rate was about 15 tokens/s. Stock upstream Metal at that
 date lacked GPU support for these NVFP4 experts and still built a dense
 prefill mask; we report no throughput measurement for stock upstream.
 
-The short-context teacher-forced check found no greedy mismatches in 64
-steps, with mean KL divergence of 1.05e-4. A retrieval test recovered a
+The short-context teacher-forced check (`ref/short`) found no greedy
+mismatches in 64 steps, with mean KL divergence of 1.05e-4 (maximum
+1.92e-3). The `ref/2k` check found none, with mean KL divergence of
+9.90e-4 (maximum 2.51e-2). A retrieval test recovered a
 code placed 400 tokens into a 31.5k-token prompt with a 100k context
 setting. Neither result is a general model-quality benchmark.
 

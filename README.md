@@ -14,7 +14,8 @@ text, images, tool calls and structured JSON output.
 The app sits in the menu bar. By default it unloads the model one second
 after each answer and saves the conversation state to disk, so the next
 message continues without processing the whole prompt again. On an M2
-MacBook Air, Gall generates about 20 tokens per second.
+MacBook Air, Gall generates about 25 tokens per second, and 27–36 with
+the drafter on JSON, tool calls and code edits.
 
 The engine is a Rust host with Metal kernels. It reads the Unsloth
 UD-IQ3_XXS GGUF file in place. It does not use ggml or MLX.
@@ -162,21 +163,26 @@ token secret.
 
 ## Performance
 
-Recorded on a 24 GB M2 MacBook Air, 21–22 November 2026:
+Recorded on a 24 GB M2 MacBook Air. Short-context rates are medians of
+interleaved runs on a warm machine, 23–24 November 2026; the other rows
+are individual runs on 21–22 November 2026, before the decode changes of
+23–24 November:
 
 | Work | Gall |
 | --- | ---: |
-| Generate at short context | 20.5 tokens/s |
+| Generate at short context | About 25 tokens/s |
+| Generate a JSON schema answer, with the drafter | 31.7–31.9 tokens/s |
+| Generate a code edit, with the drafter | 35–36 tokens/s |
+| Generate prose, with the drafter | 23.1–23.4 tokens/s |
 | Generate at 10.5k context | 18.0 tokens/s |
 | Generate at 29.9k context | 16.2–16.5 tokens/s |
 | Read a 512-token prompt | 130 tokens/s |
 | Read a 10.5k-token prompt | 106 tokens/s |
 | First token with a saved prefix | 0.5–1.2 s |
 
-These are individual runs, not averages. The fanless Air slows by roughly
-10% after about 2.5 minutes of load. A configured 100k context is not a
-100k throughput measurement; the longest measured generation context
-here was 29.9k tokens.
+The fanless Air slows by roughly 10% after about 2.5 minutes of load. A
+configured 100k context is not a 100k throughput measurement; the
+longest measured generation context here was 29.9k tokens.
 
 The baseline, **patched llama.cpp b12600 + Unsloth pins** (21 November
 2026), generated about 15 tokens/s with the same quantization. Stock

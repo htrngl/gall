@@ -85,6 +85,14 @@ text is JSON that fits the schema. The server checks `type`, `properties`,
 `anyOf`, and `oneOf`. It does not check other keywords. It also appends a
 system line with the schema to the prompt. GBNF grammars are not supported.
 
+With the drafter loaded, the server verifies proposed tokens in batches,
+which round differently from one token at a time. A temperature 0 answer
+is then a greedy decode as close to the llama.cpp reference as serial
+decode, and the same from run to run, but it can differ from the serial
+answer once a near-tie occurs, typically after 100–300 tokens. Sampled
+answers with the same seed can differ likewise. `--no-draft` gives serial
+output. See [drafter notes](DRAFT.md#exactness).
+
 
 ## Unloading and saved state
 
