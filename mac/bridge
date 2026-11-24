@@ -13,7 +13,7 @@ c=~/.config/gall/bridge; [ -r "$c" ] && . "$c" && [ "$TELEGRAM_BOT_TOKEN" ] ||
   { echo "no TELEGRAM_BOT_TOKEN in $c"; exit 1; }
 [ "$AGENT" ] || AGENT='hax --json ${CONTINUE:+--continue} \
   --provider=llamacpp --model=$GALL_MODEL | tee .jl |
-  jq -r "select(.type == \"result\").text"'
+  jq -r "select(.type == \"result\") | .text // .error"'
 api=https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN g=http://127.0.0.1:9940
 d=${BOT_DIR:-$HOME/Gall}; mkdir -p "$d"; cd "$d" || exit 1; o=0
 [ -e AGENTS.md ] || echo "Telegram shows your replies as plain text: never \

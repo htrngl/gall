@@ -214,11 +214,12 @@ impl Dr {
         slice::<f32>(&self.b)[SW + k] = slice::<f32>(&self.b)[WB + t];
     }
 
-    // toks, fed: the new ones take the ring's oldest slots
+    // toks, fed: the new ones take the ring's oldest slots (an image row
+    // is no token of the vocabulary)
     fn see(&self, m: &Model, toks: &[u32]) {
         for &t in toks {
             let k = self.sv.borrow().1;
-            if self.sv.borrow().0[t as usize] == 0 {
+            if self.sv.borrow().0.get(t as usize) == Some(&0) {
                 self.put(m, SF + k % (SL - SF), t);
                 self.sv.borrow_mut().1 = k + 1;
             }
