@@ -568,7 +568,7 @@ impl Model {
             }
             if lp {
                 k!("low", [65, 3, 1], 576, VR, msg, l.ctl, GC);
-                k!("ctl", [72, 3, 1], 32, VR, msg, l.ctl, GC, X, w0, w1, w2);
+                k!("ctl", [N / 2, 3, 1], 32, VR, msg, l.ctl, GC, X, w0, w1, w2);
             }
             mv!("mv", l.q, x(0), Q, N, 3072);
             mv!("mv", l.k, x(1), K, N, 1024);
@@ -633,7 +633,7 @@ impl Model {
             if lp {
                 let (m, c) = (msg + 3 * N, l.ctl as usize + 768 * N);
                 k!("low", [65, 1, 1], 576, VR, m, c, GC);
-                k!("ctl", [72, 1, 1], 32, VR, m, c, GC, XF, l.fnw);
+                k!("ctl", [N / 2, 1, 1], 32, VR, m, c, GC, XF, l.fnw);
             }
             k!("rows", [129, 1, 1], 576, XF, l.gi, LGT, VR);
             k!("top8", [128, 1, 1], 32, LGT, l.pb, WT);

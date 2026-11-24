@@ -153,21 +153,22 @@ kernel void low(U p [[buffer(0)]], A a [[buffer(1)]],
   g[n ? 1 : 64] = x;
 }
 
-// control, grid (72, controls): v += tanh(gain g) msg - tanh(forget g) v
-// with g from the normalized v and msg; x = v * w
+// control, grid (N / 2, controls): v += tanh(gain g) msg - tanh(forget
+// g) v with g from the normalized v and msg; x = v * w. 16 lanes take an
+// element, a lane 4 of its 64 gains and forgets
 // p: 0 v, 1 msg, 2 ctl, 3 g, 4 x, 5.. w
 kernel void ctl(U p [[buffer(0)]], A a [[buffer(1)]], S s [[buffer(2)]],
                 SH sh [[buffer(6)]], GP) {
   ZA;
-  uint e = gp.x * 32 + ln;
+  uint e = gp.x * 2 + ln / 16, k = ln % 16;
   S g = a + p[3] + gp.y * 130;
   SH w = sh + p[2] + gp.y * 256 * N + 128 * N + e * 64;
   float2 n = rsqrt(float2(g[128], g[129]) / N + 1e-6);
-  float o = 0, f = 0;
-  for (uint k = 0; k < 16; k++) {
-    float4 x = n.x * L(g, k) + n.y * L(g, 16 + k);
-    o += dot(x, LH(w, k)), f += dot(x, LH(w, 16 * N + k));
-  }
+  float4 x = n.x * L(g, k) + n.y * L(g, 16 + k);
+  float o = dot(x, LH(w, k)), f = dot(x, LH(w, 16 * N + k));
+  for (uint d = 8; d; d /= 2)
+    o += simd_shuffle_xor(o, d), f += simd_shuffle_xor(f, d);
+  if (k) return;
   A v = a + p[0] + gp.y * N + e;
   *v += tanh(o) * a[p[1] + gp.y * N + e] - tanh(f) * *v;
   a[p[4] + gp.y * N + e] = *v * s[p[5 + gp.y] + e];
