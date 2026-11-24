@@ -393,11 +393,7 @@ impl Dr {
         // it holds, so does the rest
         st.kept[st.r - 1] += (st.j > 0) as usize;
         let mut d = if hit { st.d.split_off(st.r) } else { vec![] };
-        let (t0, on) = (Instant::now(), st.block.map_or(st.on(), |b| b > 0));
-        // one slow pass (a first use, another process) must not close a block
-        let ema = |x: &mut f64, t: Instant| {
-            *x += 0.1 * (t.elapsed().as_secs_f64().min(1.5 * *x) - *x)
-        };
+        let on = st.block.map_or(st.on(), |b| b > 0);
         let nd = st.block.unwrap_or(if on || st.n >= st.due[0] { st.nb() } else { 0 });
         // a longer draft from elsewhere (a copy, serve.rs) costs nothing
         let cp = st.cp.len() > d.len();
@@ -405,10 +401,9 @@ impl Dr {
             d = std::mem::take(&mut st.cp);
         } else if d.is_empty() && nd > 0 {
             d = self.draft(m, tok, nd);
-            ema(&mut st.td[nd], t0);
             st.fresh(&d, on);
         }
-        let (t1, room) = (Instant::now(), self.n_ctx - 1 - m.pos);
+        let room = self.n_ctx - 1 - m.pos;
         let j = (st.plan(&d).0 * (on || cp) as usize).min(room);
         if j == 0 {
             self.step(m, tok);
@@ -417,7 +412,6 @@ impl Dr {
             self.pass(m, &toks);
             (m.pos, m.top) = (m.pos + 1, m.pos + 1 + j);
         }
-        ema(&mut st.tv[j + 1], t1);
         (st.d, st.j, st.r, st.pos) = (d, j, 1, m.pos);
         (st.n, st.rows[0]) = (st.n + 1, st.rows[0] + j);
         0
@@ -500,7 +494,9 @@ impl Dr {
     }
 }
 
-// running estimates for round(), seconds as measured here (m2 air)
+// running estimates for plan(). the costs are fixed, seconds as measured
+// here (m2 air), not timed: a pass's rows follow from the tokens alone, so
+// the output does not change from run to run
 pub struct Spec {
     pub block: Option<usize>, // a fixed count of drafts per round; 0: none
     pub q: [f64; 12],         // acceptance of a draft by its probability
@@ -523,13 +519,13 @@ pub struct Spec {
 impl Spec {
     pub fn new() -> Spec {
         let ms = |v: [f64; 8]| v.map(|x| 1e-3 * x);
-        let tv = [49., 70., 96., 117., 150., 181., 235., 244.];
+        let tv = [49., 75., 104., 124., 136., 151., 165., 179.];
         Spec {
             block: None,
             q: std::array::from_fn(|i| 0.9 / (1. + (1.75 - i as f64 / 2.).exp())),
             e: [1., 0.055],
             tv: std::array::from_fn(|i| 1e-3 * tv[i.max(1) - 1]),
-            td: ms([0., 15., 18., 21., 24., 26., 28., 31.]),
+            td: ms([0., 12., 14., 16., 18., 20., 22., 24.]),
             kept: [0; 8],
             rows: [0; 2],
             drafts: 0,
@@ -578,15 +574,14 @@ impl Spec {
     fn plan(&self, d: &[(u32, f32)]) -> (usize, f64) {
         let (mut p, mut e) = (1., 1.);
         let rate = (self.e[0] / self.e[1]).max(1. / self.tv[1]);
-        for (j, x) in d.iter().enumerate() {
+        for (j, x) in d.iter().take(7).enumerate() {
             p *= self.q[Spec::bin(x.1)];
-            let dt = (self.tv[j + 2] - self.tv[j + 1]).max(0.3 * self.tv[1]);
-            if self.block.is_none() && p < rate * dt {
+            if self.block.is_none() && p < rate * (self.tv[j + 2] - self.tv[j + 1]) {
                 return (j, e);
             }
             e += p;
         }
-        (d.len(), e)
+        (d.len().min(7), e)
     }
 
     // a new draft: the tokens and seconds to expect of it over its
