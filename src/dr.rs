@@ -6,8 +6,10 @@
 //   let row = d.next(&mut m, &mut spec, tok);  // all of it: feed tok;
 //   m.logits_row(row) and id[16 row + 8] are what follows it
 //   d.generate(&mut m, next, &mut Spec::new(), |tok| more);  // greedy loop
-// gall dr MODEL DRAFTER REFDIR [-n 64] [-c 4096] [--ub] [--tv 2,4,8]:
-// teacher-forced acceptance; --tv: ms of a pass by rows
+// gall dr MODEL DRAFTER REFDIR [-n 64] [-c 4096] [--ub] [--tv 2,4,8]
+//   [--cmp R [-o O]]:
+// teacher-forced acceptance; --tv: ms of a pass by rows; --cmp: a pass
+// against stepping
 // gall run MODEL --tokens FILE --draft DRAFTER [--block B] [-n 64] [-c 4096]
 use crate::gguf::{self, Gguf, Tensor};
 use crate::gpu::*;
@@ -65,9 +67,9 @@ pub struct Dr {
     c: Buf,
     id: Buf,
     p: Buf, // output hidden_out, 201024 x 256 f16
-    // slab kernels by type and uses: weight rows per threadgroup, name
+    // slab kernels by type and class: weight rows per threadgroup, name
     xp: HashMap<(u32, usize), (Pipe, usize, &'static str)>,
-    ut: Buf, // expert slabs of a pass by use count; ui: their grids
+    ut: Buf, // the expert slabs of a pass by class; ui: their grids
     ui: Buf,
     t0: Buf, // the same for a dense matrix: slab 0, used by every row
     o: HashMap<&'static str, usize>, // f32 tensors in s
@@ -99,30 +101,22 @@ impl Dr {
         }
         let sb = m.gpu.buf(4 * s.len());
         slice::<f32>(&sb)[..s.len()].copy_from_slice(&s);
-        let mut pipes: HashMap<_, _> = KINDS.map(|k| (k, m.gpu.pipe(SRC, "", k))).into();
-        for k in ["q8_0_8", "q5_k_1", "q5_k_2", "q5_k_3", "q5_k_4", "q5_k_5", "q5_k_6",
-            "q5_k_7", "q5_k_8"] {
-            pipes.insert(k, m.gpu.pipe(MM, "", &format!("mm_{k}")));
-        }
-        let xp = XT.iter().flat_map(|&t| (1..9).map(move |c| (t, c))).map(|((t, r), c)| {
-            let r = match c {
-                1 => r,
-                2 => 4,
-                3..=6 if t == 8 => 4,
-                _ => 2,
-            };
-            let n = format!("x_{}_{c}", name(t));
-            ((t, c), (m.gpu.pipe(MM, "", &n), r, &*n.leak()))
-        });
-        let t0 = m.gpu.buf(4 * 9 * 65 * 8);
-        for c in 0..8 {
-            let e = &mut slice::<u32>(&t0)[9 * 65 * c..][..9];
-            (0..9).for_each(|i| e[i] = 8 * i.saturating_sub(1) as u32);
+        let pipes = KINDS.map(|k| (k, m.gpu.pipe(SRC, "", k))).into();
+        let xp = XT.iter().flat_map(|&(t, r)| [(1, r), (2, 4), (3, 16)].map(|(k, r)| {
+            let n = format!("x_{}{}", name(t), ["_1", "_2", ""][k - 1]);
+            ((t, k), (m.gpu.pipe(MM, "", &n), r, &*n.leak()))
+        }));
+        // a dense matrix: slab 0 used by t rows, as uni would place it
+        let t0 = m.gpu.buf(4 * 10 * 136);
+        for t in 1..9 {
+            let e = &mut slice::<u32>(&t0)[10 * [0, 65, 130 + t - 3][t.min(3) - 1]..];
+            e[1] = t as u32;
+            (0..t).for_each(|i| e[2 + i] = 8 * i as u32);
         }
         let d = Dr {
             xp: xp.collect(),
-            ut: m.gpu.buf(4 * 9 * 65 * 8),
-            ui: m.gpu.buf(4 * 9 * 8),
+            ut: m.gpu.buf(4 * 10 * 195),
+            ui: m.gpu.buf(4 * 3 * 12),
             t0,
             mv: Mv::new(&m.gpu, ""),
             pipes,
@@ -178,14 +172,23 @@ impl Dr {
         d
     }
 
-    // rows of y = W x in one pass: nt inputs n_in apart, outputs ys apart
+    // a slab kernel of type ty for t uses of slab 0 (t0) or, with ind, for
+    // the slabs of uni's class t (1, 2, 3 or more uses)
+    fn x(&self, e: &Enc, ty: u32, t: usize, p: &[u32; 6], b: [B; 3], ind: Option<&Buf>) {
+        let (pipe, r, _) = &self.xp[&(ty, t.min(3))];
+        let Some(i) = ind else {
+            let b = [b[0], b[1], b[2], (&self.t0, 40 * t.max(3) - 120)];
+            return call(e, pipe, p, &b, [p[1] as usize / r, 1, 1], 32);
+        };
+        let o = 12 * (4 * t + r.trailing_zeros() as usize - 5);
+        calli(e, pipe, p, &[b[0], b[1], b[2], (&self.ut, 0)], (i, o), 32)
+    }
+
+    // rows of y = W x: nt inputs n_in apart, outputs ys apart
     fn mm<'a>(&'a self, t: &'static Tensor, w: B<'a>, x: usize, y: usize, ys: usize, nt: usize) -> Op<'a> {
-        let (k, r) = if t.ty == 8 { ("q8_0_8", 4) } else { (["", "q5_k_1", "q5_k_2",
-            "q5_k_3", "q5_k_4", "q5_k_5", "q5_k_6", "q5_k_7", "q5_k_8"][nt], 2) };
-        let p = [t.dims[0], t.dims[1], t.row(), nt, ys].map(|v| v as u32);
-        (k, 0, Box::new(move |e: &Enc| {
-            let b = [w, (&self.b, 4 * x), (&self.b, 4 * y)];
-            call(e, &self.pipes[k], &p, &b, [t.dims[1] / r, 1, 1], 32)
+        let p = [t.dims[0], t.dims[1], t.row(), t.dims[0], ys, 0].map(|v| v as u32);
+        (self.xp[&(t.ty, nt.min(3))].2, 0, Box::new(move |e: &Enc| {
+            self.x(e, t.ty, nt, &p, [w, (&self.b, 4 * x), (&self.b, 4 * y)], None)
         }), None)
     }
 
@@ -213,13 +216,12 @@ impl Dr {
     fn m<'a>(&'a self, l: usize, n: &str, x: usize, y: usize, ys: usize, rows: usize) -> impl Iterator<Item = Op<'a>> {
         let t = self.t(l, n);
         let (ni, no) = (t.dims[0], t.dims[1]);
-        let one = (0..rows % 8).map(move |r| -> Op {
-            let (x, y) = (4 * (x + r * ni), 4 * (y + r * ys.max(no)));
+        let one = (rows == 1).then(|| -> Op {
             (name(t.ty), 0, Box::new(move |e: &Enc| {
-                self.mv.dense(e, t.ty, self.w.w(t), (&self.b, x), (&self.b, y), ni, no)
+                self.mv.dense(e, t.ty, self.w.w(t), (&self.b, 4 * x), (&self.b, 4 * y), ni, no)
             }), None)
         });
-        one.chain((rows == 8).then(|| self.mm(t, self.w.w(t), x, y, ys.max(no), 8)))
+        one.into_iter().chain((rows > 1).then(|| self.mm(t, self.w.w(t), x, y, ys.max(no), rows)))
     }
 
     // context k, v and f_rnn of the token at pos, from row r's features
@@ -269,24 +271,17 @@ impl Dr {
                     call(e, &self.pipes["uni"], &[t as u32], &b, [1, 1, 1], 64)
                 })));
             }
-            // experts go to the 8 gate_up rows, down's are then summed.
-            // a slab used by c rows goes to the kernel of c uses
-            let (c0, kx, yy) = match mode {
-                "up" => (1, 0, y),
-                "down" => (1, ni, gu),
-                _ => (t, 0, y),
-            };
+            // experts go to the 8 gate_up rows, down's are then summed
+            let (kx, yy) = if mode == "down" { (ni, gu) } else { (0, y) };
             let p = [ni, no, w.row(), rs, rs, kx].map(|v| v as u32);
-            for c in c0..=t {
-                let (pipe, r, n) = &self.xp[&(w.ty, c)];
-                q.push((n, Box::new(move |e: &Enc| {
-                    let b = |t| [m.gpu.w(w), (&m.a, 4 * x), (&m.a, 4 * yy), (t, 0)];
-                    if mode == "mv" {
-                        return call(e, pipe, &p, &b(&self.t0), [no / r, 1, 1], 32);
-                    }
-                    let i = 12 * (3 * (c - 1) + r.trailing_zeros() as usize - 1);
-                    calli(e, pipe, &p, &b(&self.ut), (&self.ui, i), 32)
-                })));
+            let b = [m.gpu.w(w), (&m.a, 4 * x), (&m.a, 4 * yy)];
+            if mode == "mv" {
+                let n = self.xp[&(w.ty, t.min(3))].2;
+                q.push((n, Box::new(move |e: &Enc| self.x(e, w.ty, t, &p, b, None))));
+            }
+            for k in (1..4).filter(|_| mode != "mv") {
+                let n = self.xp[&(w.ty, k)].2;
+                q.push((n, Box::new(move |e: &Enc| self.x(e, w.ty, k, &p, b, Some(&self.ui)))));
             }
             if mode == "down" {
                 let p = [gu, y, rs].map(|v| v as u32);
@@ -647,6 +642,36 @@ pub fn main(a: &[String]) {
         }
         return;
     }
+    if let Some(i) = a.iter().position(|x| x == "--cmp") {
+        // a pass of r rows on the reference text against stepping them:
+        // the greatest logit difference, the argmax of each row and the
+        // margin of the stepped one. -o O: O tokens into gen.txt, by
+        // passes of r rows
+        let (r, p) = (a[i + 1].parse::<usize>().unwrap(), np - 1 + opt("-o", 0));
+        dr.feed(&mut m, &all[..np - 1]);
+        while m.pos < p {
+            let k = r.min(p - m.pos);
+            dr.pass(&m, &all[m.pos..m.pos + k]);
+            dr.commit(&mut m, k, k - 1);
+        }
+        let am = |l: &[f32]| (0..l.len()).fold(0, |b, i| if l[i] > l[b] { i } else { b });
+        let gap = |l: &[f32]| {
+            let b = am(l);
+            l[b] - (0..l.len()).filter(|&i| i != b).fold(f32::MIN, |a, i| a.max(l[i]))
+        };
+        dr.pass(&m, &all[p..p + r]);
+        let v: Vec<_> = (0..r).map(|j| m.logits_row(j)).collect();
+        (m.top, m.pos) = (p + r, p + r);
+        assert!(m.truncate(p));
+        for (j, v) in v.iter().enumerate() {
+            m.step(all[p + j]);
+            let s = m.logits();
+            let d = s.iter().zip(v).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+            println!("row {j}: max diff {d:.2e}, argmax {} {}, margin {:.2e}", am(&s), am(v),
+                gap(&s));
+        }
+        return;
+    }
     // --ub: the prompt by feed() (batched), not step by step
     let ub = a.iter().any(|x| x == "--ub");
     if ub {
@@ -655,7 +680,9 @@ pub fn main(a: &[String]) {
     for i in if ub { np - 1 } else { 0 }..np + n {
         dr.step(&mut m, all[i]);
         if i == np {
-            // the step that fed gen[0] is ref step s0000
+            // the step that fed gen[0] is ref step s0000; step() does not
+            // wait for its taps
+            m.gpu.run(|_| ());
             for (j, f) in ["l_out-4", "l_out-28", "l_out-46", "result_norm"].iter().enumerate() {
                 let r = crate::f32s(&format!("{d}/s0000/{f}.f32"));
                 let x = &slice::<f32>(&dr.b)[FR + j * N..][..N];

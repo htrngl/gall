@@ -1,83 +1,3 @@
-// several inputs against one read of the weights, on mv.metal's units
-// (appended to it by dr.rs): y[t][r] = W[r] x[t] for t < nt <= 8. x rows
-// are n_in apart, y rows ys apart. lanes and rows as in mv.metal.
-struct PM { uint n_in, n_out, rb, nt, ys; };
-
-// a unit is dequantized once for all inputs (inside mv.metal's u_<fmt>
-// the compiler repeats it per input: 5x slower), and the input count T is
-// a constant (a run-time count: 2x slower). kernels mm_<fmt>_<T>.
-// q8_0, 4 rows
-#define MM8(T) \
-kernel void mm_q8_0_##T(constant PM &p, W w [[buffer(1)]], X x [[buffer(2)]], \
-        device float *y [[buffer(3)]], \
-        uint3 tg [[threadgroup_position_in_grid]], \
-        ushort l [[thread_index_in_threadgroup]]) { \
-    uint U = p.n_in/8, gb = p.rb*256/p.n_in, r0 = tg.x*4; \
-    float4 s[T] = {0}; \
-    for (uint k = 0; 32*k + l < U; k++) { \
-        float4 a[4], b[4]; \
-        for (uint i = 0; i < 4; i++) { \
-            W c = w + (ulong)(r0 + i)*p.rb + k*gb + (l/4)*34; \
-            device const packed_char4 *q = \
-                (device const packed_char4 *)(c + 2 + 8*(l%4)); \
-            a[i] = F16(c)*float4(char4(q[0])); \
-            b[i] = F16(c)*float4(char4(q[1])); \
-        } \
-        for (uint t = 0; t < T; t++) { \
-            device const packed_float4 *xp = (device const packed_float4 *) \
-                (x + t*p.n_in + 256*k + 8*l); \
-            float4 xa = xp[0], xb = xp[1]; \
-            s[t] += float4(dot(a[0], xa) + dot(b[0], xb), \
-                           dot(a[1], xa) + dot(b[1], xb), \
-                           dot(a[2], xa) + dot(b[2], xb), \
-                           dot(a[3], xa) + dot(b[3], xb)); \
-        } \
-    } \
-    for (uint t = 0; t < T; t++) \
-        for (uint i = 0; i < 4; i++) { \
-            float v = simd_sum(s[t][i]); \
-            if (l == 0) y[t*p.ys + r0 + i] = v; \
-        } \
-}
-
-// q5_k, 2 rows
-#define MM5(T) \
-kernel void mm_q5_k_##T(constant PM &p, W w [[buffer(1)]], X x [[buffer(2)]], \
-        device float *y [[buffer(3)]], \
-        uint3 tg [[threadgroup_position_in_grid]], \
-        ushort l [[thread_index_in_threadgroup]]) { \
-    uint U = p.n_in/8, gb = p.rb*256/p.n_in, r0 = tg.x*2; \
-    uint j = l/4, sh = 4*(j & 1), o = 8*(l%4); \
-    float2 s[T] = {0}; \
-    for (uint k = 0; 32*k + l < U; k++) { \
-        float4 a[2], b[2]; \
-        for (uint i = 0; i < 2; i++) { \
-            W c = w + (ulong)(r0 + i)*p.rb + k*gb; \
-            float2 d = float2(*(device const packed_half2 *)c)*k4(c + 4, j); \
-            Q h = (Q)(c + 16 + o), q = (Q)(c + 48 + 32*(j/2) + o); \
-            a[i] = d.x*float4(((uint4(q[0]) >> sh) & 15) + \
-                              (((uint4(h[0]) >> j) & 1) << 4)) - d.y; \
-            b[i] = d.x*float4(((uint4(q[1]) >> sh) & 15) + \
-                              (((uint4(h[1]) >> j) & 1) << 4)) - d.y; \
-        } \
-        for (uint t = 0; t < T; t++) { \
-            device const packed_float4 *xp = (device const packed_float4 *) \
-                (x + t*p.n_in + 256*k + 8*l); \
-            float4 xa = xp[0], xb = xp[1]; \
-            s[t] += float2(dot(a[0], xa) + dot(b[0], xb), \
-                           dot(a[1], xa) + dot(b[1], xb)); \
-        } \
-    } \
-    for (uint t = 0; t < T; t++) \
-        for (uint i = 0; i < 2; i++) { \
-            float v = simd_sum(s[t][i]); \
-            if (l == 0) y[t*p.ys + r0 + i] = v; \
-        } \
-}
-
-MM8(8)
-MM5(1) MM5(2) MM5(3) MM5(4) MM5(5) MM5(6) MM5(7) MM5(8)
-
 // d_<fmt>: the 8 weights of unit e of the group at b, dequantized once,
 // and their common scale; their inputs are the float4s at xo_<fmt>(e) and
 // NH_<fmt> after it
@@ -186,65 +106,89 @@ DQ(iq3_xxs) {
          iq3xxs_grid[b[3 + 2*e]], ksigns_iq2xs[(aux >> 7*l) & 127]);
 }
 
-// C activation rows against one read of an expert slab (or of a dense
-// matrix: slab 0). entry tg.y of class C in tab (dr.metal uni: 65 entries
-// of 9 per class) is the slab and C uses, row t << 3 | k:
+// up to 8 activation rows against one read of an expert slab (or of a
+// dense matrix: slab 0). entry tg.y of class k in tab (dr.metal uni: 65
+// entries of 10 per class) is (slab, uses c, use j: row t << 3 | k):
 // y[t][k][r] = W[slab][r] x[t][k]. x rows are xs apart and x[t][k] is kx
-// floats after x[t][0]; y likewise with ys and n_out. R weight rows per
-// threadgroup. the use count is a constant: a slab is read once and costs
-// one dot per use
+// floats after x[t][0]; y likewise with ys and n_out
 struct PX { uint n_in, n_out, rb, xs, ys, kx; };
-#define XK(N, F, R, C, ...) \
-kernel void N##_##F##_##C(constant PX &p, W w [[buffer(1)]], \
-        X x [[buffer(2)]], device float *y [[buffer(3)]], \
-        device const uint *tab [[buffer(4)]], \
-        uint3 tg [[threadgroup_position_in_grid]], \
-        ushort l [[thread_index_in_threadgroup]]) { \
-    device const uint *u = tab + (65*(C - 1) + tg.y)*9; \
-    if (u[0] == ~0u) return; \
+typedef device const packed_float4 *X4;
+#define XU(e) (x + ((e) >> 3)*p.xs + ((e) & 7)*p.kx)
+#define YU(e) (y + ((e) >> 3)*p.ys + ((e) & 7)*p.n_out)
+#define ARG constant PX &p, W w [[buffer(1)]], X x [[buffer(2)]], \
+    device float *y [[buffer(3)]], device const uint *tab [[buffer(4)]], \
+    uint3 tg [[threadgroup_position_in_grid]], \
+    ushort l [[thread_index_in_simdgroup]]
+
+// classes 1 and 2: C uses as dots, R rows per threadgroup, lane l unit l
+// of each group as in mv.metal; a slab costs a dot per use and weight
+#define XI(F, R, C) \
+kernel void x_##F##_##C(ARG) { \
+    device const uint *u = tab + (65*(C - 1) + tg.y)*10; \
+    if (!u[1]) return; \
     uint U = p.n_in/8, gb = p.rb*256/p.n_in, r0 = tg.x*R; \
     W w0 = w + ((ulong)u[0]*p.n_out + r0)*p.rb; \
-    device const packed_float4 *xp[C]; \
-    for (uint j = 0; j < C; j++) \
-        xp[j] = (device const packed_float4 *)(x + (u[1 + j] >> 3)*p.xs + \
-            (u[1 + j] & 7)*p.kx + xo_##F(l)); \
-    float s[R*C] = {0}; \
-    for (uint k = 0; 32*k + l < U; k++) { __VA_ARGS__ } \
+    X4 xp[C]; \
+    for (uint j = 0; j < C; j++) xp[j] = (X4)(XU(u[2 + j]) + xo_##F(l)); \
+    float s[R][C] = {}; \
+    for (uint k = 0; 32*k + l < U; k++) { \
+        float4 xa[C], xb[C]; \
+        for (uint j = 0; j < C; j++) \
+            xa[j] = xp[j][64*k], xb[j] = xp[j][64*k + NH_##F/4]; \
+        for (uint i = 0; i < R; i++) { \
+            float4 a, b; \
+            float d = d_##F(w0 + i*p.rb + k*gb, l, a, b); \
+            for (uint j = 0; j < C; j++) \
+                s[i][j] += d*(dot(a, xa[j]) + dot(b, xb[j])); \
+        } \
+    } \
     for (uint i = 0; i < R*C; i++) { \
-        float v = simd_sum(s[i]); \
-        uint e = u[1 + i%C]; \
-        if (l == 0) y[(e >> 3)*p.ys + (e & 7)*p.n_out + r0 + i/C] = v; \
+        float v = simd_sum(s[i/C][i%C]); \
+        if (l == 0) YU(u[2 + i%C])[r0 + i/C] = v; \
     } \
 }
-// XI: the inputs are held and the rows dequantized in turn; XW: the rows
-// are held and the inputs loaded in turn
-#define XI(F, R, C) XK(x, F, R, C, \
-    float4 xa[C], xb[C]; \
-    for (uint j = 0; j < C; j++) \
-        xa[j] = xp[j][64*k], xb[j] = xp[j][64*k + NH_##F/4]; \
-    for (uint i = 0; i < R; i++) { \
-        float4 a, b; \
-        float d = d_##F(w0 + i*p.rb + k*gb, l, a, b); \
-        for (uint j = 0; j < C; j++) \
-            s[i*C + j] += d*(dot(a, xa[j]) + dot(b, xb[j])); \
-    })
-#define XW(F, R, C) XK(x, F, R, C, \
-    float4 a[R], b[R]; \
-    float d[R]; \
-    for (uint i = 0; i < R; i++) \
-        d[i] = d_##F(w0 + i*p.rb + k*gb, l, a[i], b[i]); \
-    for (uint j = 0; j < C; j++) { \
-        float4 xa = xp[j][64*k], xb = xp[j][64*k + NH_##F/4]; \
-        for (uint i = 0; i < R; i++) \
-            s[i*C + j] += d[i]*(dot(a[i], xa) + dot(b[i], xb)); \
-    })
-// rows per threadgroup for 1, 2 and 3 to 6 uses, as in dr.rs; 2 above.
-// measured in a pass of 4 rows, shares in ms at 8 / 4 / 2 rows: iq3_xxs
-// 1 use 10.3 / 10.5 / 11.9, 2 uses 7.0 / 5.6 / 6.3, 3 uses 7.1 / 5.2 / 4.5;
-// nvfp4 3 uses 7.5 / 4.8 / 3.2; q8_0 4 uses 20.4 / 17.9 / 20.3. 8 uses of
-// q8_0 in a pass of 8: XI 55 at 4 rows, 61 at 2; XW 95 and 47
-#define XS(F, A, B, D) XI(F, A, 1) XI(F, B, 2) XI(F, D, 3) XI(F, D, 4) \
-    XI(F, D, 5) XI(F, D, 6) XW(F, 2, 7) XW(F, 2, 8)
-XS(q8_0, 4, 4, 4) XS(q4_k, 2, 4, 2) XS(q5_k, 2, 4, 2) XS(q6_k, 2, 4, 2)
-XS(iq2_xxs, 8, 4, 2) XS(iq2_xs, 4, 4, 2) XS(iq2_s, 8, 4, 2)
-XS(iq3_xxs, 8, 4, 2) XS(iq4_nl, 2, 4, 2) XS(nvfp4, 2, 4, 2)
+
+// class 3, 3 uses or more, on 8x8 simdgroup matrices: a dot costs 8
+// multiplies a weight, a tile 8 whatever its uses. a threadgroup takes 16
+// rows, two tiles. per 32 inputs lane (m, n) decodes unit 4q + n/2 of row
+// m once: its weights i and 4 + i are row m, columns n and n + 1 of tile
+// i. the inputs follow the same order: lane (m, n) holds element i of unit
+// 4q + m/2 (half m%2) of uses n and n + 1. four sums a tile, as the
+// lanes of a dot: shorter chains, and nearer to it
+#define TE(a) (*(thread float2 *)&(a).thread_elements())
+#define XT(F) \
+kernel void x_##F(ARG) { \
+    device const uint *u = tab + (130 + tg.y)*10; \
+    uint c = u[1], m = (l/4 & 4) + l/2%4, n = (l/4 & 2)*2 + l%2*2, \
+         gb = p.rb*256/p.n_in, r0 = tg.x*16 + m, \
+         e0 = u[2 + min(n, c - 1)], e1 = u[2 + min(n + 1, c - 1)]; \
+    if (!c) return; \
+    W w0 = w + ((ulong)u[0]*p.n_out + r0)*p.rb; \
+    X x0 = XU(e0) + (m & 1)*NH_##F, x1 = XU(e1) + (m & 1)*NH_##F; \
+    simdgroup_float8x8 a, b[4], s[2][4]; \
+    for (uint i = 0; i < 8; i++) \
+        s[i/4][i%4] = make_filled_simdgroup_matrix<float, 8>(0.f); \
+    for (uint k = 0; k < p.n_in/32; k++) { \
+        uint g = k/8, q = k%8, o = 256*g + xo_##F(4*q + m/2); \
+        float4 xa = *(X4)(x0 + o), xb = *(X4)(x1 + o); \
+        for (uint i = 0; i < 4; i++) TE(b[i]) = float2(xa[i], xb[i]); \
+        for (uint j = 0; j < 2; j++) { \
+            float4 va, vb; \
+            float d = d_##F(w0 + 8*j*p.rb + g*gb, 4*q + n/2, va, vb); \
+            va *= d, vb *= d; \
+            for (uint i = 0; i < 4; i++) { \
+                TE(a) = float2(va[i], vb[i]); \
+                simdgroup_multiply_accumulate(s[j][i], a, b[i], s[j][i]); \
+            } \
+        } \
+    } \
+    for (uint j = 0; j < 2; j++) { \
+        float2 v = TE(s[j][0]) + TE(s[j][1]) + (TE(s[j][2]) + TE(s[j][3])); \
+        if (n < c) YU(e0)[r0 + 8*j] = v[0]; \
+        if (n + 1 < c) YU(e1)[r0 + 8*j] = v[1]; \
+    } \
+}
+// rows per threadgroup at 1 use, as XT in dr.rs; 4 at 2
+#define XS(F, R) XI(F, R, 1) XI(F, 4, 2) XT(F)
+XS(q8_0, 4) XS(q4_k, 2) XS(q5_k, 2) XS(q6_k, 2) XS(iq2_xxs, 8) XS(iq2_xs, 4)
+XS(iq2_s, 8) XS(iq3_xxs, 8) XS(iq4_nl, 2) XS(nvfp4, 2)

@@ -230,39 +230,36 @@ kernel void conf(U p [[buffer(0)]], A b [[buffer(1)]], U id [[buffer(4)]],
   b[p[3]] = 1 / o;
 }
 
-// the rows' expert slabs by use count, for drm.metal: entry j of class c
-// (65 entries of 9 per class) is (id, c uses: row t << 3 | k); the entry
-// after the last has id ~0. ind: the grids of class c for 2, 4, 8 weight
-// rows per threadgroup. one group of 64: thread e is use k = e % 8 of row
-// e / 8, the first use of a slab places it. p: 0 rows
+// the expert slabs of a pass's rows by class, for drm.metal x_*: uses 1,
+// 2, 3 or more. entry j of class k (65 entries of 10 per class) is (id, c
+// uses, use i: row t << 3 | k), in order of first use. ind: the grids of
+// class k at 2, 4, 8, 16 weight rows per threadgroup. one group of 64:
+// thread e is use k = e % 8 of row e / 8. p: 0 rows
 kernel void uni(U p [[buffer(0)]], U id [[buffer(1)]],
                 device uint *tab [[buffer(2)]],
                 device uint *ind [[buffer(3)]],
                 uint e [[thread_index_in_threadgroup]]) {
-  threadgroup uint lc[64], ls[64];
-  uint T = p[0], n = 8 * T, x = id[16 * (e / 8) + e % 8];
-  uint f = e, c = 0, r = 0, m = 0; // first use, uses, uses before e
+  threadgroup uint fk[64];
+  uint n = 8 * p[0], x = id[16 * (e / 8) + e % 8], f = e, c = 0, r = 0, j = 0;
   for (uint i = 0; i < n; i++) {
     bool s = id[16 * (i / 8) + i % 8] == x;
     c += s, r += s && i < e, f = s ? min(f, i) : f;
   }
-  lc[e] = e < n && f == e ? c : 0;
+  uint k = min(c, 3u); // the class of a first use, else 0
+  fk[e] = e < n && f == e ? k : 0;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  // the place of a slab in its class; thread e < T counts class e + 1
-  for (uint i = 0; i < e; i++) m += lc[i] == c;
-  ls[e] = m;
-  for (uint i = m = 0; i < 64; i++) m += lc[i] == e + 1;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = 0; i < f; i++) j += fk[i] == k;
   if (e < n) {
-    device uint *o = tab + (65 * (c - 1) + ls[f]) * 9;
-    if (f == e) o[0] = x;
-    o[1 + r] = e / 8 << 3 | e % 8;
+    device uint *o = tab + (65 * (k - 1) + j) * 10;
+    if (f == e) o[0] = x, o[1] = c;
+    o[2 + r] = e / 8 << 3 | e % 8;
   }
-  if (e >= T) return;
-  tab[(65 * e + m) * 9] = ~0u;
-  for (uint r = 0; r < 3; r++) {
-    device uint *o = ind + (e * 3 + r) * 3;
-    o[0] = 1152 >> r, o[1] = max(m, 1u), o[2] = 1;
+  if (e >= 3) return;
+  for (uint i = j = 0; i < 64; i++) j += fk[i] == e + 1;
+  tab[(65 * e + j) * 10 + 1] = 0; // the end, as a grid is not empty
+  for (uint r = 0; r < 4; r++) {
+    device uint *o = ind + (e * 4 + r) * 3;
+    o[0] = 1152 >> r, o[1] = max(j, 1u), o[2] = 1;
   }
 }
 
