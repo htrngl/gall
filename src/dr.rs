@@ -557,8 +557,9 @@ impl Dr {
     }
 }
 
-// running estimates for plan(). the costs are fixed, seconds as measured
-// here (m2 air), not timed: a pass's rows follow from the tokens alone, so
+// running estimates for plan(). the costs are fixed, seconds of a step, a
+// pass and a draft in the loop of next() as measured here (m2 air), not
+// timed: a pass's rows follow from the tokens alone, so
 // the output does not change from run to run
 pub struct Spec {
     pub block: Option<usize>, // a fixed count of drafts per round; 0: none
@@ -582,13 +583,13 @@ pub struct Spec {
 impl Spec {
     pub fn new() -> Spec {
         let ms = |v: [f64; 8]| v.map(|x| 1e-3 * x);
-        let tv = [49., 75., 104., 124., 136., 151., 165., 179.];
+        let tv = [40.2, 63., 85., 97., 107., 117., 126., 136.];
         Spec {
             block: None,
             q: std::array::from_fn(|i| 0.9 / (1. + (1.75 - i as f64 / 2.).exp())),
             e: [1., 0.055],
             tv: std::array::from_fn(|i| 1e-3 * tv[i.max(1) - 1]),
-            td: ms([0., 5.5, 6., 6.5, 7., 7.5, 8., 8.5]),
+            td: ms([0., 6.3, 6.8, 7.4, 7.7, 8.1, 8.4, 8.8]),
             kept: [0; 8],
             rows: [0; 2],
             drafts: 0,
