@@ -780,7 +780,11 @@ pub fn main(a: &[String]) {
                 format!("{} ref {rd} kl {:.1e}/{:.1e} ({}) x {x}", mm(t),
                     k.iter().sum::<f64>() / k.len().max(1) as f64, km, k.len())
             }).collect();
-            println!("r {r}: {w:?}");
+            // fnv-1a of the logit bits, to see a kernel change keep them
+            let h = v.iter().flatten().fold(0xcbf29ce484222325u64, |h, x| {
+                (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3)
+            });
+            println!("r {r}: {w:?} bits {h:016x}");
         }
         return;
     }
