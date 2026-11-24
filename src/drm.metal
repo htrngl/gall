@@ -132,6 +132,41 @@ DQ(iq3_xxs) {
          t[b[3 + 2*e]], ksigns_iq2xs[(aux >> 7*l) & 127]);
 }
 
+// units 2j, 2j + 1 with the loads of both at once, each as d_<fmt>:
+// weights in v[0..1] and v[2..3], one scale
+#define DQ2(F) static inline float d2_##F(W b, uint j, thread float4 *v, \
+    threadgroup const ulong *G)
+#define GR2(g0, g1, sg, v) \
+    v[0] = H4(uint(g0), uint(sg)*0x01000400, 5, 4); \
+    v[1] = H4(uint(g1), uint(sg)*0x01000400, 1, 0)
+#define GRID2(g, sg, v) GR2(g, (g) >> 32, sg, v)
+
+DQ2(iq2_s) {
+    uint q = ((H)(b + 2))[j], sg = ((H)(b + 34))[j], c = 4*(j & 1),
+         h = b[66 + j/2] >> c;
+    GRID2(iq2s_grid[(q & 255) | (h & 3) << 8], sg & 255, v);
+    GRID2(iq2s_grid[(q >> 8) | (h & 12) << 6], sg >> 8, (v + 2));
+    return F16(b)*(0.5f + ((b[74 + j/2] >> c) & 15))*0x1p22f;
+}
+
+DQ2(iq2_xs) {
+    uint q0 = ((H)(b + 2))[2*j], q1 = ((H)(b + 2))[2*j + 1];
+    GRID2(G[q0 & 511], ksigns_iq2xs[q0 >> 9], v);
+    GRID2(G[q1 & 511], ksigns_iq2xs[q1 >> 9], (v + 2));
+    return F16(b)*(0.5f + ((b[66 + j/2] >> 4*(j & 1)) & 15))*0x1p22f;
+}
+
+DQ2(iq3_xxs) {
+    H a = (H)(b + 66 + 4*(j/2));
+    uint aux = a[0] | (uint(a[1]) << 16), l = 2*(j & 1),
+         q0 = ((H)b)[1 + 2*j], q1 = ((H)b)[2 + 2*j];
+    threadgroup const uint *t = (threadgroup const uint *)G;
+    GR2(t[q0 & 255], t[q0 >> 8], ksigns_iq2xs[(aux >> 7*l) & 127], v);
+    GR2(t[q1 & 255], t[q1 >> 8], ksigns_iq2xs[(aux >> 7*(l + 1)) & 127],
+        (v + 2));
+    return F16(b)*(0.5f + (aux >> 28))*0x1p23f;
+}
+
 // up to 8 activation rows against one read of an expert slab (or of a
 // dense matrix: slab 0). entry tg.y of class k in tab (dr.metal uni: 65
 // entries of 10 per class) is (slab, uses c, use j: row t << 3 | k):
@@ -172,6 +207,41 @@ kernel void x_##F##_##C(ARG) { \
     for (uint i = 0; i < R*C; i++) { \
         float v = simd_sum(s[i/C][i%C]); \
         if (l == 0) YU(u[2 + i%C])[r0 + i/C] = v; \
+    } \
+}
+
+// as XI, half the weight loads: lane l takes units 2j, 2j + 1 (j = l%16)
+// of rows R/2 (l/16).. of every group. the shuffles give lane u unit u's
+// sums, so simd_sum adds what XI's lanes held: the same bits
+#define XI2(F, R, C) \
+kernel void x_##F##_##C(ARG) { \
+    device const uint *u = tab + (65*(C - 1) + tg.y)*10; \
+    if (!u[1]) return; \
+    TGX(TG_##F) \
+    uint U = p.n_in/8, gb = p.rb*256/p.n_in, r0 = tg.x*R, j = l%16; \
+    W w0 = w + ((ulong)u[0]*p.n_out + r0 + l/16*R/2)*p.rb; \
+    X4 xp[C]; \
+    for (uint c = 0; c < C; c++) xp[c] = (X4)(XU(u[2 + c]) + 16*j); \
+    float s[R/2][2][C] = {}; \
+    for (uint k = 0; 32*k + 2*j < U; k++) { \
+        float4 x[C][4]; \
+        for (uint c = 0; c < C; c++) \
+            for (uint i = 0; i < 4; i++) x[c][i] = xp[c][64*k + i]; \
+        for (uint i = 0; i < R/2; i++) { \
+            float4 v[4]; \
+            float d = d2_##F(w0 + i*p.rb + k*gb, j, v, tgg); \
+            for (uint c = 0; c < C; c++) { \
+                s[i][0][c] += d*(dot(v[0], x[c][0]) + dot(v[1], x[c][1])); \
+                s[i][1][c] += d*(dot(v[2], x[c][2]) + dot(v[3], x[c][3])); \
+            } \
+        } \
+    } \
+    for (uint i = 0; i < R/2*C; i++) { \
+        float2 v = float2(s[i/C][0][i%C], s[i/C][1][i%C]), \
+               a = simd_shuffle(v, l/2), b = simd_shuffle(v, 16 + l/2); \
+        float y0 = simd_sum(a[l%2]), y1 = simd_sum(b[l%2]); \
+        if (l == 0) YU(u[2 + i%C])[r0 + i/C] = y0, \
+                    YU(u[2 + i%C])[r0 + R/2 + i/C] = y1; \
     } \
 }
 
@@ -216,7 +286,8 @@ kernel void x_##F(ARG) { \
         if (n + 1 < c) YU(e1)[r0 + 8*j] = v[1]; \
     } \
 }
-// rows per threadgroup at 1 use, as XT in dr.rs; 4 at 2
+// rows per threadgroup at 1 and 2 uses, as XT in dr.rs
 #define XS(F, R) XI(F, R, 1) XI(F, 4, 2) XT(F)
-XS(q8_0, 4) XS(q4_k, 2) XS(q5_k, 2) XS(q6_k, 2) XS(iq2_xxs, 8) XS(iq2_xs, 4)
-XS(iq2_s, 8) XS(iq3_xxs, 8) XS(iq4_nl, 2) XS(nvfp4, 2)
+XS(q8_0, 4) XS(q4_k, 2) XS(q5_k, 2) XS(q6_k, 2) XS(iq2_xxs, 8) XS(iq4_nl, 2)
+XS(nvfp4, 2) XI2(iq2_xs, 8, 1) XI2(iq2_xs, 8, 2) XT(iq2_xs) XI2(iq2_s, 8, 1)
+XI2(iq2_s, 8, 2) XT(iq2_s) XI2(iq3_xxs, 8, 1) XI(iq3_xxs, 4, 2) XT(iq3_xxs)

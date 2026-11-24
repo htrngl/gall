@@ -32,9 +32,10 @@ const KINDS: [&str; 15] = [
     "tap", "fuse", "norm", "rope", "put", "attn", "silu", "add", "joint", "pl",
     "pset", "amax", "uni", "dsum", "amrg",
 ];
-// drm.metal x_*: (type, weight rows per threadgroup at 1 use), as XS there
-const XT: [(u32, usize); 10] = [(8, 4), (12, 2), (13, 2), (14, 2), (16, 8),
-    (17, 4), (18, 8), (20, 2), (22, 8), (40, 2)];
+// drm.metal x_*: (type, weight rows per threadgroup at 1 and 2 uses)
+const XT: [(u32, usize, usize); 10] = [(8, 4, 4), (12, 2, 4), (13, 2, 4),
+    (14, 2, 4), (16, 8, 4), (17, 8, 8), (18, 8, 4), (20, 2, 4), (22, 8, 8),
+    (40, 2, 4)];
 // target activations, as in model.rs: the normed output and its source
 const TA: [usize; 2] = [3 * N, 15 * N];
 // drafter activations, in floats; block regions hold 8 rows
@@ -112,10 +113,12 @@ impl Dr {
         let sb = m.gpu.buf(4 * s.len());
         slice::<f32>(&sb)[..s.len()].copy_from_slice(&s);
         let pipes = KINDS.map(|k| (k, m.gpu.pipe(SRC, "", k))).into();
-        let xp = XT.iter().flat_map(|&(t, r)| [(1, r), (2, 4), (3, 16)].map(|(k, r)| {
-            let n = format!("x_{}{}", name(t), ["_1", "_2", ""][k - 1]);
-            ((t, k), (m.gpu.pipe(MM, "", &n), r, &*n.leak()))
-        }));
+        let xp = XT.iter().flat_map(|&(t, r, r2)| {
+            [(1, r), (2, r2), (3, 16)].map(|(k, r)| {
+                let n = format!("x_{}{}", name(t), ["_1", "_2", ""][k - 1]);
+                ((t, k), (m.gpu.pipe(MM, "", &n), r, &*n.leak()))
+            })
+        });
         // a dense matrix: slab 0 used by t rows, as uni would place it
         let t0 = m.gpu.buf(4 * 10 * 136);
         for t in 1..9 {
