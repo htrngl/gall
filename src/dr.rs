@@ -7,9 +7,10 @@
 //   m.logits_row(row) and id[16 row + 8] are what follows it
 //   d.generate(&mut m, next, &mut Spec::new(), |tok| more);  // greedy loop
 // gall dr MODEL DRAFTER REFDIR [-n 64] [-c 4096] [--ub] [--tv 2,4,8]
-//   [--cmp R [-o O]]:
+//   [--cmp R [-o O]] [--drift 1,2,8 [-o O]]:
 // teacher-forced acceptance; --tv: ms of a pass by rows; --cmp: a pass
-// against stepping
+// against stepping; --drift: histories by passes against steps and the
+// reference
 // gall run MODEL --tokens FILE --draft DRAFTER [--block B] [-n 64] [-c 4096]
 use crate::gguf::{self, Gguf, Tensor};
 use crate::gpu::*;
@@ -611,6 +612,7 @@ pub fn main(a: &[String]) {
         a.iter().position(|x| x == k).map_or(d, |i| a[i + 1].parse().unwrap())
     };
     let (n, d) = (opt("-n", 64), &a[2]);
+    let am = |l: &[f32]| (0..l.len()).fold(0, |b, i| if l[i] > l[b] { i } else { b });
     let mut m = Model::open(&a[0], opt("-c", 4096));
     m.reset();
     let dr = Dr::open(&mut m, &a[1], opt("-c", 4096));
@@ -649,7 +651,6 @@ pub fn main(a: &[String]) {
             dr.pass(&m, &all[m.pos..m.pos + k]);
             dr.commit(&mut m, k, k - 1);
         }
-        let am = |l: &[f32]| (0..l.len()).fold(0, |b, i| if l[i] > l[b] { i } else { b });
         let gap = |l: &[f32]| {
             let b = am(l);
             l[b] - (0..l.len()).filter(|&i| i != b).fold(f32::MIN, |a, i| a.max(l[i]))
@@ -664,6 +665,54 @@ pub fn main(a: &[String]) {
             let d = s.iter().zip(v).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
             println!("row {j}: max diff {d:.2e}, argmax {} {}, margin {:.2e}", am(&s), am(v),
                 gap(&s));
+        }
+        return;
+    }
+    if let Some(i) = a.iter().position(|x| x == "--drift") {
+        // -o O tokens of gen.txt teacher-forced by steps (r 1) or by
+        // passes of r rows, r in R. by 100 rows: the median and greatest
+        // difference from the steps over their 32 best logits, kl from the
+        // reference logits.f32 where it has rows (mean, max), and argmax
+        // other than gen.txt
+        let (o, nv) = (opt("-o", 256), 200058);
+        let lg = crate::f32s(&format!("{d}/logits.f32"));
+        let mut run = |r: usize| -> Vec<Vec<f32>> {
+            m.reset();
+            dr.forget(0);
+            dr.feed(&mut m, &all[..np - 1]);
+            let mut v = vec![];
+            while v.len() < o {
+                let (q, k) = (v.len(), r.min(o - v.len()));
+                if r == 1 {
+                    m.step(all[np - 1 + q]);
+                    v.push(m.logits());
+                    continue;
+                }
+                dr.pass(&m, &all[np - 1 + q..][..k]);
+                v.extend((0..k).map(|j| m.logits_row(j)));
+                dr.commit(&mut m, k, k - 1);
+            }
+            v
+        };
+        let s = run(1);
+        for r in a[i + 1].split(',').map(|v| v.parse::<usize>().unwrap()) {
+            let v = if r == 1 { s.clone() } else { run(r) };
+            let w: Vec<String> = v.chunks(100).zip(s.chunks(100)).enumerate().map(|(c, (v, s))| {
+                let mut t: Vec<f32> = v.iter().zip(s).map(|(v, s)| {
+                    let mut ix: Vec<usize> = (0..s.len()).collect();
+                    ix.select_nth_unstable_by(32, |a, b| s[*b].total_cmp(&s[*a]));
+                    ix[..32].iter().fold(0f32, |a, &i| a.max((s[i] - v[i]).abs()))
+                }).collect();
+                t.sort_by(f32::total_cmp);
+                let q = |j: usize| 100 * c + j;
+                let k: Vec<f64> = (0..v.len()).filter(|&j| (q(j) + 1) * nv <= lg.len())
+                    .map(|j| crate::kl(&lg[q(j) * nv..][..nv], &v[j])).collect();
+                let km = k.iter().fold(0f64, |a, &b| a.max(b)) as f32;
+                let x = (0..v.len()).filter(|&j| am(&v[j]) as u32 != all[np + q(j)]).count();
+                format!("{:.1e}/{:.1e} kl {:.1e}/{:.1e} ({}) x {x}", t[t.len() / 2],
+                    t[t.len() - 1], k.iter().sum::<f64>() / k.len().max(1) as f64, km, k.len())
+            }).collect();
+            println!("r {r}: {w:?}");
         }
         return;
     }
