@@ -185,6 +185,13 @@ static inline float2 p_iq2_s(W b, uint j, float4 x0, float4 x1, float4 x2,
     return float2(d*gd(G[(q & 255) | (h & 3) << 8], sg & 255, x0, x1),
                   d*gd(G[(q >> 8) | (h & 12) << 6], sg >> 8, x2, x3));
 }
+static inline float2 p_iq2_xs(W b, uint j, float4 x0, float4 x1, float4 x2,
+        float4 x3, threadgroup const ulong *G) {
+    uint q0 = ((H)(b + 2))[2*j], q1 = ((H)(b + 2))[2*j + 1];
+    float d = F16(b)*(0.5f + ((b[66 + j/2] >> 4*(j & 1)) & 15))*0x1p22f;
+    return float2(d*gd(G[q0 & 511], ksigns_iq2xs[q0 >> 9], x0, x1),
+                  d*gd(G[q1 & 511], ksigns_iq2xs[q1 >> 9], x2, x3));
+}
 // as ACC on 8 rows, half the weight loads: a lane takes units 2j, 2j + 1
 // (j = l%16) of rows 4(l/16).. of every group. the shuffles give lane u
 // unit u's sums, so simd_sum adds what ACC's lanes held: the same bits
@@ -352,7 +359,7 @@ KERNELS(q6_k, R(2))
 #define u_iq2_s(b, e, xa, xb) t_iq2_s(b, e, xa, xb, tgg)
 #define u_iq3_xxs(b, e, xa, xb) t_iq3_xxs(b, e, xa, xb, tgg)
 KERNELS_(iq2_xxs, R(8), ACC, TGG(iq2xxs_grid, 256, ulong))
-KERNELS_(iq2_xs, R(4), ACC, TGG(iq2xs_grid, 512, ulong))
+KERNELS3(iq2_xs, 8, ACC2, TGG(iq2xs_grid, 512, ulong), TAIL2)
 KERNELS3(iq2_s, 8, ACC2, TGG(iq2s_grid, 1024, ulong), TAIL2)
 KERNELS_(iq3_xxs, R(8), ACC, TGG(iq3xxs_grid, 256, uint))
 #undef u_iq2_xxs
