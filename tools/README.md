@@ -185,3 +185,39 @@ python3 tools/memory.py target/release/gall "$(gall model)"
 The reported process footprint excludes some file-backed weight memory;
 do not treat it as total RAM required by the model. See the
 [engine notes](../docs/ENGINE.md) for the measured workload and limitations.
+
+## Long session
+
+`long.py` replays a tool session of 10 turns that grows to about 52,600
+tokens: a system prompt with `AGENTS.md`, five tools, and 13,000
+characters of `src/*.rs` as each tool result (or as a user message when
+the answer has no tool call). It starts `gall serve` with a temporary
+snapshot cache and the given flags, and prints the server log (load,
+snapshot read and write, the prompt line) and one row a turn: prompt
+tokens, cached tokens, prefill ms, first token in s, generated tokens,
+tokens/s and wall time in s. The log has no line for the int8 rebuild.
+
+```sh
+python3 tools/long.py target/release/gall "$(gall model)" --dummy
+python3 tools/long.py target/release/gall "$(gall model)" --idle-unload 1
+```
+
+The requests carry the fields that hax 0.6.1 sends as a llama.cpp client
+(`stream`, `stream_options.include_usage`, `return_progress`), and
+`max_tokens` 512. hax sends no `temperature`, `top_k`, `top_p`, `min_p`
+or `seed`, so the server uses the model's `general.sampling` values:
+temperature 1.0, top_k 0, top_p 1.0, min_p 0.0. Without `--dummy` the
+server loads the model and takes the GPU lock.
+
+## Copy runs
+
+`runs.py` reads a prompt and an output as token IDs, one per line (as in
+`tests/short`), and prints the share of output tokens inside copy runs
+of 16, 32 and 64 tokens or more. A token is copied when it is the token
+that followed the last place of the last 12 tokens (else the last 3), in
+the prompt or the output so far, as the server's
+[copy drafts](../docs/DRAFT.md#copy-drafts) find it. It runs on the CPU.
+
+```sh
+python3 tools/runs.py tests/short/tokens.txt tests/short/gen.txt
+```
