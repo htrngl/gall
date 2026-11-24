@@ -7,7 +7,8 @@ use crate::gpu::*;
 use crate::mv::Mv;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBarrierScope, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-use objc2_metal::{MTLComputeCommandEncoder, MTLDispatchType};
+use objc2_metal::{MTLComputeCommandEncoder, MTLDevice, MTLDispatchType};
+use objc2_metal::MTLSharedEvent;
 use std::cell::Cell;
 use std::collections::HashMap;
 
@@ -101,6 +102,7 @@ const IMR: usize = 8192; // image rows kept
 pub const ROWS: usize = 8; // activation rows, for dr.rs's batched verify
 const TID: u32 = !0; // the token of id[9]
 type Cb = objc2::rc::Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+type Ev = objc2::rc::Retained<ProtocolObject<dyn MTLSharedEvent>>;
 
 pub struct Model {
     pub g: &'static Gguf,
@@ -138,7 +140,13 @@ pub struct Model {
     pub t: f64, // gpu seconds of the last step
     ck: Option<(usize, Vec<f32>, Vec<u16>)>, // checkpoint: pos, conv, swa
     pf: Option<pf::Pf>,
-    pre: Option<(usize, Cb)>, // the encoded token of a position
+    pre: Option<(usize, Cb, bool)>, // the encoded token of a position; run
+    // greedy: the caller feeds step()'s result, so the next token is
+    // committed before the wait, on the gpu's greedy id; its head waits
+    // for ev >= k, which the next step() sets
+    pub greedy: bool,
+    ev: Ev,
+    k: u64,
 }
 
 // f32 to f16, round to nearest; tiny values to 0
@@ -157,6 +165,12 @@ pub fn visits() -> Vec<(usize, usize, usize)> {
     let core = |p| (6..18).map(move |i| (i, if p > 0 { 12 * p + 6 + i } else { i }, p));
     let lin = |r: std::ops::Range<usize>| r.map(|i| (i, i, 0));
     lin(0..6).chain((0..3).flat_map(core)).chain(lin(18..24)).collect()
+}
+
+impl Drop for Model {
+    fn drop(&mut self) {
+        self.idle()
+    }
 }
 
 impl Model {
@@ -312,13 +326,26 @@ impl Model {
             ck: None,
             pf: None,
             pre: None,
+            greedy: false,
+            ev: gpu.dev.newSharedEvent().unwrap(),
+            k: 0,
             g,
             gpu,
         }
     }
 
+    // no token runs ahead: one that does is let through and waited for
+    pub fn idle(&mut self) {
+        if let Some((_, cb, true)) = &self.pre {
+            self.ev.setSignaledValue(self.k);
+            cb.waitUntilCompleted();
+            self.pre = None;
+        }
+    }
+
     // the raw cache and conv state
-    pub fn raw(&self) -> [&mut [u8]; 2] {
+    pub fn raw(&mut self) -> [&mut [u8]; 2] {
+        self.idle();
         [slice(&self.kv), slice(&self.cs)]
     }
 
@@ -353,12 +380,14 @@ impl Model {
 
     // keep the drafter's features of every token from now on
     pub fn taps(&mut self) {
+        self.idle();
         (self.taps, self.pre) = (true, None);
     }
 
     // the f16 rows from n on change without their int8 copy, so a token
     // encoded ahead is void too: it holds no copy of the rows before it
     fn stale(&mut self, n: usize) {
+        self.idle();
         self.hi.set(self.hi.get().min(n));
         self.pre = None;
     }
@@ -382,6 +411,7 @@ impl Model {
 
     // checkpoint the state at pos, for truncate()
     pub fn save(&mut self) {
+        self.idle();
         let kv = slice::<u16>(&self.kv);
         let mut w = Vec::with_capacity(self.swa(self.pos).count() * 2048);
         self.swa(self.pos).for_each(|r| w.extend_from_slice(&kv[r]));
@@ -639,15 +669,21 @@ impl Model {
         ops
     }
 
-    // the command buffer of the token at pos; the token is read from id[9]
-    fn enc(&self, pos: usize) -> Cb {
+    // the command buffer of the token at pos; the token is read from id[9].
+    // gate k: the head waits for ev >= k
+    fn enc(&self, pos: usize, mut gate: Option<u64>) -> Cb {
         objc2::rc::autoreleasepool(|_| {
             let cb = self.gpu.q.commandBuffer().unwrap();
             // concurrent: a barrier before each op, except between mat-vecs
             // that read none of the earlier ones' outputs (q, k, v, rel, gate)
-            let e = cb.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent);
-            let (e, mut ys) = (e.unwrap(), vec![]);
+            let ne = || cb.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent);
+            let (mut e, mut ys) = (ne().unwrap(), vec![]);
             for o in self.sched(TID, pos, true) {
+                if let Some(k) = gate.take_if(|_| o.1 == 48) {
+                    e.endEncoding();
+                    cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*self.ev), k);
+                    e = ne().unwrap();
+                }
                 match o.3 {
                     Some(("mv", _, x, y)) if !ys.is_empty() && !ys.contains(&x) => ys.push(y),
                     m => {
@@ -663,15 +699,35 @@ impl Model {
     }
 
     // decode one token; returns the greedy next id. the next position is
-    // encoded while this one runs, so a step starts with a commit
+    // encoded while this one runs, so a step starts with a commit (greedy:
+    // it runs too, and its head waits for the next step)
     pub fn step(&mut self, tok: u32) -> u32 {
-        slice::<u32>(&self.id)[9] = tok;
-        let cb = self.pre.take().filter(|c| c.0 == self.pos);
-        let cb = cb.map_or_else(|| self.enc(self.pos), |c| c.1);
-        cb.commit();
-        self.pos += 1;
         let p = self.pos;
-        self.pre = (p < self.n_ctx).then(|| (p, self.enc(p)));
+        let cb = match self.pre.take() {
+            Some((q, cb, true)) if q == p && tok == self.next() => {
+                self.ev.setSignaledValue(self.k);
+                cb
+            }
+            c => {
+                self.pre = c;
+                self.idle();
+                slice::<u32>(&self.id)[9] = tok;
+                let c = self.pre.take().filter(|c| c.0 == p).map(|c| c.1);
+                let cb = c.unwrap_or_else(|| self.enc(p, None));
+                cb.commit();
+                cb
+            }
+        };
+        self.pos += 1;
+        self.pre = (p + 1 < self.n_ctx).then(|| {
+            let g = self.greedy && !self.taps;
+            self.k += g as u64;
+            let c = self.enc(p + 1, g.then_some(self.k));
+            if g {
+                c.commit();
+            }
+            (p + 1, c, g)
+        });
         cb.waitUntilCompleted();
         assert!(cb.error().is_none(), "metal: {:?}", cb.error());
         self.t = cb.GPUEndTime() - cb.GPUStartTime();
@@ -681,6 +737,7 @@ impl Model {
     // decode toks (not empty), logits only for the last: no output head
     // and no wait between the others
     pub fn feed(&mut self, toks: &[u32]) -> u32 {
+        self.idle();
         let toks = self.prefill(toks, 512);
         let (l, h) = toks.split_last().unwrap();
         for c in h.chunks(4) {

@@ -553,7 +553,8 @@ kernel void amax(U p [[buffer(0)]], A a [[buffer(1)]], GP) {
   if (!ln) a[p[2] + gp.x * 2] = b, a[p[2] + gp.x * 2 + 1] = as_type<float>(k);
 }
 
-// stage 2: the best of p[1] (max, index) pairs at p[0], to id[p[2]].
+// stage 2: the best of p[1] (max, index) pairs at p[0], to id[p[2]] and
+// the next token's id[p[2] + 1].
 // one threadgroup of 1024
 kernel void best(U p [[buffer(0)]], A a [[buffer(1)]],
                  device uint *id [[buffer(5)]], TG) {
@@ -574,7 +575,7 @@ kernel void best(U p [[buffer(0)]], A a [[buffer(1)]],
   if (t) return;
   for (uint i = 0; i < 32; i++)
     if (bv[i] > b || (bv[i] == b && bi[i] < k)) b = bv[i], k = bi[i];
-  id[p[2]] = k;
+  id[p[2]] = id[p[2] + 1] = k;
 }
 
 // a[p[1]..] = a[p[0]..], N floats: a feature kept for the drafter. grid 18

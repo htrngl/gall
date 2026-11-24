@@ -151,6 +151,7 @@ fn main() {
                 assert!(m.truncate(p0));
                 let (first, t0, mut gpu) = (out.is_empty(), Instant::now(), 0.);
                 let (mut x, mut kls, mut flips) = (next, vec![], 0);
+                m.greedy = first;
                 for i in 0..n {
                     if first {
                         out.push(x);
@@ -180,6 +181,7 @@ fn main() {
                 eprintln!();
             }
             let next = m.next();
+            m.idle();
             if a.iter().any(|x| x == "--rollback") {
                 // 5 steps back by the rings, then back to the checkpoint
                 for k in [n - 5, 0] {
