@@ -754,22 +754,31 @@ pub fn main(a: &[String]) {
             v
         };
         let s = run(1);
+        // the greatest difference over the 32 best of s; median, greatest
+        let td = |s: &[f32], v: &[f32]| {
+            let mut ix: Vec<usize> = (0..s.len()).collect();
+            ix.select_nth_unstable_by(32, |a, b| s[*b].total_cmp(&s[*a]));
+            ix[..32].iter().fold(0f32, |a, &i| a.max((s[i] - v[i]).abs()))
+        };
+        let mm = |mut t: Vec<f32>| {
+            t.sort_by(f32::total_cmp);
+            format!("{:.1e}/{:.1e}", t[t.len() / 2], t[t.len() - 1])
+        };
         for r in a[i + 1].split(',').map(|v| v.parse::<usize>().unwrap()) {
             let v = if r == 1 { s.clone() } else { run(r) };
             let w: Vec<String> = v.chunks(100).zip(s.chunks(100)).enumerate().map(|(c, (v, s))| {
-                let mut t: Vec<f32> = v.iter().zip(s).map(|(v, s)| {
-                    let mut ix: Vec<usize> = (0..s.len()).collect();
-                    ix.select_nth_unstable_by(32, |a, b| s[*b].total_cmp(&s[*a]));
-                    ix[..32].iter().fold(0f32, |a, &i| a.max((s[i] - v[i]).abs()))
-                }).collect();
-                t.sort_by(f32::total_cmp);
+                let t = v.iter().zip(s).map(|(v, s)| td(s, v)).collect();
                 let q = |j: usize| 100 * c + j;
-                let k: Vec<f64> = (0..v.len()).filter(|&j| (q(j) + 1) * nv <= lg.len())
-                    .map(|j| crate::kl(&lg[q(j) * nv..][..nv], &v[j])).collect();
+                let j: Vec<usize> = (0..v.len()).filter(|&j| (q(j) + 1) * nv <= lg.len()).collect();
+                let rf = |j: usize| &lg[q(j) * nv..][..nv];
+                let k: Vec<f64> = j.iter().map(|&j| crate::kl(rf(j), &v[j])).collect();
                 let km = k.iter().fold(0f64, |a, &b| a.max(b)) as f32;
                 let x = (0..v.len()).filter(|&j| am(&v[j]) as u32 != all[np + q(j)]).count();
-                format!("{:.1e}/{:.1e} kl {:.1e}/{:.1e} ({}) x {x}", t[t.len() / 2],
-                    t[t.len() - 1], k.iter().sum::<f64>() / k.len().max(1) as f64, km, k.len())
+                let rd = if j.is_empty() { "-".into() } else {
+                    mm(j.iter().map(|&j| td(rf(j), &v[j])).collect())
+                };
+                format!("{} ref {rd} kl {:.1e}/{:.1e} ({}) x {x}", mm(t),
+                    k.iter().sum::<f64>() / k.len().max(1) as f64, km, k.len())
             }).collect();
             println!("r {r}: {w:?}");
         }
