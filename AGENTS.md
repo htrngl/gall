@@ -22,7 +22,9 @@ Parallel agents divide the work by area. Two agents do not edit one file.
 
 The app runs its bundled `gall` (`up`, `down`, `model`) and reads
 `/health`. It adds no commands to the CLI. Server state is in
-`~/.cache/gall`: `serve.pid`, `serve.log`, and `key`.
+`~/.cache/gall`: `serve.pid`, `serve.log`, and `key`. `gall up` keeps
+the last log as `serve.old`, and the app runs `up` again when the server
+stops with `panicked` in its log.
 
 ## Build the app
 

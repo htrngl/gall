@@ -266,7 +266,15 @@ func alert(_ s: String) {
                     }
                     lid(!(wakes && closed() && stay < Date()))
                 }
+                // a server that panicked starts again (up keeps its log
+                // as serve.old); one that left for memory stays down
+                let was = h != nil
                 await poll()
+                let log = cache.appendingPathComponent("serve.log")
+                if was, h == nil, phase.isEmpty, (try? String(contentsOf: log,
+                    encoding: .utf8))?.contains("panicked") == true {
+                    await up()
+                }
                 await sleep(1)
             }
         }

@@ -109,6 +109,7 @@ pub fn main(a: &[String]) {
         }
         _ if up() => {}
         _ => {
+            fs::rename(&log, log.with_extension("old")).ok();
             let (m, f) = (model(), fs::File::create(&log).unwrap());
             let ctx = a.get(1).map_or("102400", |s| s);
             let mut c = Command::new(env::current_exe().unwrap())

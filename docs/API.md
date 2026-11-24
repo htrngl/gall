@@ -42,7 +42,8 @@ model architecture, not arbitrary GGUF models.
 | `gall serve <gguf> [flags]` | Run the server in the foreground. |
 
 The PID, log and optional network key are in `~/.cache/gall` as
-`serve.pid`, `serve.log` and `key`.
+`serve.pid`, `serve.log` and `key`. `serve.old` is the log of the run
+before. The app starts the server again after a panic.
 
 ### Server flags
 
