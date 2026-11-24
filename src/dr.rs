@@ -28,9 +28,9 @@ const MM: &str = concat!(
     include_str!("mv.metal"),
     include_str!("drm.metal")
 );
-const KINDS: [&str; 16] = [
+const KINDS: [&str; 15] = [
     "tap", "fuse", "norm", "rope", "put", "attn", "silu", "add", "joint", "pl",
-    "pset", "amax", "uni", "dsum", "conf", "amrg",
+    "pset", "amax", "uni", "dsum", "amrg",
 ];
 // drm.metal x_*: (type, weight rows per threadgroup at 1 use), as XS there
 const XT: [(u32, usize); 10] = [(8, 4), (12, 2), (13, 2), (14, 2), (16, 8),
@@ -56,7 +56,12 @@ const BL: usize = WB + 201024; // base logits, 8 rows
 const NV: usize = 201024;
 const FR: usize = BL + 8 * NV; // 4 target features per verify row
 const CF: usize = FR + 32 * N; // the drafter's probability of each draft
-const PA: usize = CF + 8; // attention partials: 192 queries x chunks x 130
+const SW: usize = CF + 8; // wb of the shortlist
+const PA: usize = SW + SL; // attention partials: 192 queries x chunks x 130
+// the drafter's head scores a shortlist: the SF tokens of greatest wb and
+// a ring of the last SL - SF new tokens fed
+const SL: usize = 32768;
+const SF: usize = 28672;
 
 pub struct Dr {
     g: &'static Gguf,
@@ -68,6 +73,10 @@ pub struct Dr {
     c: Buf,
     id: Buf,
     p: Buf, // output hidden_out, 201024 x 256 f16
+    // the shortlist: ids, then rows of output and of p; the slot + 1 of an
+    // id, and the next ring slot
+    sl: [Buf; 3],
+    sv: std::cell::RefCell<(Vec<u32>, usize)>,
     // slab kernels by type and class: weight rows per threadgroup, name
     xp: HashMap<(u32, usize), (Pipe, usize, &'static str)>,
     ut: Buf, // the expert slabs of a pass by class; ui: their grids
@@ -126,6 +135,8 @@ impl Dr {
             p: m.gpu.buf(2 * 256 * NV),
             c: m.gpu.buf(2 * 2048 * (2048 + n_ctx)),
             id: m.gpu.buf(4 * 8),
+            sl: [4, m.g.t["output.weight"].row(), 512].map(|n| m.gpu.buf(n * SL)),
+            sv: Default::default(),
             co: [0, 1024, 1024 + n_ctx],
             n_ctx,
             span: Default::default(),
@@ -145,7 +156,7 @@ impl Dr {
             r.read_exact(wb()).and_then(|_| r.read_exact(slice::<u8>(&d.p))).is_ok()
         };
         if md.len() > 0 && std::fs::File::open(&f).is_ok_and(read) {
-            return d;
+            return d.short(m);
         }
         let (b, out) = (slice::<f32>(&d.b), &m.g.t["output.weight"]);
         let ho = d.g.data(&d.g.t["dspark_hidden_out.weight"]);
@@ -170,7 +181,45 @@ impl Dr {
         if std::fs::File::create(&tmp).is_ok_and(put) {
             std::fs::rename(tmp, f).ok();
         }
-        d
+        d.short(m)
+    }
+
+    // the shortlist's first SL tokens: those of greatest wb
+    fn short(self, m: &Model) -> Dr {
+        let nv = m.g.u("inkling2.vocab_size_unpadded");
+        let wb = &slice::<f32>(&self.b)[WB..][..nv];
+        let mut o: Vec<u32> = (0..wb.len() as u32).collect();
+        o.sort_by(|&a, &b| wb[b as usize].total_cmp(&wb[a as usize]));
+        *self.sv.borrow_mut() = (vec![0; wb.len()], 0);
+        o[..SL].iter().enumerate().for_each(|(k, &t)| self.put(m, k, t));
+        self.sv.borrow_mut().1 = SL - SF;
+        self
+    }
+
+    // token t into slot k of the shortlist
+    fn put(&self, m: &Model, k: usize, t: u32) {
+        let (sv, out) = (&mut self.sv.borrow_mut().0, &m.g.t["output.weight"]);
+        let o = &mut slice::<u32>(&self.sl[0])[k];
+        if sv[*o as usize] == k as u32 + 1 {
+            sv[*o as usize] = 0;
+        }
+        (*o, sv[t as usize]) = (t, k as u32 + 1);
+        let (n, t, p) = (out.row(), t as usize, slice::<u16>(&self.p));
+        let o = &m.g.data(out)[t * n..][..n];
+        slice::<u8>(&self.sl[1])[k * n..][..n].copy_from_slice(o);
+        slice::<u16>(&self.sl[2])[k * 256..][..256].copy_from_slice(&p[t * 256..][..256]);
+        slice::<f32>(&self.b)[SW + k] = slice::<f32>(&self.b)[WB + t];
+    }
+
+    // toks, fed: the new ones take the ring's oldest slots
+    fn see(&self, m: &Model, toks: &[u32]) {
+        for &t in toks {
+            let k = self.sv.borrow().1;
+            if self.sv.borrow().0[t as usize] == 0 {
+                self.put(m, SF + k % (SL - SF), t);
+                self.sv.borrow_mut().1 = k + 1;
+            }
+        }
     }
 
     // a slab kernel of type ty for t uses of slab 0 (t0) or, with ind, for
@@ -187,7 +236,14 @@ impl Dr {
 
     // rows of y = W x: nt inputs n_in apart, outputs ys apart
     fn mm<'a>(&'a self, t: &'static Tensor, w: B<'a>, x: usize, y: usize, ys: usize, nt: usize) -> Op<'a> {
-        let p = [t.dims[0], t.dims[1], t.row(), t.dims[0], ys, 0].map(|v| v as u32);
+        self.mo(t, w, t.dims[1], x, y, ys, nt)
+    }
+
+    // the first no rows of t at w
+    #[allow(clippy::too_many_arguments)]
+    fn mo<'a>(&'a self, t: &'static Tensor, w: B<'a>, no: usize, x: usize,
+              y: usize, ys: usize, nt: usize) -> Op<'a> {
+        let p = [t.dims[0], no, t.row(), t.dims[0], ys, 0].map(|v| v as u32);
         (self.xp[&(t.ty, nt.min(3))].2, 0, Box::new(move |e: &Enc| {
             self.x(e, t.ty, nt, &p, [w, (&self.b, 4 * x), (&self.b, 4 * y)], None)
         }), None)
@@ -338,6 +394,7 @@ impl Dr {
     // a prompt: batched prefill with the context of each token, the tail
     // by step(). greedy next id
     pub fn feed(&self, m: &mut Model, toks: &[u32]) -> u32 {
+        self.see(m, toks);
         let rest = m.prefill_tap(toks, 512, Some(&mut |m: &Model, ft: &[f32]| {
             for (i, f) in ft.chunks(32 * N).enumerate() {
                 slice::<f32>(&self.b)[FR..][..f.len()].copy_from_slice(f);
@@ -356,6 +413,7 @@ impl Dr {
 
     // one target token with its context; greedy next id
     pub fn step(&self, m: &mut Model, tok: u32) -> u32 {
+        self.see(m, &[tok]);
         let r = m.step(tok);
         // the next token's command buffer comes after this one
         let ops = self.inject(m.pos - 1, 0);
@@ -379,6 +437,7 @@ impl Dr {
     // one if that held; else a serial step, and a draft now and then to
     // keep score. m.pos counts the tokens fed; rows ahead lie past it
     pub fn next(&self, m: &mut Model, st: &mut Spec, tok: u32) -> usize {
+        self.see(m, &[tok]);
         if st.pos != m.pos {
             st.drop();
         }
@@ -469,16 +528,16 @@ impl Dr {
             v.push(self.k("add", g8, &[X, OO], vec![]));
         }
         v.push(self.k("norm", g8, &[X, HN, self.o["output_norm.weight"]], vec![]));
-        v.push(self.mm(out, m.gpu.w(out), HN + N, BL, NV, nb));
+        v.push(self.mo(out, (&self.sl[1], 0), SL, HN + N, BL, NV, nb));
         let w = |n: &str| self.w.w(&self.g.t[n]);
         for i in 1..=nb {
             let p = [ST, HN + i * N, CX + 3 * N, JJ, self.o["joint_proj.bias"], i - 1];
             let x = vec![w("joint_proj.weight"), w("markov_w1.weight")];
-            v.push(self.k("joint", [24, 1, 1], &p, x));
-            let p = [ST, JJ, BL + (i - 1) * NV, LG, WB];
-            v.push(self.k("pl", [6252, 1, 1], &p, vec![(&self.p, 0)]));
-            v.push(self.k("amax", [1, 1, 1], &[LG, 200058, i], vec![]));
-            v.push(self.k("conf", [1, 1, 1], &[LG, 200058, i, CF + i, cap], vec![]));
+            v.push(self.k("joint", [768, 1, 1], &p, x));
+            let p = [ST, JJ, BL + (i - 1) * NV, LG, SW];
+            v.push(self.k("pl", [SL / 32, 1, 1], &p, vec![(&self.sl[2], 0)]));
+            let p = [LG, SL, i, CF + i, cap];
+            v.push(self.k("amax", [1, 1, 1], &p, vec![(&self.sl[0], 0)]));
         }
         if std::env::var("PROF").is_ok() {
             // every dispatch in its own command buffer: read as shares
@@ -526,7 +585,7 @@ impl Spec {
             q: std::array::from_fn(|i| 0.9 / (1. + (1.75 - i as f64 / 2.).exp())),
             e: [1., 0.055],
             tv: std::array::from_fn(|i| 1e-3 * tv[i.max(1) - 1]),
-            td: ms([0., 12., 14., 16., 18., 20., 22., 24.]),
+            td: ms([0., 5.5, 6., 6.5, 7., 7.5, 8., 8.5]),
             kept: [0; 8],
             rows: [0; 2],
             drafts: 0,

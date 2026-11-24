@@ -158,19 +158,20 @@ kernel void add(U p [[buffer(0)]], A b [[buffer(1)]], GP) {
 }
 
 // j = joint_proj [state, markov_w1[prev], cur, f_rnn] + bias; the last
-// third (the latent) through tanh. grid 24
+// third (the latent) through tanh. grid 768: a row a threadgroup
 // p: 0 state, 1 cur, 2 f_rnn, 3 j, 4 bias, 5 index of prev in id
 kernel void joint(U p [[buffer(0)]], A b [[buffer(1)]], S s [[buffer(2)]],
                   U id [[buffer(4)]], W jp [[buffer(5)]],
                   W mk [[buffer(6)]], GP) {
-  uint r = gp.x * 32 + ln;
+  uint r = gp.x;
   W w = jp + r * 5120, v = mk + id[p[5]] * 256;
-  float o = s[p[4] + r];
-  for (uint i = 0; i < 256; i++)
+  float o = 0;
+  for (uint i = ln; i < 256; i += 32)
     o += bf(w[i]) * b[p[0] + i] + bf(w[256 + i]) * bf(v[i]);
-  for (uint i = 0; i < N; i++)
+  for (uint i = ln; i < N; i += 32)
     o += bf(w[512 + i]) * b[p[1] + i] + bf(w[512 + N + i]) * b[p[2] + i];
-  b[p[3] + r] = r < 512 ? o : tanh(o);
+  o = simd_sum(o) + s[p[4] + r];
+  if (!ln) b[p[3] + r] = r < 512 ? o : tanh(o);
 }
 
 // logits = base + wb + P latent for vocab row v, P = output hidden_out
@@ -196,38 +197,39 @@ kernel void pset(U p [[buffer(0)]], A b [[buffer(1)]],
     pp[v * 256 + p[1] + t] = b[p[0] + t * 201024 + v];
 }
 
-// first argmax of b[p[0]..+p[1]] into id[p[2]]. one group of 768
+// the first argmax k of b[p[0]..+p[1]]: id[p[2]] = sl[k], and its
+// probability after the softcap p[4] to b[p[3]]. one group of 768
 kernel void amax(U p [[buffer(0)]], A b [[buffer(1)]],
-                 device uint *id [[buffer(4)]],
-                 uint t [[thread_index_in_threadgroup]]) {
-  threadgroup float bv[768];
-  threadgroup uint bi[768];
-  float m = -1e30;
+                 device uint *id [[buffer(4)]], U sl [[buffer(5)]],
+                 uint t [[thread_index_in_threadgroup]],
+                 uint sg [[simdgroup_index_in_threadgroup]],
+                 uint ln [[thread_index_in_simdgroup]]) {
+  threadgroup float bv[24];
+  threadgroup uint bi[24];
+  S x = b + p[0];
+  float m = -1e30, c = as_type<float>(p[4]), o = 0;
   uint k = 0;
   for (uint i = t; i < p[1]; i += 768)
-    if (b[p[0] + i] > m) m = b[p[0] + i], k = i;
-  bv[t] = m, bi[t] = k;
+    if (x[i] > m) m = x[i], k = i;
+  for (uint d = 16; d; d /= 2) {
+    float n = simd_shuffle_down(m, d);
+    uint j = simd_shuffle_down(k, d);
+    if (n > m || (n == m && j < k)) m = n, k = j;
+  }
+  if (!ln) bv[sg] = m, bi[sg] = k;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t) return;
-  for (uint i = 1; i < 768; i++)
+  m = bv[0], k = bi[0];
+  for (uint i = 1; i < 24; i++)
     if (bv[i] > m || (bv[i] == m && bi[i] < k)) m = bv[i], k = bi[i];
-  id[p[2]] = k;
-}
-
-// the drafter's probability of id[p[2]] among b[p[0]..+p[1]] after the
-// softcap p[4], to b[p[3]]. one group of 768
-kernel void conf(U p [[buffer(0)]], A b [[buffer(1)]], U id [[buffer(4)]],
-                 uint t [[thread_index_in_threadgroup]],
-                 uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float r[24];
-  float c = as_type<float>(p[4]), m = c * tanh(b[p[0] + id[p[2]]] / c), o = 0;
-  for (uint i = t; i < p[1]; i += 768) o += exp(c * tanh(b[p[0] + i] / c) - m);
+  m = c * tanh(m / c);
+  for (uint i = t; i < p[1]; i += 768) o += exp(c * tanh(x[i] / c) - m);
   o = simd_sum(o);
-  if (t % 32 == 0) r[sg] = o;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!ln) bv[sg] = o;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (t) return;
-  for (uint i = 1; i < 24; i++) o += r[i];
-  b[p[3]] = 1 / o;
+  for (uint i = 1; i < 24; i++) o += bv[i];
+  id[p[2]] = sl[k], b[p[3]] = 1 / o;
 }
 
 // the expert slabs of a pass's rows by class, for drm.metal x_*: uses 1,
