@@ -49,9 +49,10 @@ pub trait Lm {
         self.step(*l)
     }
     // holds p[..k]: restore or feed and store prefixes of p up to the
-    // system region p[..sys]; the new k and the length restored
-    fn prime(&mut self, _p: &[u32], k: usize, _sys: usize) -> (usize, usize) {
-        (k, 0)
+    // system region p[..sys]; the new k, the length restored and the
+    // length of the snapshot it came from
+    fn prime(&mut self, _p: &[u32], k: usize, _sys: usize) -> (usize, usize, usize) {
+        (k, 0, 0)
     }
     // forget the images not among these keys (those of the prompt)
     fn keep(&mut self, _keys: &[u32]) {}
@@ -109,7 +110,7 @@ impl Lm for Lazy {
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
         self.get().feed(toks)
     }
-    fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
+    fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize, usize) {
         self.get().prime(p, k, sys)
     }
     fn keep(&mut self, keys: &[u32]) {
@@ -1116,6 +1117,7 @@ impl Srv {
         }
 
         let t0 = Instant::now();
+        let prev = self.fed.len(); // the state of the last chat, if in memory
         if self.lm.len() != self.fed.len() {
             self.lm.reset();
             self.fed.clear();
@@ -1133,8 +1135,24 @@ impl Srv {
                 }
             }
         }
-        let (at, snap) = self.lm.prime(&p, k, sys);
-        let k = k.max(snap); // not fed for this request
+        let (at, snap, of) = self.lm.prime(&p, k, sys);
+        // hit: all of the last state (in memory, or the snapshot read) is a
+        // prefix of p; partial: a shorter prefix is, the rest is fed (the
+        // client changed earlier messages, or dropped thinking); miss: none
+        let (mem, used) = (if snap > 0 { 0 } else { k }, k.max(snap));
+        let kind = match () {
+            _ if used == 0 => "miss",
+            _ if (snap > 0 && snap == of) || (snap == 0 && mem == prev) => "hit",
+            _ => "partial",
+        };
+        let src = match () {
+            _ if snap > 0 => format!("snapshot of {of}"),
+            _ if mem > 0 => "memory".to_string(),
+            _ => "nothing".to_string(),
+        };
+        eprintln!("gall: cache {kind}: {used} of {} prompt tokens reused from {src}, {} fed",
+            p.len(), p.len() - used);
+        let k = used; // not fed for this request
         self.fed.clear();
         self.fed.extend(&p);
         self.lm.draft();
@@ -1456,12 +1474,12 @@ impl Lm for Ink {
         self.step(*l)
     }
     // what prime restores or feeds has no drafter context
-    fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
+    fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize, usize) {
         let r = self.2.prime(&mut self.0, p, k, sys);
         if let Some((d, ..)) = self.5.as_ref().filter(|_| r.0 > k) {
             d.forget(r.0);
         }
-        r
+        (r.0, r.1, self.2.of)
     }
     fn keep(&mut self, keys: &[u32]) {
         let id = |k: u64| k as u32 & 0x7ffff;
