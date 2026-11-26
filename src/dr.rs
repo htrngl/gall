@@ -882,6 +882,24 @@ pub fn main(a: &[String]) {
     }
 }
 
+// whether the drafter beside the model has the dspark layout dr reads. the
+// mainline llama.cpp drafter (architecture dflash, unsloth/Inkling-2-Mini-GGUF
+// since 23 November 2026) does not; its dspark-Inkling-2-Mini-Q8_0_Old.gguf does
+pub fn usable(model: &str) -> bool {
+    let d = std::path::Path::new(model).with_file_name(crate::up::DRAFT);
+    if !d.exists() {
+        return true;
+    }
+    let g = gguf::open(d.to_str().unwrap());
+    let ok = g.t.contains_key("dspark_hidden_out.weight");
+    unsafe { libc::munmap(g.map.as_ptr() as *mut _, g.map.len()) };
+    if !ok {
+        eprintln!("gall: {} is not a dspark drafter (mainline layout?); \
+                   serving without drafts", d.display());
+    }
+    ok
+}
+
 // greedy decode with drafts; --block B fixes the drafts per round (0: none)
 pub fn run(a: &[String]) {
     let opt = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].as_str());

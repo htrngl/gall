@@ -224,10 +224,18 @@ impl Model {
                 } else {
                     ["q", "k", "v"].map(|c| w(&format!("attn_{c}_inp_norm.weight")))
                 };
-                let ctl = ["attn", "k", "v", "mlp"]
-                    .map(|c| {
-                        ["down", "gain", "forget"]
-                            .map(|k| wh(&format!("loop_{c}_{k}.weight")))[0]
+                // controllers, as unsloth named them (attn k v mlp) or as
+                // mainline llama.cpp does (q k v ffn, loop_{c}_ctrl_{k})
+                let ctl = [("attn", "q"), ("k", "k"), ("v", "v"), ("mlp", "ffn")]
+                    .map(|(c, m)| {
+                        ["down", "gain", "forget"].map(|k| {
+                            let n = format!("loop_{c}_{k}.weight");
+                            if g.t.contains_key(format!("blk.{i}.{n}").as_str()) {
+                                wh(&n)
+                            } else {
+                                wh(&format!("loop_{m}_ctrl_{k}.weight"))
+                            }
+                        })[0]
                     })[0];
                 L {
                     swa,
@@ -266,16 +274,30 @@ impl Model {
         let oq = sm("output_res_query.weight".into());
         let on = sm("output_norm.weight".into());
         // message queries of core layer i: res[2i], kv[2i], kv[2i+1], res[2i+1]
-        let (res, kvq) = (
-            sm("loop_res_query.weight".into()) as usize,
-            sm("loop_kv_res_query.weight".into()) as usize,
-        );
-        let mq = s.len() as u32;
-        for i in 0..12 {
-            for o in [res + 2 * i * N, kvq + 2 * i * N, kvq + (2 * i + 1) * N, res + (2 * i + 1) * N] {
-                s.extend_from_within(o..o + N);
+        // (unsloth layout), which are the q, k, v and ffn columns of mainline
+        // llama.cpp's blk.{6+i}.loop_msg_query, [N, 4]
+        let mq = if g.t.contains_key("loop_res_query.weight") {
+            let (res, kvq) = (
+                sm("loop_res_query.weight".into()) as usize,
+                sm("loop_kv_res_query.weight".into()) as usize,
+            );
+            let mq = s.len() as u32;
+            for i in 0..12 {
+                for o in [res + 2 * i * N, kvq + 2 * i * N, kvq + (2 * i + 1) * N, res + (2 * i + 1) * N] {
+                    s.extend_from_within(o..o + N);
+                }
             }
-        }
+            mq
+        } else {
+            let o: Vec<u32> = (6..18)
+                .map(|l| sm(format!("blk.{l}.loop_msg_query.weight")))
+                .collect();
+            for (i, &x) in o.iter().enumerate() {
+                assert!(x != 0 && x as usize == o[0] as usize + 4 * N * i,
+                        "blk.{}.loop_msg_query: missing or not [N, 4]", 6 + i);
+            }
+            o[0]
+        };
         let (sb, hb) = (gpu.buf(4 * s.len()), gpu.buf(2 * sh.len()));
         slice::<f32>(&sb)[..s.len()].copy_from_slice(&s);
         slice::<u16>(&hb)[..sh.len()].copy_from_slice(&sh);

@@ -1551,6 +1551,7 @@ pub fn main(a: &[String]) {
             }
         });
         let (p, draft) = (a[0].clone(), !a.iter().any(|x| x == "--no-draft"));
+        let draft = draft && crate::dr::usable(&p);
         Box::new(move || {
             crate::up::lock(true);
             let mut m = crate::model::Model::open(&p, ctx);
