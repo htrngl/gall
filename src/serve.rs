@@ -36,6 +36,10 @@ pub trait Lm {
     fn len(&self) -> usize;
     // forget all but the first n tokens; false if that needs a reset
     fn truncate(&mut self, n: usize) -> bool;
+    // a length truncate() can always go back to (the checkpoint), if any
+    fn mark(&self) -> Option<usize> {
+        None
+    }
     // step() over toks (not empty); override to batch
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
         let (l, h) = toks.split_last().unwrap();
@@ -98,6 +102,9 @@ impl Lm for Lazy {
     }
     fn truncate(&mut self, n: usize) -> bool {
         self.get().truncate(n)
+    }
+    fn mark(&self) -> Option<usize> {
+        self.0.as_ref().and_then(|m| m.mark())
     }
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
         self.get().feed(toks)
@@ -1116,8 +1123,15 @@ impl Srv {
         let same = self.fed.iter().zip(&p).take_while(|(a, b)| a == b).count();
         let mut k = same.min(p.len() - 1);
         if k < self.fed.len() && !self.lm.truncate(k) {
-            self.lm.reset();
-            k = 0;
+            // a client that drops the thinking parts from where the last
+            // prompt ended: back to the checkpoint just before that end
+            match self.lm.mark().filter(|&c| c <= k) {
+                Some(c) if self.lm.truncate(c) => k = c,
+                _ => {
+                    self.lm.reset();
+                    k = 0;
+                }
+            }
         }
         let (at, snap) = self.lm.prime(&p, k, sys);
         let k = k.max(snap); // not fed for this request
@@ -1425,6 +1439,9 @@ impl Lm for Ink {
     fn truncate(&mut self, n: usize) -> bool {
         self.draft();
         self.0.truncate(n)
+    }
+    fn mark(&self) -> Option<usize> {
+        self.0.mark()
     }
     // the checkpoint is before the last token: the same prompt again
     // (regenerate) goes back to it

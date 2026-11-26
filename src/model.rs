@@ -473,6 +473,11 @@ impl Model {
         self.ck = Some((self.pos, slice::<f32>(&self.cs).to_vec(), w));
     }
 
+    // where truncate() can go back to beyond the rings' few steps
+    pub fn mark(&self) -> Option<usize> {
+        self.ck.as_ref().map(|c| c.0)
+    }
+
     // forget all but the first n tokens: a few steps back by the rings,
     // or back to the checkpoint. false: not possible, reset
     pub fn truncate(&mut self, n: usize) -> bool {
