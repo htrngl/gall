@@ -49,6 +49,8 @@ pub trait Lm {
     fn prime(&mut self, _p: &[u32], k: usize, _sys: usize) -> (usize, usize) {
         (k, 0)
     }
+    // forget the images not among these keys (those of the prompt)
+    fn keep(&mut self, _keys: &[u32]) {}
     // store toks, which it holds (or nothing, if empty), and free memory
     fn park(&mut self, _toks: &[u32]) {}
     fn loaded(&self) -> bool {
@@ -102,6 +104,11 @@ impl Lm for Lazy {
     }
     fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
         self.get().prime(p, k, sys)
+    }
+    fn keep(&mut self, keys: &[u32]) {
+        if let Some(m) = &mut self.0 {
+            m.keep(keys)
+        }
     }
     fn park(&mut self, toks: &[u32]) {
         if let Some(mut m) = self.0.take() {
@@ -1040,6 +1047,10 @@ impl Srv {
                     k => format!(", the oldest {k} left out (store full)"),
                 });
         }
+        let ids: Vec<Range<u32>> = ids.collect();
+        let keys: Vec<u32> = ids.iter().filter(|r| !r.is_empty())
+            .map(|r| (r.start - crate::model::IMG) >> 12).collect();
+        self.lm.keep(&keys);
         let (enc, mut p, mut at) = (|s: &str| self.tok.enc(s, true), vec![], 0);
         for ((to, _), ids) in urls.iter().zip(ids) {
             p.extend(enc(&o[at..*to]));
@@ -1435,6 +1446,11 @@ impl Lm for Ink {
         }
         r
     }
+    fn keep(&mut self, keys: &[u32]) {
+        let id = |k: u64| k as u32 & 0x7ffff;
+        self.4.retain(|&k, _| keys.contains(&id(k)));
+        self.0.pend.retain(|k, _| keys.contains(k));
+    }
     // also drops the rows verified ahead: the model is about to move
     fn draft(&mut self) -> String {
         let Some((_, s, c)) = &mut self.5 else { return String::new() };
@@ -1489,14 +1505,15 @@ impl Lm for Ink {
         };
         // two images with one 19-bit key: forget what was built on the first
         let (id, m) = (|k: u64| k as u32 & 0x7ffff, &mut self.0);
-        let twin = self.4.keys().any(|&k| id(k) == id(key));
-        if twin || !m.image(key as u32, &e) {
+        if self.4.keys().any(|&k| id(k) == id(key)) {
             (m.ni, self.4) = (0, HashMap::new());
-            m.ib.clear();
-            if twin {
-                m.reset();
-            }
+            (m.ib, m.pend) = (HashMap::new(), HashMap::new());
+            m.reset();
             return Err(FULL.into());
+        }
+        // the store needs room only for the images of one pass (Model::stage)
+        if !m.image(key as u32, &e) {
+            return Err("the image is larger than the image store".into());
         }
         self.4.insert(key, e.len() / 2304);
         Ok(Model::ids(key as u32, e.len() / 2304))

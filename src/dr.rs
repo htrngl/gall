@@ -424,6 +424,7 @@ impl Dr {
             }
         }));
         // the tail may hold image rows: the general path
+        m.stage(rest);
         rest.iter().fold(0, |_, &t| {
             let r = self.pass(m, &[t])[0];
             self.commit(m, 1, 0);

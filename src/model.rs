@@ -121,6 +121,9 @@ pub struct Model {
     im: Buf, // image embeddings, f32 rows
     pub ni: usize,
     pub ib: HashMap<u32, usize>, // first row of an image by its key
+    // every image the prompt may feed, by key, until stage() copies the
+    // ones a pass reads into im: the store holds a pass's images, not a chat's
+    pub pend: HashMap<u32, Vec<f32>>,
     out: T,
     tn: u32,
     oq: u32,
@@ -325,6 +328,7 @@ impl Model {
             im: gpu.buf(4 * N * IMR),
             ni: 0,
             ib: HashMap::new(),
+            pend: HashMap::new(),
             out: &g.t["output.weight"],
             tn,
             oq,
@@ -388,16 +392,45 @@ impl Model {
         a..a + n as u32
     }
 
-    // keep the rows of image key; false when the store is full
+    // the rows of image key, for stage() to copy in when a pass reads them;
+    // false when one image is more than the store holds
     pub fn image(&mut self, key: u32, e: &[f32]) -> bool {
-        let (a, b) = (self.ni, self.ni + e.len() / N);
-        let Some(r) = slice::<f32>(&self.im).get_mut(a * N..b * N) else {
+        if e.len() / N > IMR {
             return false;
-        };
-        r.copy_from_slice(e);
-        self.ib.insert(key & 0x7ffff, a);
-        self.ni = b;
+        }
+        self.ib.remove(&(key & 0x7ffff)); // what the store held may be another's
+        self.pend.insert(key & 0x7ffff, e.to_vec());
         true
+    }
+
+    // the images toks read, in the store: one not there is copied in, and
+    // when they do not fit the store starts again with only these. rows
+    // already fed are in the cache, so an image is only needed while fed
+    pub fn stage(&mut self, toks: &[u32]) {
+        let mut keys: Vec<u32> = vec![];
+        for &t in toks.iter().filter(|&&t| t >= IMG && t != TID) {
+            let k = (t - IMG) >> 12;
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        let miss: Vec<u32> = keys.iter().copied().filter(|k| !self.ib.contains_key(k)).collect();
+        if miss.is_empty() {
+            return;
+        }
+        self.idle();
+        let rows = |k: &u32| self.pend.get(k).unwrap_or_else(|| panic!("image {k:x}: no rows")).len() / N;
+        let fresh = self.ni + miss.iter().map(rows).sum::<usize>() > IMR;
+        if fresh {
+            (self.ni, self.ib) = (0, HashMap::new());
+        }
+        for k in if fresh { keys } else { miss } {
+            let (e, a) = (&self.pend[&k], self.ni);
+            assert!(a + e.len() / N <= IMR, "the images of one pass are more than the store");
+            slice::<f32>(&self.im)[a * N..][..e.len()].copy_from_slice(e);
+            self.ib.insert(k, a);
+            self.ni = a + e.len() / N;
+        }
     }
 
     // keep the drafter's features of every token from now on
@@ -762,6 +795,7 @@ impl Model {
         let toks = self.prefill(toks, 512);
         let (l, h) = toks.split_last().unwrap();
         for c in h.chunks(4) {
+            self.stage(c);
             let ops = c.iter().enumerate();
             let ops: Vec<_> = ops.flat_map(|(i, &t)| self.sched(t, self.pos + i, false)).collect();
             self.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
@@ -772,6 +806,7 @@ impl Model {
             return self.step(*l);
         }
         // step() reads the token table: an image row goes the long way
+        self.stage(&[*l]);
         let ops = self.sched(*l, self.pos, true);
         self.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
         drop(ops);
